@@ -1,5 +1,28 @@
+-- ============================================================
+-- Trigger function: validates that a contract stream exists
+-- in the streams table. Used as a "soft FK" for tables that
+-- reference contract_id, since direct FK to event-sourced
+-- aggregates isn't possible (aggregate_id alone isn't unique
+-- in streams — it requires aggregate_type to be unique).
+-- ============================================================
+CREATE OR REPLACE FUNCTION check_contract_stream_exists()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM streams
+        WHERE aggregate_type = 'contract' AND aggregate_id = NEW.contract_id
+    ) THEN
+        RAISE EXCEPTION 'contract stream does not exist: %', NEW.contract_id
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
 -- Contract read model (projection target)
--- NOTE: No FK to other tables — projections are rebuilt via TRUNCATE + replay.
+-- NOTE: No FK/trigger — projections are rebuilt via TRUNCATE + replay.
+-- ============================================================
 CREATE TABLE contract_read_models (
     id             TEXT        PRIMARY KEY,
     account_id     TEXT        NOT NULL,
@@ -22,7 +45,7 @@ CREATE INDEX idx_contract_rm_trial_end ON contract_read_models (trial_end_date) 
 
 -- ============================================================
 -- Invoices
--- NOTE: No FK on contract_id — contracts are event-sourced (no write-model table).
+-- contract_id validated via trigger → streams table
 -- ============================================================
 CREATE TABLE invoices (
     id          TEXT        PRIMARY KEY,
@@ -39,6 +62,10 @@ CREATE TABLE invoices (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TRIGGER trg_invoices_check_contract
+    BEFORE INSERT OR UPDATE OF contract_id ON invoices
+    FOR EACH ROW EXECUTE FUNCTION check_contract_stream_exists();
 
 CREATE INDEX idx_invoices_contract_id ON invoices (contract_id);
 CREATE INDEX idx_invoices_account_id ON invoices (account_id);
@@ -60,7 +87,7 @@ CREATE TABLE invoice_history (
 CREATE INDEX idx_invoice_history_temporal ON invoice_history (id, valid_from);
 
 -- Invoice read model (projection target)
--- NOTE: No FKs — projection table, rebuilt via TRUNCATE + replay.
+-- NOTE: No FK/trigger — projection table, rebuilt via TRUNCATE + replay.
 CREATE TABLE invoice_read_models (
     id          TEXT        PRIMARY KEY,
     contract_id TEXT        NOT NULL,
@@ -76,9 +103,8 @@ CREATE TABLE invoice_read_models (
 
 -- ============================================================
 -- Credit notes
--- FK: invoice_id → invoices (same bounded context, CRUD tables)
--- NOTE: No FK on contract_id/account_id — contract is event-sourced,
---       account is external. Denormalized for query performance.
+-- FK: invoice_id → invoices
+-- contract_id validated via trigger → streams table
 -- ============================================================
 CREATE TABLE credit_notes (
     id          TEXT        PRIMARY KEY,
@@ -93,6 +119,10 @@ CREATE TABLE credit_notes (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TRIGGER trg_credit_notes_check_contract
+    BEFORE INSERT OR UPDATE OF contract_id ON credit_notes
+    FOR EACH ROW EXECUTE FUNCTION check_contract_stream_exists();
 
 CREATE INDEX idx_credit_notes_invoice_id ON credit_notes (invoice_id);
 CREATE INDEX idx_credit_notes_account_id ON credit_notes (account_id);
@@ -120,7 +150,6 @@ CREATE INDEX idx_payments_invoice_id ON payments (invoice_id);
 
 -- ============================================================
 -- Balance entries
--- NOTE: No FK on account_id — account is external to this bounded context.
 -- ============================================================
 CREATE TABLE balance_entries (
     id         TEXT    PRIMARY KEY,
@@ -163,7 +192,7 @@ CREATE INDEX idx_balance_refunds_entry_id ON balance_refunds (balance_entry_id);
 
 -- ============================================================
 -- Usage records
--- NOTE: No FK on contract_id — contract is event-sourced.
+-- contract_id validated via trigger → streams table
 -- ============================================================
 CREATE TABLE usage_records (
     id              TEXT        PRIMARY KEY,
@@ -175,6 +204,10 @@ CREATE TABLE usage_records (
     data            JSONB       NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TRIGGER trg_usage_records_check_contract
+    BEFORE INSERT OR UPDATE OF contract_id ON usage_records
+    FOR EACH ROW EXECUTE FUNCTION check_contract_stream_exists();
 
 CREATE INDEX idx_usage_records_contract_id ON usage_records (contract_id);
 CREATE INDEX idx_usage_records_contract_metric ON usage_records (contract_id, metric);
