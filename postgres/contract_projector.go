@@ -34,12 +34,20 @@ func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event)
 }
 
 // Rebuild drops and recreates the contract read model from all events up to the given time.
+// Uses DEFERRABLE FK + DELETE (not TRUNCATE) so that other tables referencing
+// contract_read_models via DEFERRABLE FK remain valid at commit time.
 func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error {
 	q := QuerierFromContext(ctx, p.pool)
 
-	_, err := q.Exec(ctx, `TRUNCATE contract_read_models`)
+	// Defer FK constraints so DELETE doesn't fail while we rebuild
+	_, err := q.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`)
 	if err != nil {
-		return fmt.Errorf("truncate contract read models: %w", err)
+		return fmt.Errorf("defer constraints: %w", err)
+	}
+
+	_, err = q.Exec(ctx, `DELETE FROM contract_read_models`)
+	if err != nil {
+		return fmt.Errorf("delete contract read models: %w", err)
 	}
 
 	if err := p.checkpoint.Reset(ctx, contractProjectorName); err != nil {

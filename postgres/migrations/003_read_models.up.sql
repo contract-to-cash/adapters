@@ -1,27 +1,15 @@
 -- ============================================================
--- Trigger function: validates that a contract stream exists
--- in the streams table. Used as a "soft FK" for tables that
--- reference contract_id, since direct FK to event-sourced
--- aggregates isn't possible (aggregate_id alone isn't unique
--- in streams — it requires aggregate_type to be unique).
--- ============================================================
-CREATE OR REPLACE FUNCTION check_contract_stream_exists()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM streams
-        WHERE aggregate_type = 'contract' AND aggregate_id = NEW.contract_id
-    ) THEN
-        RAISE EXCEPTION 'contract stream does not exist: %', NEW.contract_id
-            USING ERRCODE = 'foreign_key_violation';
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- ============================================================
 -- Contract read model (projection target)
--- NOTE: No FK/trigger — projections are rebuilt via TRUNCATE + replay.
+-- This is the relational representation of the Contract aggregate.
+-- Other domain tables reference this via DEFERRABLE FK, enabling
+-- DB-level referential integrity while supporting projection rebuild.
+--
+-- Rebuild procedure:
+--   BEGIN;
+--   SET CONSTRAINTS ALL DEFERRED;
+--   DELETE FROM contract_read_models;
+--   -- re-insert from events --
+--   COMMIT;  -- FK integrity checked here
 -- ============================================================
 CREATE TABLE contract_read_models (
     id             TEXT        PRIMARY KEY,
@@ -45,7 +33,7 @@ CREATE INDEX idx_contract_rm_trial_end ON contract_read_models (trial_end_date) 
 
 -- ============================================================
 -- Invoices
--- contract_id validated via trigger → streams table
+-- FK: contract_id → contract_read_models (DEFERRABLE for rebuild)
 -- ============================================================
 CREATE TABLE invoices (
     id          TEXT        PRIMARY KEY,
@@ -60,12 +48,11 @@ CREATE TABLE invoices (
     data        JSONB       NOT NULL,
     version     INTEGER     NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_invoices_contract
+        FOREIGN KEY (contract_id) REFERENCES contract_read_models (id)
+        DEFERRABLE INITIALLY IMMEDIATE
 );
-
-CREATE TRIGGER trg_invoices_check_contract
-    BEFORE INSERT OR UPDATE OF contract_id ON invoices
-    FOR EACH ROW EXECUTE FUNCTION check_contract_stream_exists();
 
 CREATE INDEX idx_invoices_contract_id ON invoices (contract_id);
 CREATE INDEX idx_invoices_account_id ON invoices (account_id);
@@ -87,7 +74,7 @@ CREATE TABLE invoice_history (
 CREATE INDEX idx_invoice_history_temporal ON invoice_history (id, valid_from);
 
 -- Invoice read model (projection target)
--- NOTE: No FK/trigger — projection table, rebuilt via TRUNCATE + replay.
+-- NOTE: No FK — projection table, rebuilt via DELETE + replay.
 CREATE TABLE invoice_read_models (
     id          TEXT        PRIMARY KEY,
     contract_id TEXT        NOT NULL,
@@ -103,8 +90,7 @@ CREATE TABLE invoice_read_models (
 
 -- ============================================================
 -- Credit notes
--- FK: invoice_id → invoices
--- contract_id validated via trigger → streams table
+-- FK: invoice_id → invoices, contract_id → contract_read_models
 -- ============================================================
 CREATE TABLE credit_notes (
     id          TEXT        PRIMARY KEY,
@@ -117,12 +103,11 @@ CREATE TABLE credit_notes (
     status      TEXT        NOT NULL CHECK (status IN ('draft', 'issued', 'applied', 'voided')),
     data        JSONB       NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_credit_notes_contract
+        FOREIGN KEY (contract_id) REFERENCES contract_read_models (id)
+        DEFERRABLE INITIALLY IMMEDIATE
 );
-
-CREATE TRIGGER trg_credit_notes_check_contract
-    BEFORE INSERT OR UPDATE OF contract_id ON credit_notes
-    FOR EACH ROW EXECUTE FUNCTION check_contract_stream_exists();
 
 CREATE INDEX idx_credit_notes_invoice_id ON credit_notes (invoice_id);
 CREATE INDEX idx_credit_notes_account_id ON credit_notes (account_id);
@@ -192,7 +177,7 @@ CREATE INDEX idx_balance_refunds_entry_id ON balance_refunds (balance_entry_id);
 
 -- ============================================================
 -- Usage records
--- contract_id validated via trigger → streams table
+-- FK: contract_id → contract_read_models (DEFERRABLE for rebuild)
 -- ============================================================
 CREATE TABLE usage_records (
     id              TEXT        PRIMARY KEY,
@@ -202,12 +187,11 @@ CREATE TABLE usage_records (
     timestamp       TIMESTAMPTZ NOT NULL,
     idempotency_key TEXT        UNIQUE,
     data            JSONB       NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_usage_records_contract
+        FOREIGN KEY (contract_id) REFERENCES contract_read_models (id)
+        DEFERRABLE INITIALLY IMMEDIATE
 );
-
-CREATE TRIGGER trg_usage_records_check_contract
-    BEFORE INSERT OR UPDATE OF contract_id ON usage_records
-    FOR EACH ROW EXECUTE FUNCTION check_contract_stream_exists();
 
 CREATE INDEX idx_usage_records_contract_id ON usage_records (contract_id);
 CREATE INDEX idx_usage_records_contract_metric ON usage_records (contract_id, metric);

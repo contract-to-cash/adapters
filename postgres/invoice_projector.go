@@ -37,9 +37,9 @@ func (p *InvoiceProjector) Project(ctx context.Context, event eventstore.Event) 
 func (p *InvoiceProjector) Rebuild(ctx context.Context, until time.Time) error {
 	q := QuerierFromContext(ctx, p.pool)
 
-	_, err := q.Exec(ctx, `TRUNCATE invoice_read_models`)
+	_, err := q.Exec(ctx, `DELETE FROM invoice_read_models`)
 	if err != nil {
-		return fmt.Errorf("truncate invoice read models: %w", err)
+		return fmt.Errorf("delete invoice read models: %w", err)
 	}
 
 	if err := p.checkpoint.Reset(ctx, invoiceProjectorName); err != nil {
