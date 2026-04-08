@@ -15,7 +15,7 @@ CREATE TABLE events (
 CREATE INDEX idx_events_stream_id ON events (stream_id);
 CREATE INDEX idx_events_type ON events (type);
 CREATE INDEX idx_events_global_position ON events (global_position);
-CREATE INDEX idx_events_stream_id_version ON events (stream_id, version);
+-- NOTE: idx for (stream_id, version) is already created by the UNIQUE constraint
 
 -- Notification function for subscriber wakeup
 CREATE OR REPLACE FUNCTION notify_events_inserted()
