@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/contract-to-cash/core/domain/invoice"
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -42,30 +43,29 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 		   amount     = EXCLUDED.amount,
 		   due_date   = EXCLUDED.due_date,
 		   issued_at  = EXCLUDED.issued_at,
-		   paid_at    = EXCLUDED.paid_at,
 		   data       = EXCLUDED.data,
 		   version    = invoices.version + 1,
 		   updated_at = NOW()`,
-		inv.ID(), inv.ContractID(), inv.AccountID(), inv.Status(),
-		inv.Amount(), inv.Currency(), inv.DueDate(), inv.IssuedAt(), data,
+		string(inv.ID()), string(inv.ContractID()), string(inv.AccountID()),
+		string(inv.Status()), inv.Amount(), string(inv.Currency()),
+		inv.DueDate(), inv.IssuedAt(), data,
 	)
 	if err != nil {
 		return fmt.Errorf("save invoice: %w", err)
 	}
 
-	// Record history for temporal queries
+	// Maintain history for temporal queries (FindByIDAsOf)
 	_, err = q.Exec(ctx,
 		`UPDATE invoice_history SET valid_to = NOW() WHERE id = $1 AND valid_to IS NULL`,
-		inv.ID(),
+		string(inv.ID()),
 	)
 	if err != nil {
 		return fmt.Errorf("close invoice history: %w", err)
 	}
-
 	_, err = q.Exec(ctx,
 		`INSERT INTO invoice_history (id, data, version, valid_from)
 		 SELECT id, data, version, NOW() FROM invoices WHERE id = $1`,
-		inv.ID(),
+		string(inv.ID()),
 	)
 	if err != nil {
 		return fmt.Errorf("insert invoice history: %w", err)
@@ -74,13 +74,12 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 	return nil
 }
 
-func (r *PostgresInvoiceRepository) FindByID(ctx context.Context, id string) (*invoice.Invoice, error) {
+func (r *PostgresInvoiceRepository) FindByID(ctx context.Context, id shared.InvoiceID) (*invoice.Invoice, error) {
 	q := r.q(ctx)
 
 	var data json.RawMessage
 	err := q.QueryRow(ctx,
-		`SELECT data FROM invoices WHERE id = $1`,
-		id,
+		`SELECT data FROM invoices WHERE id = $1`, string(id),
 	).Scan(&data)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -92,8 +91,69 @@ func (r *PostgresInvoiceRepository) FindByID(ctx context.Context, id string) (*i
 	return invoice.Unmarshal(data)
 }
 
+func (r *PostgresInvoiceRepository) FindByContractID(ctx context.Context, contractID shared.ContractID) ([]*invoice.Invoice, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM invoices WHERE contract_id = $1 ORDER BY created_at DESC`,
+		string(contractID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find invoices by contract: %w", err)
+	}
+	defer rows.Close()
+
+	return scanInvoices(rows)
+}
+
+func (r *PostgresInvoiceRepository) FindByAccountID(ctx context.Context, accountID shared.AccountID) ([]*invoice.Invoice, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM invoices WHERE account_id = $1 ORDER BY created_at DESC`,
+		string(accountID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find invoices by account: %w", err)
+	}
+	defer rows.Close()
+
+	return scanInvoices(rows)
+}
+
+func (r *PostgresInvoiceRepository) FindOverdue(ctx context.Context) ([]*invoice.Invoice, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM invoices
+		 WHERE status = 'issued' AND due_date < NOW()
+		 ORDER BY due_date ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find overdue invoices: %w", err)
+	}
+	defer rows.Close()
+
+	return scanInvoices(rows)
+}
+
+func (r *PostgresInvoiceRepository) FindByStatus(ctx context.Context, status invoice.InvoiceStatus) ([]*invoice.Invoice, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM invoices WHERE status = $1 ORDER BY created_at DESC`,
+		string(status),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find invoices by status: %w", err)
+	}
+	defer rows.Close()
+
+	return scanInvoices(rows)
+}
+
 // FindByIDAsOf performs a temporal query — returns the invoice state as of the given time.
-func (r *PostgresInvoiceRepository) FindByIDAsOf(ctx context.Context, id string, asOf time.Time) (*invoice.Invoice, error) {
+func (r *PostgresInvoiceRepository) FindByIDAsOf(ctx context.Context, id shared.InvoiceID, asOf time.Time) (*invoice.Invoice, error) {
 	q := r.q(ctx)
 
 	var data json.RawMessage
@@ -102,7 +162,7 @@ func (r *PostgresInvoiceRepository) FindByIDAsOf(ctx context.Context, id string,
 		 WHERE id = $1 AND valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2)
 		 ORDER BY version DESC
 		 LIMIT 1`,
-		id, asOf,
+		string(id), asOf,
 	).Scan(&data)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -114,97 +174,55 @@ func (r *PostgresInvoiceRepository) FindByIDAsOf(ctx context.Context, id string,
 	return invoice.Unmarshal(data)
 }
 
-func (r *PostgresInvoiceRepository) FindByContractID(ctx context.Context, contractID string) ([]*invoice.Invoice, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM invoices WHERE contract_id = $1 ORDER BY created_at DESC`,
-		contractID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find invoices by contract: %w", err)
-	}
-	defer rows.Close()
-
-	return scanInvoices(rows)
-}
-
-func (r *PostgresInvoiceRepository) FindByAccountID(ctx context.Context, accountID string) ([]*invoice.Invoice, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM invoices WHERE account_id = $1 ORDER BY created_at DESC`,
-		accountID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find invoices by account: %w", err)
-	}
-	defer rows.Close()
-
-	return scanInvoices(rows)
-}
-
-func (r *PostgresInvoiceRepository) FindPending(ctx context.Context) ([]*invoice.Invoice, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM invoices WHERE status = 'pending' ORDER BY due_date ASC`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find pending invoices: %w", err)
-	}
-	defer rows.Close()
-
-	return scanInvoices(rows)
-}
-
-func (r *PostgresInvoiceRepository) FindOverdue(ctx context.Context, asOf time.Time) ([]*invoice.Invoice, error) {
+func (r *PostgresInvoiceRepository) FindByContractAndStatus(ctx context.Context, contractID shared.ContractID, status invoice.InvoiceStatus) ([]*invoice.Invoice, error) {
 	q := r.q(ctx)
 
 	rows, err := q.Query(ctx,
 		`SELECT data FROM invoices
-		 WHERE status = 'issued' AND due_date < $1
-		 ORDER BY due_date ASC`,
-		asOf,
+		 WHERE contract_id = $1 AND status = $2
+		 ORDER BY created_at DESC`,
+		string(contractID), string(status),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("find overdue invoices: %w", err)
+		return nil, fmt.Errorf("find invoices by contract and status: %w", err)
 	}
 	defer rows.Close()
 
 	return scanInvoices(rows)
 }
 
-func (r *PostgresInvoiceRepository) FindByStatus(ctx context.Context, status string) ([]*invoice.Invoice, error) {
+func (r *PostgresInvoiceRepository) FindByContractAndPeriod(ctx context.Context, contractID shared.ContractID, period shared.DateRange) ([]*invoice.Invoice, error) {
 	q := r.q(ctx)
 
 	rows, err := q.Query(ctx,
-		`SELECT data FROM invoices WHERE status = $1 ORDER BY created_at DESC`,
-		status,
+		`SELECT data FROM invoices
+		 WHERE contract_id = $1 AND issued_at >= $2 AND issued_at < $3
+		 ORDER BY issued_at ASC`,
+		string(contractID), period.From, period.To,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("find invoices by status: %w", err)
+		return nil, fmt.Errorf("find invoices by contract and period: %w", err)
 	}
 	defer rows.Close()
 
 	return scanInvoices(rows)
 }
 
-func (r *PostgresInvoiceRepository) Update(ctx context.Context, inv *invoice.Invoice) error {
-	return r.Save(ctx, inv)
-}
-
-func (r *PostgresInvoiceRepository) Delete(ctx context.Context, id string) error {
+func (r *PostgresInvoiceRepository) FindUnpaidByContract(ctx context.Context, contractID shared.ContractID) ([]*invoice.Invoice, error) {
 	q := r.q(ctx)
 
-	tag, err := q.Exec(ctx, `DELETE FROM invoices WHERE id = $1`, id)
+	rows, err := q.Query(ctx,
+		`SELECT data FROM invoices
+		 WHERE contract_id = $1 AND status NOT IN ('paid', 'voided', 'cancelled')
+		 ORDER BY due_date ASC`,
+		string(contractID),
+	)
 	if err != nil {
-		return fmt.Errorf("delete invoice: %w", err)
+		return nil, fmt.Errorf("find unpaid invoices by contract: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return invoice.ErrNotFound
-	}
-	return nil
+	defer rows.Close()
+
+	return scanInvoices(rows)
 }
 
 func scanInvoices(rows pgx.Rows) ([]*invoice.Invoice, error) {

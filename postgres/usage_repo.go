@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/domain/usage"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // PostgresUsageRepository implements usage.Repository.
-// Read-only in the billing flow; Record is idempotent via idempotency_key.
+// Record is idempotent via idempotency_key (ON CONFLICT DO NOTHING).
 type PostgresUsageRepository struct {
 	pool *pgxpool.Pool
 }
@@ -37,11 +38,11 @@ func (r *PostgresUsageRepository) Record(ctx context.Context, rec *usage.UsageRe
 	}
 
 	_, err = q.Exec(ctx,
-		`INSERT INTO usage_records (id, subscription_id, meter_id, quantity, timestamp, idempotency_key, data)
+		`INSERT INTO usage_records (id, contract_id, metric, quantity, timestamp, idempotency_key, data)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (idempotency_key) DO NOTHING`,
-		rec.ID(), rec.SubscriptionID(), rec.MeterID(), rec.Quantity(),
-		rec.Timestamp(), rec.IdempotencyKey(), data,
+		string(rec.ID()), string(rec.ContractID()), string(rec.Metric()),
+		rec.Quantity(), rec.Timestamp(), rec.IdempotencyKey(), data,
 	)
 	if err != nil {
 		return fmt.Errorf("record usage: %w", err)
@@ -49,58 +50,43 @@ func (r *PostgresUsageRepository) Record(ctx context.Context, rec *usage.UsageRe
 	return nil
 }
 
-func (r *PostgresUsageRepository) FindByID(ctx context.Context, id string) (*usage.UsageRecord, error) {
+// GetSummary returns an aggregated usage summary for a contract+metric within a date range.
+func (r *PostgresUsageRepository) GetSummary(ctx context.Context, contractID shared.ContractID, metric shared.MetricName, period shared.DateRange) (*usage.UsageSummary, error) {
 	q := r.q(ctx)
 
-	var data json.RawMessage
+	var totalQuantity int64
+	var count int64
 	err := q.QueryRow(ctx,
-		`SELECT data FROM usage_records WHERE id = $1`, id,
-	).Scan(&data)
+		`SELECT COALESCE(SUM(quantity), 0), COUNT(*)
+		 FROM usage_records
+		 WHERE contract_id = $1 AND metric = $2 AND timestamp >= $3 AND timestamp < $4`,
+		string(contractID), string(metric), period.From, period.To,
+	).Scan(&totalQuantity, &count)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return nil, usage.ErrNotFound
+			return usage.NewSummary(contractID, metric, period, 0, 0), nil
 		}
-		return nil, fmt.Errorf("find usage record: %w", err)
+		return nil, fmt.Errorf("get usage summary: %w", err)
 	}
 
-	return usage.Unmarshal(data)
+	return usage.NewSummary(contractID, metric, period, totalQuantity, count), nil
 }
 
-func (r *PostgresUsageRepository) FindBySubscriptionID(ctx context.Context, subscriptionID string, from, to time.Time) ([]*usage.UsageRecord, error) {
+// GetRecords returns individual usage records for a contract+metric within a time range.
+func (r *PostgresUsageRepository) GetRecords(ctx context.Context, contractID shared.ContractID, metric shared.MetricName, from, to time.Time) ([]*usage.UsageRecord, error) {
 	q := r.q(ctx)
 
 	rows, err := q.Query(ctx,
 		`SELECT data FROM usage_records
-		 WHERE subscription_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE contract_id = $1 AND metric = $2 AND timestamp >= $3 AND timestamp < $4
 		 ORDER BY timestamp ASC`,
-		subscriptionID, from, to,
+		string(contractID), string(metric), from, to,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("find usage by subscription: %w", err)
+		return nil, fmt.Errorf("get usage records: %w", err)
 	}
 	defer rows.Close()
 
-	return scanUsageRecords(rows)
-}
-
-func (r *PostgresUsageRepository) FindByMeterID(ctx context.Context, meterID string, from, to time.Time) ([]*usage.UsageRecord, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM usage_records
-		 WHERE meter_id = $1 AND timestamp >= $2 AND timestamp < $3
-		 ORDER BY timestamp ASC`,
-		meterID, from, to,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find usage by meter: %w", err)
-	}
-	defer rows.Close()
-
-	return scanUsageRecords(rows)
-}
-
-func scanUsageRecords(rows pgx.Rows) ([]*usage.UsageRecord, error) {
 	var records []*usage.UsageRecord
 	for rows.Next() {
 		var data json.RawMessage

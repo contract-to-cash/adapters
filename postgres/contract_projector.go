@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/contract-to-cash/core/eventstore"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,7 +14,7 @@ import (
 const contractProjectorName = "contract_projector"
 
 // ContractProjector implements projection.Projector for the Contract read model.
-// It listens to contract domain events and maintains the contract_read_models table.
+// Project handles a single event; Rebuild replays all events up to a timestamp.
 type ContractProjector struct {
 	pool       *pgxpool.Pool
 	es         *PostgresEventStore
@@ -24,53 +25,49 @@ func NewContractProjector(pool *pgxpool.Pool, es *PostgresEventStore, cp *Checkp
 	return &ContractProjector{pool: pool, es: es, checkpoint: cp}
 }
 
-// Project processes events from the last checkpoint and updates the read model.
-func (p *ContractProjector) Project(ctx context.Context) error {
-	lastPos, err := p.checkpoint.Load(ctx, contractProjectorName)
-	if err != nil {
-		return fmt.Errorf("load checkpoint: %w", err)
+// Project processes a single event and updates the contract read model.
+func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event) error {
+	if !isContractEvent(event) {
+		return nil
 	}
-
-	events, err := p.es.LoadAll(ctx, lastPos)
-	if err != nil {
-		return fmt.Errorf("load events: %w", err)
-	}
-
-	for _, evt := range events {
-		if !isContractEvent(evt) {
-			lastPos = evt.GlobalPosition
-			continue
-		}
-
-		if err := p.handleEvent(ctx, evt); err != nil {
-			return fmt.Errorf("handle event %s: %w", evt.ID, err)
-		}
-		lastPos = evt.GlobalPosition
-	}
-
-	if err := p.checkpoint.Save(ctx, contractProjectorName, lastPos); err != nil {
-		return fmt.Errorf("save checkpoint: %w", err)
-	}
-	return nil
+	return p.handleEvent(ctx, event)
 }
 
-// Rebuild drops and recreates the entire contract read model from scratch.
-func (p *ContractProjector) Rebuild(ctx context.Context) error {
+// Rebuild drops and recreates the contract read model from all events up to the given time.
+func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error {
 	q := QuerierFromContext(ctx, p.pool)
 
-	// Truncate read model
 	_, err := q.Exec(ctx, `TRUNCATE contract_read_models`)
 	if err != nil {
 		return fmt.Errorf("truncate contract read models: %w", err)
 	}
 
-	// Reset checkpoint
 	if err := p.checkpoint.Reset(ctx, contractProjectorName); err != nil {
 		return fmt.Errorf("reset checkpoint: %w", err)
 	}
 
-	// Replay all events
-	return p.Project(ctx)
+	events, err := p.es.loadAllUntil(ctx, until)
+	if err != nil {
+		return fmt.Errorf("load all events: %w", err)
+	}
+
+	for _, evt := range events {
+		if !isContractEvent(evt) {
+			continue
+		}
+		if err := p.handleEvent(ctx, evt); err != nil {
+			return fmt.Errorf("handle event %s: %w", evt.ID, err)
+		}
+	}
+
+	if len(events) > 0 {
+		lastPos := events[len(events)-1].GlobalPosition
+		if err := p.checkpoint.Save(ctx, contractProjectorName, lastPos); err != nil {
+			return fmt.Errorf("save checkpoint: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (p *ContractProjector) handleEvent(ctx context.Context, evt eventstore.Event) error {
@@ -78,7 +75,6 @@ func (p *ContractProjector) handleEvent(ctx context.Context, evt eventstore.Even
 
 	contractID := extractContractID(evt.StreamID)
 
-	// Extract common fields from event data
 	var data map[string]interface{}
 	raw, ok := evt.Data.(json.RawMessage)
 	if !ok {
@@ -92,46 +88,45 @@ func (p *ContractProjector) handleEvent(ctx context.Context, evt eventstore.Even
 		return fmt.Errorf("unmarshal event data: %w", err)
 	}
 
+	eventType := string(evt.Type)
+
 	switch {
-	case strings.HasSuffix(evt.Type, "Created"):
+	case strings.HasSuffix(eventType, "Created"):
 		accountID, _ := data["account_id"].(string)
 		startDate, _ := data["start_date"].(string)
 		_, err := q.Exec(ctx,
 			`INSERT INTO contract_read_models (id, account_id, status, start_date, data, version)
 			 VALUES ($1, $2, 'draft', $3, $4, $5)
 			 ON CONFLICT (id) DO UPDATE SET
-			   account_id = EXCLUDED.account_id,
-			   status     = 'draft',
-			   start_date = EXCLUDED.start_date,
-			   data       = EXCLUDED.data,
-			   version    = EXCLUDED.version,
-			   updated_at = NOW()`,
+			   account_id = EXCLUDED.account_id, status = 'draft',
+			   start_date = EXCLUDED.start_date, data = EXCLUDED.data,
+			   version = EXCLUDED.version, updated_at = NOW()`,
 			contractID, accountID, startDate, raw, evt.Version,
 		)
 		return err
 
-	case strings.HasSuffix(evt.Type, "Activated"):
+	case strings.HasSuffix(eventType, "Activated"):
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models SET status = 'active', version = $1, updated_at = NOW() WHERE id = $2`,
 			evt.Version, contractID,
 		)
 		return err
 
-	case strings.HasSuffix(evt.Type, "Suspended"):
+	case strings.HasSuffix(eventType, "Suspended"):
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models SET status = 'suspended', version = $1, updated_at = NOW() WHERE id = $2`,
 			evt.Version, contractID,
 		)
 		return err
 
-	case strings.HasSuffix(evt.Type, "Cancelled"):
+	case strings.HasSuffix(eventType, "Cancelled"):
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models SET status = 'cancelled', version = $1, updated_at = NOW() WHERE id = $2`,
 			evt.Version, contractID,
 		)
 		return err
 
-	case strings.HasSuffix(evt.Type, "Renewed"):
+	case strings.HasSuffix(eventType, "Renewed"):
 		endDate, _ := data["end_date"].(string)
 		renewalDate, _ := data["renewal_date"].(string)
 		_, err := q.Exec(ctx,
@@ -142,8 +137,17 @@ func (p *ContractProjector) handleEvent(ctx context.Context, evt eventstore.Even
 		)
 		return err
 
+	case strings.HasSuffix(eventType, "TrialStarted"):
+		trialEnd, _ := data["trial_end_date"].(string)
+		_, err := q.Exec(ctx,
+			`UPDATE contract_read_models
+			 SET status = 'trial', trial_end_date = $1, version = $2, updated_at = NOW()
+			 WHERE id = $3`,
+			trialEnd, evt.Version, contractID,
+		)
+		return err
+
 	default:
-		// Unknown event type — update version and data for forward compatibility
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models SET data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
 			raw, evt.Version, contractID,

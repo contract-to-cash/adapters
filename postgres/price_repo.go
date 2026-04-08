@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/contract-to-cash/core/domain/pricing"
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -26,6 +27,53 @@ func (r *PostgresPriceRepository) q(ctx context.Context) Querier {
 	return QuerierFromContext(ctx, r.pool)
 }
 
+func (r *PostgresPriceRepository) FindByID(ctx context.Context, id shared.PriceID) (*pricing.Price, error) {
+	q := r.q(ctx)
+
+	var data json.RawMessage
+	err := q.QueryRow(ctx, `SELECT data FROM prices WHERE id = $1`, string(id)).Scan(&data)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, pricing.ErrNotFound
+		}
+		return nil, fmt.Errorf("find price: %w", err)
+	}
+
+	return pricing.UnmarshalPrice(data)
+}
+
+func (r *PostgresPriceRepository) FindByProductID(ctx context.Context, productID shared.ProductID) ([]*pricing.Price, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM prices WHERE product_id = $1 ORDER BY created_at DESC`,
+		string(productID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find prices by product: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPrices(rows)
+}
+
+func (r *PostgresPriceRepository) FindActiveByProductID(ctx context.Context, productID shared.ProductID) ([]*pricing.Price, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM prices
+		 WHERE product_id = $1 AND status = 'active'
+		 ORDER BY created_at DESC`,
+		string(productID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find active prices by product: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPrices(rows)
+}
+
 func (r *PostgresPriceRepository) Save(ctx context.Context, p *pricing.Price) error {
 	q := r.q(ctx)
 
@@ -43,71 +91,13 @@ func (r *PostgresPriceRepository) Save(ctx context.Context, p *pricing.Price) er
 		   status         = EXCLUDED.status,
 		   data           = EXCLUDED.data,
 		   updated_at     = NOW()`,
-		p.ID(), p.ProductID(), p.Amount(), p.Currency(), p.BillingPeriod(), p.Status(), data,
+		string(p.ID()), string(p.ProductID()), p.Amount(), string(p.Currency()),
+		p.BillingPeriod(), string(p.Status()), data,
 	)
 	if err != nil {
 		return fmt.Errorf("save price: %w", err)
 	}
 	return nil
-}
-
-func (r *PostgresPriceRepository) FindByID(ctx context.Context, id string) (*pricing.Price, error) {
-	q := r.q(ctx)
-
-	var data json.RawMessage
-	err := q.QueryRow(ctx, `SELECT data FROM prices WHERE id = $1`, id).Scan(&data)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, pricing.ErrNotFound
-		}
-		return nil, fmt.Errorf("find price: %w", err)
-	}
-
-	return pricing.UnmarshalPrice(data)
-}
-
-func (r *PostgresPriceRepository) FindByProductID(ctx context.Context, productID string) ([]*pricing.Price, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM prices WHERE product_id = $1 ORDER BY created_at DESC`,
-		productID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find prices by product: %w", err)
-	}
-	defer rows.Close()
-
-	return scanPrices(rows)
-}
-
-func (r *PostgresPriceRepository) FindActive(ctx context.Context) ([]*pricing.Price, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM prices WHERE status = 'active' ORDER BY product_id, created_at DESC`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find active prices: %w", err)
-	}
-	defer rows.Close()
-
-	return scanPrices(rows)
-}
-
-func (r *PostgresPriceRepository) FindActiveByProductID(ctx context.Context, productID string) ([]*pricing.Price, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM prices WHERE product_id = $1 AND status = 'active' ORDER BY created_at DESC`,
-		productID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find active prices by product: %w", err)
-	}
-	defer rows.Close()
-
-	return scanPrices(rows)
 }
 
 func scanPrices(rows pgx.Rows) ([]*pricing.Price, error) {

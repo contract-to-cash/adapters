@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/contract-to-cash/core/eventstore"
@@ -85,60 +84,87 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 
 // Load loads all events for a stream ordered by version.
 func (s *PostgresEventStore) Load(ctx context.Context, streamID string) ([]eventstore.Event, error) {
-	return s.LoadFrom(ctx, streamID, 0)
-}
-
-// LoadFrom loads events for a stream starting from the given version (exclusive).
-func (s *PostgresEventStore) LoadFrom(ctx context.Context, streamID string, fromVersion int) ([]eventstore.Event, error) {
 	q := s.querier(ctx)
 
 	rows, err := q.Query(ctx,
 		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
 		 FROM events
-		 WHERE stream_id = $1 AND version > $2
+		 WHERE stream_id = $1
 		 ORDER BY version ASC`,
-		streamID, fromVersion,
+		streamID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("query events: %w", err)
+		return nil, fmt.Errorf("load events: %w", err)
 	}
 	defer rows.Close()
 
 	return scanEvents(rows)
 }
 
-// LoadAll loads all events from the given global position (exclusive), used by projectors.
-func (s *PostgresEventStore) LoadAll(ctx context.Context, fromPosition int64) ([]eventstore.Event, error) {
+// LoadUntilVersion loads events for a stream up to (inclusive) the given version.
+func (s *PostgresEventStore) LoadUntilVersion(ctx context.Context, streamID string, version int) ([]eventstore.Event, error) {
 	q := s.querier(ctx)
 
 	rows, err := q.Query(ctx,
 		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
 		 FROM events
-		 WHERE global_position > $1
-		 ORDER BY global_position ASC`,
-		fromPosition,
+		 WHERE stream_id = $1 AND version <= $2
+		 ORDER BY version ASC`,
+		streamID, version,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("query all events: %w", err)
+		return nil, fmt.Errorf("load events until version: %w", err)
 	}
 	defer rows.Close()
 
 	return scanEvents(rows)
 }
 
-// Subscribe returns a Subscription that receives events from the given global position.
-// Uses a hybrid LISTEN/NOTIFY + polling approach.
-// Slow subscribers are dropped (buffer size 100) to match InMemory semantics.
-func (s *PostgresEventStore) Subscribe(ctx context.Context, fromPosition int64) (eventstore.Subscription, error) {
-	sub := &postgresSubscription{
-		store:    s,
-		ch:       make(chan eventstore.Event, subscriberBuffer),
-		done:     make(chan struct{}),
-		position: fromPosition,
-	}
+// LoadUntil loads events for a stream up to the given timestamp.
+func (s *PostgresEventStore) LoadUntil(ctx context.Context, streamID string, until time.Time) ([]eventstore.Event, error) {
+	q := s.querier(ctx)
 
-	go sub.run(ctx)
-	return sub, nil
+	rows, err := q.Query(ctx,
+		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
+		 FROM events
+		 WHERE stream_id = $1 AND occurred_at <= $2
+		 ORDER BY version ASC`,
+		streamID, until,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load events until time: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEvents(rows)
+}
+
+// LoadRange loads events for a stream within the given time range.
+func (s *PostgresEventStore) LoadRange(ctx context.Context, streamID string, from, to time.Time) ([]eventstore.Event, error) {
+	q := s.querier(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
+		 FROM events
+		 WHERE stream_id = $1 AND occurred_at >= $2 AND occurred_at <= $3
+		 ORDER BY version ASC`,
+		streamID, from, to,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load events in range: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEvents(rows)
+}
+
+// Subscribe returns a channel that receives events from the given global position.
+// Uses a hybrid LISTEN/NOTIFY + polling approach.
+// Slow subscribers are dropped (matching InMemory semantics, buffer size 100).
+func (s *PostgresEventStore) Subscribe(ctx context.Context, fromPosition int64) (<-chan eventstore.Event, error) {
+	ch := make(chan eventstore.Event, subscriberBuffer)
+	go s.runSubscription(ctx, fromPosition, ch)
+	return ch, nil
 }
 
 // SaveSnapshot saves or upserts a snapshot for the given stream.
@@ -187,47 +213,66 @@ func (s *PostgresEventStore) LoadSnapshot(ctx context.Context, streamID string) 
 	return &snap, nil
 }
 
-// DeleteSnapshot deletes all snapshots for a stream.
-func (s *PostgresEventStore) DeleteSnapshot(ctx context.Context, streamID string) error {
+// LoadSnapshotBefore loads the latest snapshot for a stream that was taken before the given time.
+func (s *PostgresEventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	q := s.querier(ctx)
 
-	_, err := q.Exec(ctx,
-		`DELETE FROM snapshots WHERE stream_id = $1`,
-		streamID,
+	var snap eventstore.Snapshot
+	var state json.RawMessage
+	err := q.QueryRow(ctx,
+		`SELECT stream_id, version, state, as_of, created_at
+		 FROM snapshots
+		 WHERE stream_id = $1 AND as_of < $2
+		 ORDER BY version DESC
+		 LIMIT 1`,
+		streamID, before,
+	).Scan(&snap.StreamID, &snap.Version, &state, &snap.AsOf, &snap.CreatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load snapshot before: %w", err)
+	}
+	snap.State = state
+	return &snap, nil
+}
+
+// --- internal: load all events from global position (used by projectors) ---
+
+func (s *PostgresEventStore) loadAllFrom(ctx context.Context, fromPosition int64) ([]eventstore.Event, error) {
+	q := s.querier(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
+		 FROM events
+		 WHERE global_position > $1
+		 ORDER BY global_position ASC`,
+		fromPosition,
 	)
 	if err != nil {
-		return fmt.Errorf("delete snapshot: %w", err)
+		return nil, fmt.Errorf("load all events: %w", err)
 	}
-	return nil
+	defer rows.Close()
+
+	return scanEvents(rows)
 }
 
-// GetStreamVersion returns the current version of a stream (0 if stream does not exist).
-func (s *PostgresEventStore) GetStreamVersion(ctx context.Context, streamID string) (int, error) {
+func (s *PostgresEventStore) loadAllUntil(ctx context.Context, until time.Time) ([]eventstore.Event, error) {
 	q := s.querier(ctx)
 
-	var version int
-	err := q.QueryRow(ctx,
-		`SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = $1`,
-		streamID,
-	).Scan(&version)
+	rows, err := q.Query(ctx,
+		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
+		 FROM events
+		 WHERE occurred_at <= $1
+		 ORDER BY global_position ASC`,
+		until,
+	)
 	if err != nil {
-		return 0, fmt.Errorf("get stream version: %w", err)
+		return nil, fmt.Errorf("load all events until: %w", err)
 	}
-	return version, nil
-}
+	defer rows.Close()
 
-// GetLastPosition returns the last global position across all events.
-func (s *PostgresEventStore) GetLastPosition(ctx context.Context) (int64, error) {
-	q := s.querier(ctx)
-
-	var pos int64
-	err := q.QueryRow(ctx,
-		`SELECT COALESCE(MAX(global_position), 0) FROM events`,
-	).Scan(&pos)
-	if err != nil {
-		return 0, fmt.Errorf("get last position: %w", err)
-	}
-	return pos, nil
+	return scanEvents(rows)
 }
 
 // --- helpers ---
@@ -256,108 +301,63 @@ func scanEvents(rows pgx.Rows) ([]eventstore.Event, error) {
 
 // --- subscription ---
 
-type postgresSubscription struct {
-	store    *PostgresEventStore
-	ch       chan eventstore.Event
-	done     chan struct{}
-	position int64
-	closeOnce sync.Once
-	err      error
-	mu       sync.Mutex
-}
+func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition int64, ch chan<- eventstore.Event) {
+	defer close(ch)
 
-func (sub *postgresSubscription) Events() <-chan eventstore.Event {
-	return sub.ch
-}
-
-func (sub *postgresSubscription) Close() error {
-	sub.closeOnce.Do(func() {
-		close(sub.done)
-	})
-	return nil
-}
-
-func (sub *postgresSubscription) Err() error {
-	sub.mu.Lock()
-	defer sub.mu.Unlock()
-	return sub.err
-}
-
-func (sub *postgresSubscription) setErr(err error) {
-	sub.mu.Lock()
-	defer sub.mu.Unlock()
-	sub.err = err
-}
-
-func (sub *postgresSubscription) run(ctx context.Context) {
-	defer close(sub.ch)
-
-	// Acquire a dedicated connection for LISTEN
-	conn, err := sub.store.pool.Acquire(ctx)
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		sub.setErr(fmt.Errorf("acquire conn for listen: %w", err))
 		return
 	}
 	defer conn.Release()
 
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", eventsChannel))
 	if err != nil {
-		sub.setErr(fmt.Errorf("listen: %w", err))
 		return
 	}
 
+	position := fromPosition
+
 	// Initial catch-up
-	if err := sub.catchUp(ctx); err != nil {
-		sub.setErr(err)
+	if err := s.catchUp(ctx, &position, ch); err != nil {
 		return
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			sub.setErr(ctx.Err())
-			return
-		case <-sub.done:
 			return
 		default:
 		}
 
-		// Wait for notification with timeout for periodic polling
-		notification, err := conn.Conn().WaitForNotification(ctx)
+		_, err := conn.Conn().WaitForNotification(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				sub.setErr(ctx.Err())
 				return
 			}
-			// On error, fall through to poll-based catch-up
 			time.Sleep(100 * time.Millisecond)
 		}
-		_ = notification
 
-		if err := sub.catchUp(ctx); err != nil {
-			sub.setErr(err)
+		if err := s.catchUp(ctx, &position, ch); err != nil {
 			return
 		}
 	}
 }
 
-func (sub *postgresSubscription) catchUp(ctx context.Context) error {
-	events, err := sub.store.LoadAll(ctx, sub.position)
+func (s *PostgresEventStore) catchUp(ctx context.Context, position *int64, ch chan<- eventstore.Event) error {
+	events, err := s.loadAllFrom(ctx, *position)
 	if err != nil {
-		return fmt.Errorf("catch-up load: %w", err)
+		return err
 	}
 
 	for _, evt := range events {
 		select {
-		case sub.ch <- evt:
-			sub.position = evt.GlobalPosition
+		case ch <- evt:
+			*position = evt.GlobalPosition
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-sub.done:
-			return nil
 		default:
-			// Slow subscriber — drop (matching InMemory semantics)
-			sub.position = evt.GlobalPosition
+			// Slow subscriber — drop event (matching InMemory semantics)
+			*position = evt.GlobalPosition
 		}
 	}
 	return nil

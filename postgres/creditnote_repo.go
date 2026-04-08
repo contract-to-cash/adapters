@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/contract-to-cash/core/domain/invoice"
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,13 +36,15 @@ func (r *PostgresCreditNoteRepository) Save(ctx context.Context, cn *invoice.Cre
 	}
 
 	_, err = q.Exec(ctx,
-		`INSERT INTO credit_notes (id, invoice_id, amount, currency, reason, status, data)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO credit_notes (id, invoice_id, contract_id, account_id, amount, currency, reason, status, data)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 ON CONFLICT (id) DO UPDATE SET
 		   status     = EXCLUDED.status,
 		   data       = EXCLUDED.data,
 		   updated_at = NOW()`,
-		cn.ID(), cn.InvoiceID(), cn.Amount(), cn.Currency(), cn.Reason(), cn.Status(), data,
+		string(cn.ID()), string(cn.InvoiceID()), string(cn.ContractID()),
+		string(cn.AccountID()), cn.Amount(), string(cn.Currency()),
+		cn.Reason(), string(cn.Status()), data,
 	)
 	if err != nil {
 		return fmt.Errorf("save credit note: %w", err)
@@ -49,12 +52,12 @@ func (r *PostgresCreditNoteRepository) Save(ctx context.Context, cn *invoice.Cre
 	return nil
 }
 
-func (r *PostgresCreditNoteRepository) FindByID(ctx context.Context, id string) (*invoice.CreditNote, error) {
+func (r *PostgresCreditNoteRepository) FindByID(ctx context.Context, id shared.CreditNoteID) (*invoice.CreditNote, error) {
 	q := r.q(ctx)
 
 	var data json.RawMessage
 	err := q.QueryRow(ctx,
-		`SELECT data FROM credit_notes WHERE id = $1`, id,
+		`SELECT data FROM credit_notes WHERE id = $1`, string(id),
 	).Scan(&data)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -66,18 +69,67 @@ func (r *PostgresCreditNoteRepository) FindByID(ctx context.Context, id string) 
 	return invoice.UnmarshalCreditNote(data)
 }
 
-func (r *PostgresCreditNoteRepository) FindByInvoiceID(ctx context.Context, invoiceID string) ([]*invoice.CreditNote, error) {
+func (r *PostgresCreditNoteRepository) FindByInvoiceID(ctx context.Context, invoiceID shared.InvoiceID) ([]*invoice.CreditNote, error) {
 	q := r.q(ctx)
 
 	rows, err := q.Query(ctx,
 		`SELECT data FROM credit_notes WHERE invoice_id = $1 ORDER BY created_at DESC`,
-		invoiceID,
+		string(invoiceID),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("find credit notes by invoice: %w", err)
 	}
 	defer rows.Close()
 
+	return scanCreditNotes(rows)
+}
+
+func (r *PostgresCreditNoteRepository) FindByAccountID(ctx context.Context, accountID shared.AccountID) ([]*invoice.CreditNote, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM credit_notes WHERE account_id = $1 ORDER BY created_at DESC`,
+		string(accountID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find credit notes by account: %w", err)
+	}
+	defer rows.Close()
+
+	return scanCreditNotes(rows)
+}
+
+func (r *PostgresCreditNoteRepository) FindByContractID(ctx context.Context, contractID shared.ContractID) ([]*invoice.CreditNote, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM credit_notes WHERE contract_id = $1 ORDER BY created_at DESC`,
+		string(contractID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find credit notes by contract: %w", err)
+	}
+	defer rows.Close()
+
+	return scanCreditNotes(rows)
+}
+
+func (r *PostgresCreditNoteRepository) FindByStatus(ctx context.Context, status invoice.CreditNoteStatus) ([]*invoice.CreditNote, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM credit_notes WHERE status = $1 ORDER BY created_at DESC`,
+		string(status),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find credit notes by status: %w", err)
+	}
+	defer rows.Close()
+
+	return scanCreditNotes(rows)
+}
+
+func scanCreditNotes(rows pgx.Rows) ([]*invoice.CreditNote, error) {
 	var notes []*invoice.CreditNote
 	for rows.Next() {
 		var data json.RawMessage

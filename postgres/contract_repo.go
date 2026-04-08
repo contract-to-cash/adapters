@@ -2,11 +2,11 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/contract-to-cash/core/domain/contract"
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/eventstore"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,8 +29,8 @@ func NewContractRepository(pool *pgxpool.Pool, es *PostgresEventStore) *Postgres
 }
 
 // Save persists uncommitted domain events for the aggregate.
-func (r *PostgresContractRepository) Save(ctx context.Context, aggregate *contract.Aggregate) error {
-	changes := aggregate.Changes()
+func (r *PostgresContractRepository) Save(ctx context.Context, aggregate *contract.ContractAggregate) error {
+	changes := aggregate.UncommittedEvents()
 	if len(changes) == 0 {
 		return nil
 	}
@@ -42,66 +42,81 @@ func (r *PostgresContractRepository) Save(ctx context.Context, aggregate *contra
 		return fmt.Errorf("append contract events: %w", err)
 	}
 
-	aggregate.ClearChanges()
+	aggregate.ClearUncommittedEvents()
 	return nil
 }
 
 // FindByID restores a ContractAggregate from snapshot + event replay.
-func (r *PostgresContractRepository) FindByID(ctx context.Context, id string) (*contract.Aggregate, error) {
+func (r *PostgresContractRepository) FindByID(ctx context.Context, id shared.ContractID) (*contract.ContractAggregate, error) {
 	es := r.txEventStore(ctx)
-	streamID := contractStreamID(id)
+	streamID := contractStreamID(string(id))
 
-	// Try loading snapshot first
 	snap, err := es.LoadSnapshot(ctx, streamID)
 	if err != nil {
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
 
-	var agg *contract.Aggregate
-	fromVersion := 0
+	agg := contract.NewEmptyAggregate(id)
 
 	if snap != nil {
-		state, ok := snap.State.(json.RawMessage)
-		if !ok {
-			stateBytes, err := json.Marshal(snap.State)
-			if err != nil {
-				return nil, fmt.Errorf("marshal snapshot state: %w", err)
-			}
-			state = stateBytes
-		}
-		agg, err = contract.RestoreFromSnapshot(state, snap.Version)
-		if err != nil {
+		if err := agg.LoadFromSnapshot(*snap); err != nil {
 			return nil, fmt.Errorf("restore from snapshot: %w", err)
 		}
-		fromVersion = snap.Version
 	}
 
-	// Replay events after snapshot
-	events, err := es.LoadFrom(ctx, streamID, fromVersion)
-	if err != nil {
-		return nil, fmt.Errorf("load events: %w", err)
+	fromVersion := agg.Version()
+	var events []eventstore.Event
+	if fromVersion > 0 {
+		events, err = es.Load(ctx, streamID)
+		if err != nil {
+			return nil, fmt.Errorf("load events: %w", err)
+		}
+		// Filter to events after snapshot version
+		filtered := make([]eventstore.Event, 0)
+		for _, evt := range events {
+			if evt.Version > fromVersion {
+				filtered = append(filtered, evt)
+			}
+		}
+		events = filtered
+	} else {
+		events, err = es.Load(ctx, streamID)
+		if err != nil {
+			return nil, fmt.Errorf("load events: %w", err)
+		}
 	}
 
-	if agg == nil && len(events) == 0 {
+	if snap == nil && len(events) == 0 {
 		return nil, contract.ErrNotFound
 	}
 
-	if agg == nil {
-		agg = contract.NewEmptyAggregate(id)
-	}
-
-	for _, evt := range events {
-		if err := agg.Apply(evt); err != nil {
-			return nil, fmt.Errorf("apply event %s: %w", evt.ID, err)
+	if len(events) > 0 {
+		if err := agg.LoadFromHistory(events); err != nil {
+			return nil, fmt.Errorf("load from history: %w", err)
 		}
 	}
 
 	return agg, nil
 }
 
+// FindByAccountID finds all contracts for an account.
+func (r *PostgresContractRepository) FindByAccountID(ctx context.Context, accountID shared.AccountID) ([]*contract.ContractAggregate, error) {
+	q := QuerierFromContext(ctx, r.pool)
+
+	rows, err := q.Query(ctx,
+		`SELECT id FROM contract_read_models WHERE account_id = $1`,
+		string(accountID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query contracts by account: %w", err)
+	}
+	defer rows.Close()
+
+	return r.loadAggregatesByRows(ctx, rows)
+}
+
 // FindExpiring finds contracts expiring before the given time.
-// Queries the read model, then restores full aggregates from EventStore.
-func (r *PostgresContractRepository) FindExpiring(ctx context.Context, before time.Time) ([]*contract.Aggregate, error) {
+func (r *PostgresContractRepository) FindExpiring(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
 	q := QuerierFromContext(ctx, r.pool)
 
 	rows, err := q.Query(ctx,
@@ -117,14 +132,78 @@ func (r *PostgresContractRepository) FindExpiring(ctx context.Context, before ti
 	return r.loadAggregatesByRows(ctx, rows)
 }
 
-// FindDueForRenewal finds contracts due for renewal before the given time.
-func (r *PostgresContractRepository) FindDueForRenewal(ctx context.Context, before time.Time) ([]*contract.Aggregate, error) {
+// FindTrialsEndingSoon finds contracts with trials ending before the given time.
+func (r *PostgresContractRepository) FindTrialsEndingSoon(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
 	q := QuerierFromContext(ctx, r.pool)
 
 	rows, err := q.Query(ctx,
 		`SELECT id FROM contract_read_models
-		 WHERE renewal_date IS NOT NULL AND renewal_date < $1 AND status = 'active'`,
+		 WHERE trial_end_date IS NOT NULL AND trial_end_date < $1 AND status = 'trial'`,
 		before,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query trials ending soon: %w", err)
+	}
+	defer rows.Close()
+
+	return r.loadAggregatesByRows(ctx, rows)
+}
+
+// FindByIDAsOf restores a ContractAggregate as it was at the given point in time.
+func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared.ContractID, asOf time.Time) (*contract.ContractAggregate, error) {
+	es := r.txEventStore(ctx)
+	streamID := contractStreamID(string(id))
+
+	// Load snapshot before asOf
+	snap, err := es.LoadSnapshotBefore(ctx, streamID, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("load snapshot before: %w", err)
+	}
+
+	agg := contract.NewEmptyAggregate(id)
+
+	if snap != nil {
+		if err := agg.LoadFromSnapshot(*snap); err != nil {
+			return nil, fmt.Errorf("restore from snapshot: %w", err)
+		}
+	}
+
+	// Load events up to asOf
+	events, err := es.LoadUntil(ctx, streamID, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("load events until: %w", err)
+	}
+
+	// Filter to events after snapshot version
+	fromVersion := agg.Version()
+	filtered := make([]eventstore.Event, 0)
+	for _, evt := range events {
+		if evt.Version > fromVersion {
+			filtered = append(filtered, evt)
+		}
+	}
+
+	if snap == nil && len(filtered) == 0 {
+		return nil, contract.ErrNotFound
+	}
+
+	if len(filtered) > 0 {
+		if err := agg.LoadFromHistory(filtered); err != nil {
+			return nil, fmt.Errorf("load from history: %w", err)
+		}
+	}
+
+	return agg, nil
+}
+
+// FindDueForRenewal finds contracts due for renewal as of the given time.
+func (r *PostgresContractRepository) FindDueForRenewal(ctx context.Context, asOf time.Time) ([]*contract.ContractAggregate, error) {
+	q := QuerierFromContext(ctx, r.pool)
+
+	rows, err := q.Query(ctx,
+		`SELECT id FROM contract_read_models
+		 WHERE renewal_date IS NOT NULL AND renewal_date <= $1 AND status = 'active'`,
+		asOf,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query renewal contracts: %w", err)
@@ -134,24 +213,8 @@ func (r *PostgresContractRepository) FindDueForRenewal(ctx context.Context, befo
 	return r.loadAggregatesByRows(ctx, rows)
 }
 
-// FindByAccountID finds all contracts for an account.
-func (r *PostgresContractRepository) FindByAccountID(ctx context.Context, accountID string) ([]*contract.Aggregate, error) {
-	q := QuerierFromContext(ctx, r.pool)
-
-	rows, err := q.Query(ctx,
-		`SELECT id FROM contract_read_models WHERE account_id = $1`,
-		accountID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("query contracts by account: %w", err)
-	}
-	defer rows.Close()
-
-	return r.loadAggregatesByRows(ctx, rows)
-}
-
 // loadAggregatesByRows takes rows containing IDs, and restores each aggregate from EventStore.
-func (r *PostgresContractRepository) loadAggregatesByRows(ctx context.Context, rows pgx.Rows) ([]*contract.Aggregate, error) {
+func (r *PostgresContractRepository) loadAggregatesByRows(ctx context.Context, rows pgx.Rows) ([]*contract.ContractAggregate, error) {
 	var ids []string
 	for rows.Next() {
 		var id string
@@ -164,9 +227,9 @@ func (r *PostgresContractRepository) loadAggregatesByRows(ctx context.Context, r
 		return nil, fmt.Errorf("rows error: %w", err)
 	}
 
-	aggregates := make([]*contract.Aggregate, 0, len(ids))
+	aggregates := make([]*contract.ContractAggregate, 0, len(ids))
 	for _, id := range ids {
-		agg, err := r.FindByID(ctx, id)
+		agg, err := r.FindByID(ctx, shared.ContractID(id))
 		if err != nil {
 			return nil, fmt.Errorf("find contract %s: %w", id, err)
 		}

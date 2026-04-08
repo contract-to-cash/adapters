@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/contract-to-cash/core/domain/payment"
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -40,8 +41,8 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 		   status     = EXCLUDED.status,
 		   data       = EXCLUDED.data,
 		   updated_at = NOW()`,
-		p.ID(), p.InvoiceID(), p.IdempotencyKey(), p.Amount(), p.Currency(),
-		p.Status(), p.Method(), data,
+		string(p.ID()), string(p.InvoiceID()), p.IdempotencyKey(),
+		p.Amount(), string(p.Currency()), string(p.Status()), p.Method(), data,
 	)
 	if err != nil {
 		return fmt.Errorf("save payment: %w", err)
@@ -49,11 +50,11 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 	return nil
 }
 
-func (r *PostgresPaymentRepository) FindByID(ctx context.Context, id string) (*payment.Payment, error) {
+func (r *PostgresPaymentRepository) FindByID(ctx context.Context, id shared.PaymentID) (*payment.Payment, error) {
 	q := r.q(ctx)
 
 	var data json.RawMessage
-	err := q.QueryRow(ctx, `SELECT data FROM payments WHERE id = $1`, id).Scan(&data)
+	err := q.QueryRow(ctx, `SELECT data FROM payments WHERE id = $1`, string(id)).Scan(&data)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, payment.ErrNotFound
@@ -62,6 +63,21 @@ func (r *PostgresPaymentRepository) FindByID(ctx context.Context, id string) (*p
 	}
 
 	return payment.Unmarshal(data)
+}
+
+func (r *PostgresPaymentRepository) FindByInvoiceID(ctx context.Context, invoiceID shared.InvoiceID) ([]*payment.Payment, error) {
+	q := r.q(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT data FROM payments WHERE invoice_id = $1 ORDER BY created_at DESC`,
+		string(invoiceID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find payments by invoice: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPayments(rows)
 }
 
 // FindByIdempotencyKey looks up a payment by its idempotency key for duplicate detection.
@@ -80,25 +96,6 @@ func (r *PostgresPaymentRepository) FindByIdempotencyKey(ctx context.Context, ke
 	}
 
 	return payment.Unmarshal(data)
-}
-
-func (r *PostgresPaymentRepository) FindByInvoiceID(ctx context.Context, invoiceID string) ([]*payment.Payment, error) {
-	q := r.q(ctx)
-
-	rows, err := q.Query(ctx,
-		`SELECT data FROM payments WHERE invoice_id = $1 ORDER BY created_at DESC`,
-		invoiceID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find payments by invoice: %w", err)
-	}
-	defer rows.Close()
-
-	return scanPayments(rows)
-}
-
-func (r *PostgresPaymentRepository) Update(ctx context.Context, p *payment.Payment) error {
-	return r.Save(ctx, p)
 }
 
 func scanPayments(rows pgx.Rows) ([]*payment.Payment, error) {
