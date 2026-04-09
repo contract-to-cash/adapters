@@ -162,7 +162,7 @@ func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared
 	}
 
 	fromVersion := agg.Version()
-	relevant := events[:0]
+	var relevant []eventstore.Event
 	for _, evt := range events {
 		if evt.Version > fromVersion {
 			relevant = append(relevant, evt)

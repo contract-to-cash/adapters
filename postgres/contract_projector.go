@@ -37,9 +37,14 @@ func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event)
 // Uses DEFERRABLE FK + DELETE (not TRUNCATE) so that other tables referencing
 // contract_read_models via DEFERRABLE FK remain valid at commit time.
 func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error {
+	// SET CONSTRAINTS ALL DEFERRED only works inside a transaction.
+	// Caller must wrap Rebuild in RunInTx.
+	if _, ok := TxFromContext(ctx); !ok {
+		return fmt.Errorf("contract projector rebuild must run within a transaction")
+	}
+
 	q := QuerierFromContext(ctx, p.pool)
 
-	// Defer FK constraints so DELETE doesn't fail while we rebuild
 	_, err := q.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`)
 	if err != nil {
 		return fmt.Errorf("defer constraints: %w", err)

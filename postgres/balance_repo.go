@@ -93,22 +93,25 @@ func (r *PostgresBalanceRepository) FindAvailable(ctx context.Context, accountID
 func (r *PostgresBalanceRepository) GetBalance(ctx context.Context, accountID shared.AccountID, currency shared.Currency) (shared.Money, error) {
 	q := r.q(ctx)
 
-	var totalEntries, totalApplied int64
+	var totalEntries, totalApplied, totalRefunded int64
 	err := q.QueryRow(ctx,
 		`SELECT
 		   COALESCE(SUM(be.amount), 0),
 		   COALESCE((SELECT SUM(ba.amount) FROM balance_applications ba
 		             JOIN balance_entries be2 ON ba.balance_entry_id = be2.id
-		             WHERE be2.account_id = $1 AND be2.currency = $2), 0)
+		             WHERE be2.account_id = $1 AND be2.currency = $2), 0),
+		   COALESCE((SELECT SUM(br.amount) FROM balance_refunds br
+		             JOIN balance_entries be3 ON br.balance_entry_id = be3.id
+		             WHERE be3.account_id = $1 AND be3.currency = $2), 0)
 		 FROM balance_entries be
 		 WHERE be.account_id = $1 AND be.currency = $2`,
 		string(accountID), string(currency),
-	).Scan(&totalEntries, &totalApplied)
+	).Scan(&totalEntries, &totalApplied, &totalRefunded)
 	if err != nil {
 		return shared.Money{}, fmt.Errorf("get balance: %w", err)
 	}
 
-	return shared.NewMoney(totalEntries-totalApplied, currency), nil
+	return shared.NewMoney(totalEntries-totalApplied+totalRefunded, currency), nil
 }
 
 func (r *PostgresBalanceRepository) SaveApplication(ctx context.Context, app *balance.BalanceApplication) error {

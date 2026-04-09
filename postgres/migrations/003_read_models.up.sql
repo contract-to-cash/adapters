@@ -41,7 +41,7 @@ CREATE TABLE invoices (
     account_id  TEXT        NOT NULL,
     status      TEXT        NOT NULL CHECK (status IN ('draft', 'issued', 'paid', 'overdue', 'voided', 'cancelled')),
     amount      BIGINT      NOT NULL,
-    currency    TEXT        NOT NULL DEFAULT 'JPY',
+    currency    TEXT        NOT NULL DEFAULT 'JPY' CHECK (length(currency) = 3),
     due_date    TIMESTAMPTZ,
     issued_at   TIMESTAMPTZ,
     paid_at     TIMESTAMPTZ,
@@ -81,7 +81,7 @@ CREATE TABLE invoice_read_models (
     account_id  TEXT        NOT NULL,
     status      TEXT        NOT NULL,
     amount      BIGINT      NOT NULL,
-    currency    TEXT        NOT NULL DEFAULT 'JPY',
+    currency    TEXT        NOT NULL DEFAULT 'JPY' CHECK (length(currency) = 3),
     data        JSONB       NOT NULL,
     version     INTEGER     NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -98,7 +98,7 @@ CREATE TABLE credit_notes (
     contract_id TEXT        NOT NULL,
     account_id  TEXT        NOT NULL,
     amount      BIGINT      NOT NULL CHECK (amount > 0),
-    currency    TEXT        NOT NULL DEFAULT 'JPY',
+    currency    TEXT        NOT NULL DEFAULT 'JPY' CHECK (length(currency) = 3),
     reason      TEXT,
     status      TEXT        NOT NULL CHECK (status IN ('draft', 'issued', 'applied', 'voided')),
     data        JSONB       NOT NULL,
@@ -146,7 +146,7 @@ CREATE TABLE balance_entries (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_balance_entries_account_id ON balance_entries (account_id);
+-- NOTE: (account_id, currency) index also serves account_id-only queries.
 CREATE INDEX idx_balance_entries_account_currency ON balance_entries (account_id, currency);
 
 -- Balance applications (linking balance entries to invoices)
@@ -193,8 +193,9 @@ CREATE TABLE usage_records (
         DEFERRABLE INITIALLY IMMEDIATE
 );
 
-CREATE INDEX idx_usage_records_contract_id ON usage_records (contract_id);
-CREATE INDEX idx_usage_records_contract_metric ON usage_records (contract_id, metric);
+-- NOTE: (contract_id, metric, timestamp) index also serves contract_id-only
+-- and (contract_id, metric) queries.
+
 CREATE INDEX idx_usage_records_timestamp ON usage_records (timestamp);
 CREATE INDEX idx_usage_records_contract_metric_time ON usage_records (contract_id, metric, timestamp);
 
