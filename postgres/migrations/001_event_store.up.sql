@@ -18,7 +18,7 @@ CREATE TABLE events (
     UNIQUE (stream_id, version)
 );
 
-CREATE INDEX idx_events_stream_id ON events (stream_id);
+-- NOTE: UNIQUE(stream_id, version) already creates an index with stream_id as leading column.
 CREATE INDEX idx_events_type ON events (type);
 CREATE INDEX idx_events_global_position ON events (global_position);
 CREATE INDEX idx_events_occurred_at ON events (stream_id, occurred_at);

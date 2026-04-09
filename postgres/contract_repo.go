@@ -64,26 +64,11 @@ func (r *PostgresContractRepository) FindByID(ctx context.Context, id shared.Con
 		}
 	}
 
+	// Load only events after the snapshot version to avoid over-fetching.
 	fromVersion := agg.Version()
-	var events []eventstore.Event
-	if fromVersion > 0 {
-		events, err = es.Load(ctx, streamID)
-		if err != nil {
-			return nil, fmt.Errorf("load events: %w", err)
-		}
-		// Filter to events after snapshot version
-		filtered := make([]eventstore.Event, 0)
-		for _, evt := range events {
-			if evt.Version > fromVersion {
-				filtered = append(filtered, evt)
-			}
-		}
-		events = filtered
-	} else {
-		events, err = es.Load(ctx, streamID)
-		if err != nil {
-			return nil, fmt.Errorf("load events: %w", err)
-		}
+	events, err := es.loadFromVersion(ctx, streamID, fromVersion)
+	if err != nil {
+		return nil, fmt.Errorf("load events: %w", err)
 	}
 
 	if snap == nil && len(events) == 0 {
@@ -168,27 +153,28 @@ func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared
 		}
 	}
 
-	// Load events up to asOf
+	// Load events after snapshot version, up to asOf.
+	// LoadUntil filters by occurred_at in SQL; we additionally filter by version
+	// to skip events already applied from the snapshot.
 	events, err := es.LoadUntil(ctx, streamID, asOf)
 	if err != nil {
 		return nil, fmt.Errorf("load events until: %w", err)
 	}
 
-	// Filter to events after snapshot version
 	fromVersion := agg.Version()
-	filtered := make([]eventstore.Event, 0)
+	relevant := events[:0]
 	for _, evt := range events {
 		if evt.Version > fromVersion {
-			filtered = append(filtered, evt)
+			relevant = append(relevant, evt)
 		}
 	}
 
-	if snap == nil && len(filtered) == 0 {
+	if snap == nil && len(relevant) == 0 {
 		return nil, contract.ErrNotFound
 	}
 
-	if len(filtered) > 0 {
-		if err := agg.LoadFromHistory(filtered); err != nil {
+	if len(relevant) > 0 {
+		if err := agg.LoadFromHistory(relevant); err != nil {
 			return nil, fmt.Errorf("load from history: %w", err)
 		}
 	}

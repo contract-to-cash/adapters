@@ -82,7 +82,6 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 
 	return nil
 }
-}
 
 // Load loads all events for a stream ordered by version.
 func (s *PostgresEventStore) Load(ctx context.Context, streamID string) ([]eventstore.Event, error) {
@@ -259,6 +258,26 @@ func (s *PostgresEventStore) loadAllFrom(ctx context.Context, fromPosition int64
 	return scanEvents(rows)
 }
 
+// loadFromVersion loads events for a stream after the given version (exclusive).
+// Used by ContractRepository.FindByID to avoid over-fetching when a snapshot exists.
+func (s *PostgresEventStore) loadFromVersion(ctx context.Context, streamID string, afterVersion int) ([]eventstore.Event, error) {
+	q := s.querier(ctx)
+
+	rows, err := q.Query(ctx,
+		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
+		 FROM events
+		 WHERE stream_id = $1 AND version > $2
+		 ORDER BY version ASC`,
+		streamID, afterVersion,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load events from version: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEvents(rows)
+}
+
 func (s *PostgresEventStore) loadAllUntil(ctx context.Context, until time.Time) ([]eventstore.Event, error) {
 	q := s.querier(ctx)
 
@@ -310,7 +329,12 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 	if err != nil {
 		return
 	}
-	defer conn.Release()
+	defer func() {
+		// UNLISTEN before returning connection to pool to avoid
+		// stale notification delivery on connection reuse.
+		_, _ = conn.Exec(context.Background(), fmt.Sprintf("UNLISTEN %s", eventsChannel))
+		conn.Release()
+	}()
 
 	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", eventsChannel))
 	if err != nil {
@@ -357,9 +381,6 @@ func (s *PostgresEventStore) catchUp(ctx context.Context, position *int64, ch ch
 			*position = evt.GlobalPosition
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			// Slow subscriber — drop event (matching InMemory semantics)
-			*position = evt.GlobalPosition
 		}
 	}
 	return nil
