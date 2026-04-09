@@ -43,44 +43,23 @@ func (s *PostgresEventStore) querier(ctx context.Context) Querier {
 }
 
 // Append appends events to a stream with optimistic concurrency control.
-// Uses the streams table for O(1) version check (PK row lock) instead of
-// scanning the events table.
+// Uses UNIQUE(stream_id, version) index for locking and conflict detection.
 func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	q := s.querier(ctx)
 
-	if expectedVersion == 0 {
-		// New stream — insert into streams table.
-		// Extract aggregate_type and aggregate_id from streamID ("contract-123" → "contract", "123").
-		aggType, aggID := parseStreamID(streamID)
-		_, err := q.Exec(ctx,
-			`INSERT INTO streams (stream_id, aggregate_type, aggregate_id, current_version)
-			 VALUES ($1, $2, $3, 0)
-			 ON CONFLICT (stream_id) DO NOTHING`,
-			streamID, aggType, aggID,
-		)
-		if err != nil {
-			return fmt.Errorf("ensure stream: %w", err)
-		}
-	}
-
-	// Lock the stream row and check version — O(1) PK lookup.
 	var currentVersion int
 	err := q.QueryRow(ctx,
-		`SELECT current_version FROM streams WHERE stream_id = $1 FOR UPDATE`,
+		`SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = $1 FOR UPDATE`,
 		streamID,
 	).Scan(&currentVersion)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			return fmt.Errorf("stream not found: %s", streamID)
-		}
-		return fmt.Errorf("lock stream: %w", err)
+		return fmt.Errorf("check stream version: %w", err)
 	}
 
 	if currentVersion != expectedVersion {
 		return eventstore.ErrConcurrencyConflict
 	}
 
-	newVersion := expectedVersion
 	for i, evt := range events {
 		data, err := json.Marshal(evt.Data)
 		if err != nil {
@@ -90,37 +69,19 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 		if err != nil {
 			return fmt.Errorf("marshal event metadata: %w", err)
 		}
-		newVersion = expectedVersion + i + 1
+		version := expectedVersion + i + 1
 		_, err = q.Exec(ctx,
 			`INSERT INTO events (id, stream_id, type, version, schema_version, data, metadata, occurred_at)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			evt.ID, streamID, evt.Type, newVersion, evt.SchemaVersion, data, metadata, evt.OccurredAt,
+			evt.ID, streamID, evt.Type, version, evt.SchemaVersion, data, metadata, evt.OccurredAt,
 		)
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)
 		}
 	}
 
-	// Advance the stream version.
-	_, err = q.Exec(ctx,
-		`UPDATE streams SET current_version = $1, updated_at = NOW() WHERE stream_id = $2`,
-		newVersion, streamID,
-	)
-	if err != nil {
-		return fmt.Errorf("update stream version: %w", err)
-	}
-
 	return nil
 }
-
-// parseStreamID splits "contract-abc123" into ("contract", "abc123").
-func parseStreamID(streamID string) (aggregateType, aggregateID string) {
-	for i := 0; i < len(streamID); i++ {
-		if streamID[i] == '-' {
-			return streamID[:i], streamID[i+1:]
-		}
-	}
-	return streamID, streamID
 }
 
 // Load loads all events for a stream ordered by version.
