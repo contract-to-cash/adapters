@@ -47,7 +47,11 @@ func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event)
 	default:
 		return nil
 	}
-	return p.applyEvent(ctx, event)
+	if err := p.applyEvent(ctx, event); err != nil {
+		return fmt.Errorf("project contract event %s (type=%s, stream=%s): %w",
+			event.ID, event.Type, event.StreamID, err)
+	}
+	return nil
 }
 
 func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error {

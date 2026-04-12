@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/contract-to-cash/core/domain/shared"
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/eventstore"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -20,15 +20,37 @@ const (
 	pgUniqueViolation = "23505"
 )
 
+// SubscribeErrorHandler is called when the Subscribe goroutine terminates
+// due to an error. For a billing system, silent subscriber death is
+// dangerous — wire this up to your logger or metrics so the operator
+// notices. Leaving it nil disables reporting (channel will still close).
+type SubscribeErrorHandler func(err error)
+
 // PostgresEventStore implements eventstore.Store.
 type PostgresEventStore struct {
-	pool *pgxpool.Pool
+	pool       *pgxpool.Pool
+	onSubError SubscribeErrorHandler
 }
 
 var _ eventstore.Store = (*PostgresEventStore)(nil)
 
 func NewEventStore(pool *pgxpool.Pool) *PostgresEventStore {
 	return &PostgresEventStore{pool: pool}
+}
+
+// SetSubscribeErrorHandler installs a handler that is invoked when the
+// Subscribe goroutine exits due to an infrastructure error (connection
+// loss, LISTEN failure, catchUp failure). Must be called before
+// Subscribe.
+func (s *PostgresEventStore) SetSubscribeErrorHandler(h SubscribeErrorHandler) {
+	s.onSubError = h
+}
+
+func (s *PostgresEventStore) reportSubError(err error) {
+	if err == nil || s.onSubError == nil {
+		return
+	}
+	s.onSubError(err)
 }
 
 func (s *PostgresEventStore) q(ctx context.Context) Querier {
@@ -82,10 +104,11 @@ func (s *PostgresEventStore) appendInTx(ctx context.Context, streamID string, ev
 		)
 		if err != nil {
 			if isVersionConflict(err) {
-				return shared.NewDomainError(
-					shared.ErrCodeVersionConflict,
-					fmt.Sprintf("stream %q version conflict at version %d", streamID, version),
-				)
+				// Wrap so the caller can see context while errors.Is
+				// still unwraps to tx.ErrVersionConflict. This is
+				// required by tx.RetryOnConflict.
+				return fmt.Errorf("stream %q version conflict at version %d: %w",
+					streamID, version, tx.ErrVersionConflict)
 			}
 			return fmt.Errorf("insert event: %w", err)
 		}
@@ -186,6 +209,7 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
+		s.reportSubError(fmt.Errorf("subscribe acquire: %w", err))
 		return
 	}
 	defer func() {
@@ -194,11 +218,16 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 	}()
 
 	if _, err := conn.Exec(ctx, fmt.Sprintf("LISTEN %s", eventsChannel)); err != nil {
+		s.reportSubError(fmt.Errorf("subscribe LISTEN: %w", err))
 		return
 	}
 
 	position := fromPosition
 	if err := s.catchUp(ctx, &position, ch); err != nil {
+		// Context cancellation is a normal shutdown, not an error.
+		if ctx.Err() == nil {
+			s.reportSubError(fmt.Errorf("subscribe initial catchUp: %w", err))
+		}
 		return
 	}
 
@@ -218,25 +247,41 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 			continue
 		}
 		if err := s.catchUp(ctx, &position, ch); err != nil {
+			if ctx.Err() == nil {
+				s.reportSubError(fmt.Errorf("subscribe catchUp: %w", err))
+			}
 			return
 		}
 	}
 }
 
+// catchUpBatchSize caps the number of events loaded into memory per pass.
+// Without this, a large backlog on initial Subscribe would pull every event
+// into memory at once.
+const catchUpBatchSize = 1000
+
 func (s *PostgresEventStore) catchUp(ctx context.Context, position *int64, ch chan<- eventstore.Event) error {
-	events, err := s.LoadAll(ctx, *position, 0)
-	if err != nil {
-		return err
-	}
-	for _, evt := range events {
-		select {
-		case ch <- evt:
-			*position = evt.GlobalPosition
-		case <-ctx.Done():
-			return ctx.Err()
+	for {
+		events, err := s.LoadAll(ctx, *position, catchUpBatchSize)
+		if err != nil {
+			return err
+		}
+		if len(events) == 0 {
+			return nil
+		}
+		for _, evt := range events {
+			select {
+			case ch <- evt:
+				*position = evt.GlobalPosition
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		// If we got fewer than a full batch, we're caught up for now.
+		if len(events) < catchUpBatchSize {
+			return nil
 		}
 	}
-	return nil
 }
 
 func (s *PostgresEventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snapshot) error {

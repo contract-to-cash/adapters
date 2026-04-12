@@ -122,7 +122,7 @@ func (r *PostgresCreditNoteRepository) findMany(ctx context.Context, where strin
 }
 
 const selectCreditNoteSQL = `
-	SELECT id, number, invoice_id, account_id, contract_id, status, reason, memo,
+	SELECT id, number, invoice_id, contract_id, account_id, status, reason, memo,
 	       items, issued_at, created_at
 	FROM credit_notes`
 
@@ -137,7 +137,7 @@ func scanCreditNoteSnapshot(t scanTarget) (invoice.CreditNoteSnapshot, error) {
 		createdAt                        time.Time
 	)
 	if err := t.Scan(
-		&id, &number, &invoiceID, &accountID, &contractID,
+		&id, &number, &invoiceID, &contractID, &accountID,
 		&status, &reason, &memo, &itemsJSON, &issuedAt, &createdAt,
 	); err != nil {
 		return invoice.CreditNoteSnapshot{}, err

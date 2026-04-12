@@ -109,21 +109,24 @@ func (r *PostgresPriceRepository) FindActiveByProductID(ctx context.Context, pro
 
 func (r *PostgresPriceRepository) Save(ctx context.Context, p *pricing.Price) error {
 	s := p.ToSnapshot()
-	intervalJSON, _ := json.Marshal(s.Interval)
+	intervalJSON, err := json.Marshal(s.Interval)
+	if err != nil {
+		return fmt.Errorf("marshal billing interval: %w", err)
+	}
 	modelJSON, err := marshalPricingModel(s.PricingModel)
 	if err != nil {
 		return fmt.Errorf("marshal pricing model: %w", err)
 	}
 
 	_, err = r.q(ctx).Exec(ctx,
-		`INSERT INTO prices (id, product_id, amount, currency, billing_cycle, interval_data, pricing_model, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+		`INSERT INTO prices (id, product_id, amount, currency, interval_data, pricing_model, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 		 ON CONFLICT (id) DO UPDATE SET
 		   amount = EXCLUDED.amount, currency = EXCLUDED.currency,
 		   interval_data = EXCLUDED.interval_data, pricing_model = EXCLUDED.pricing_model,
 		   status = EXCLUDED.status, updated_at = NOW()`,
 		string(s.ID), string(s.ProductID), s.Amount.Int64(), string(s.Currency),
-		"", intervalJSON, modelJSON, string(s.Status), s.CreatedAt)
+		intervalJSON, modelJSON, string(s.Status), s.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("save price: %w", err)
 	}

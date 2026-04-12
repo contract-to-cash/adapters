@@ -3,12 +3,13 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/contract-to-cash/adapters/postgres"
 	"github.com/contract-to-cash/adapters/postgres/postgrestest"
-	"github.com/contract-to-cash/core/domain/shared"
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/eventstore"
 )
 
@@ -81,8 +82,8 @@ func TestEventStore_AppendVersionConflict(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected version conflict error, got nil")
 	}
-	if !shared.IsDomainError(err, shared.ErrCodeVersionConflict) {
-		t.Errorf("expected ErrCodeVersionConflict, got: %v", err)
+	if !errors.Is(err, tx.ErrVersionConflict) {
+		t.Errorf("expected errors.Is(err, tx.ErrVersionConflict), got: %v", err)
 	}
 }
 

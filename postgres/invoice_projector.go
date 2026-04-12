@@ -141,9 +141,15 @@ func (p *InvoiceProjector) applyEvent(ctx context.Context, event eventstore.Even
 			raw, event.Version, invoiceID)
 		return err
 
-	case strings.HasSuffix(eventType, ".voided"), strings.HasSuffix(eventType, ".cancelled"):
+	case strings.HasSuffix(eventType, ".voided"):
 		_, err := q.Exec(ctx,
 			`UPDATE invoice_read_models SET status = 'voided', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
+			raw, event.Version, invoiceID)
+		return err
+
+	case strings.HasSuffix(eventType, ".cancelled"):
+		_, err := q.Exec(ctx,
+			`UPDATE invoice_read_models SET status = 'cancelled', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
 			raw, event.Version, invoiceID)
 		return err
 

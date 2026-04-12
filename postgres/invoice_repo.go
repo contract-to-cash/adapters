@@ -27,30 +27,40 @@ func (r *PostgresInvoiceRepository) q(ctx context.Context) Querier {
 	return QuerierFromContext(ctx, r.pool)
 }
 
-type invoiceJSONState struct {
-	Subtotal       shared.Money              `json:"subtotal"`
-	TaxAmount      shared.Money              `json:"tax_amount"`
-	DiscountAmount shared.Money              `json:"discount_amount"`
-	Total          shared.Money              `json:"total"`
-	AppliedBalance shared.Money              `json:"applied_balance"`
-	AmountDue      shared.Money              `json:"amount_due"`
-	PaidAmount     shared.Money              `json:"paid_amount"`
-	Balance        shared.Money              `json:"balance"`
-	BillingPeriod  shared.DateRange          `json:"billing_period"`
-	LineItems      []invoice.LineItemSnapshot `json:"line_items"`
+// invoiceSnapshotState holds monetary subtotals and billing period in JSONB
+// for lossless round-trip of non-JPY currencies. LineItems are persisted
+// separately in the line_items JSONB array column so the column name matches
+// its content.
+type invoiceSnapshotState struct {
+	Subtotal       shared.Money     `json:"subtotal"`
+	TaxAmount      shared.Money     `json:"tax_amount"`
+	DiscountAmount shared.Money     `json:"discount_amount"`
+	Total          shared.Money     `json:"total"`
+	AppliedBalance shared.Money     `json:"applied_balance"`
+	AmountDue      shared.Money     `json:"amount_due"`
+	PaidAmount     shared.Money     `json:"paid_amount"`
+	Balance        shared.Money     `json:"balance"`
+	BillingPeriod  shared.DateRange `json:"billing_period"`
 }
 
 func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoice) error {
 	s := inv.ToSnapshot()
 
-	jsonState, err := json.Marshal(invoiceJSONState{
+	snapshotState, err := json.Marshal(invoiceSnapshotState{
 		Subtotal: s.Subtotal, TaxAmount: s.TaxAmount, DiscountAmount: s.DiscountAmount,
 		Total: s.Total, AppliedBalance: s.AppliedBalance, AmountDue: s.AmountDue,
 		PaidAmount: s.PaidAmount, Balance: s.Balance, BillingPeriod: s.BillingPeriod,
-		LineItems: s.LineItems,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal invoice json state: %w", err)
+		return fmt.Errorf("marshal invoice snapshot state: %w", err)
+	}
+
+	lineItems, err := json.Marshal(s.LineItems)
+	if err != nil {
+		return fmt.Errorf("marshal invoice line items: %w", err)
+	}
+	if len(s.LineItems) == 0 {
+		lineItems = []byte(`[]`)
 	}
 
 	metadata, err := json.Marshal(s.Metadata)
@@ -91,11 +101,11 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 			currency, billing_period_from, billing_period_to,
 			issue_date, due_date, paid_at, void_reason,
 			revision_of, original_invoice_id, payment_method_id,
-			allow_partial_pay, line_items, metadata, version, updated_at
+			allow_partial_pay, line_items, snapshot_state, metadata, version, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
 			$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-			$25, $26, 1, NOW()
+			$25, $26, $27, 1, NOW()
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			invoice_number = EXCLUDED.invoice_number, status = EXCLUDED.status,
@@ -110,7 +120,9 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 			original_invoice_id = EXCLUDED.original_invoice_id,
 			payment_method_id = EXCLUDED.payment_method_id,
 			allow_partial_pay = EXCLUDED.allow_partial_pay,
-			line_items = EXCLUDED.line_items, metadata = EXCLUDED.metadata,
+			line_items = EXCLUDED.line_items,
+			snapshot_state = EXCLUDED.snapshot_state,
+			metadata = EXCLUDED.metadata,
 			version = invoices.version + 1, updated_at = NOW()`,
 		string(s.ID), s.InvoiceNumber, string(s.AccountID), string(s.ContractID), string(s.Status),
 		s.Subtotal.Int64(), s.TaxAmount.Int64(), s.DiscountAmount.Int64(), s.Total.Int64(),
@@ -118,7 +130,7 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 		string(s.Total.Currency()), billingFrom, billingTo,
 		issueDate, dueDate, s.PaidAt, s.VoidReason,
 		revisionOf, originalInvoiceID, s.PaymentMethodID,
-		s.AllowPartialPay, jsonState, metadata)
+		s.AllowPartialPay, lineItems, snapshotState, metadata)
 	if err != nil {
 		return fmt.Errorf("save invoice: %w", err)
 	}
@@ -240,8 +252,8 @@ func (r *PostgresInvoiceRepository) FindUnpaidByContract(ctx context.Context, co
 
 const selectInvoiceSQL = `
 	SELECT id, invoice_number, account_id, contract_id, status,
-	       line_items, subtotal, tax_amount, discount_amount, total,
-	       applied_balance, amount_due, paid_amount, balance,
+	       line_items, snapshot_state, subtotal, tax_amount, discount_amount, total,
+	       applied_balance, amount_due, paid_amount, balance, currency,
 	       billing_period_from, billing_period_to, issue_date, due_date,
 	       paid_at, payment_method_id, allow_partial_pay,
 	       original_invoice_id, revision_of, void_reason, metadata
@@ -287,10 +299,12 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 		s                                   invoice.InvoiceSnapshot
 		id, number, accountID, contractID   string
 		status                              string
-		lineItems                           json.RawMessage
+		lineItemsRaw                        json.RawMessage
+		snapshotStateRaw                    json.RawMessage
 		subtotal, taxAmount, discountAmount int64
 		total, appliedBalance, amountDue    int64
 		paidAmount, balance                 int64
+		currency                            string
 		billingFrom, billingTo              *time.Time
 		issueDate, dueDate                  *time.Time
 		paidAt                              *time.Time
@@ -302,8 +316,9 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 	)
 	if err := t.Scan(
 		&id, &number, &accountID, &contractID, &status,
-		&lineItems, &subtotal, &taxAmount, &discountAmount, &total,
-		&appliedBalance, &amountDue, &paidAmount, &balance,
+		&lineItemsRaw, &snapshotStateRaw,
+		&subtotal, &taxAmount, &discountAmount, &total,
+		&appliedBalance, &amountDue, &paidAmount, &balance, &currency,
 		&billingFrom, &billingTo, &issueDate, &dueDate,
 		&paidAt, &paymentMethodID, &allowPartialPay,
 		&originalInvoiceID, &revisionOf, &voidReason, &metadata,
@@ -311,11 +326,22 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 		return invoice.InvoiceSnapshot{}, err
 	}
 
-	var js invoiceJSONState
-	if len(lineItems) > 0 {
-		if err := json.Unmarshal(lineItems, &js); err != nil {
-			return invoice.InvoiceSnapshot{}, fmt.Errorf("unmarshal invoice json state: %w", err)
+	// Parse line items (JSONB array) and snapshot state (JSONB object)
+	// from their dedicated columns.
+	var lineItems []invoice.LineItemSnapshot
+	if len(lineItemsRaw) > 0 {
+		if err := json.Unmarshal(lineItemsRaw, &lineItems); err != nil {
+			return invoice.InvoiceSnapshot{}, fmt.Errorf("unmarshal invoice line items: %w", err)
 		}
+	}
+
+	var ss invoiceSnapshotState
+	hasSnapshotState := false
+	if len(snapshotStateRaw) > 0 && string(snapshotStateRaw) != "{}" {
+		if err := json.Unmarshal(snapshotStateRaw, &ss); err != nil {
+			return invoice.InvoiceSnapshot{}, fmt.Errorf("unmarshal invoice snapshot state: %w", err)
+		}
+		hasSnapshotState = true
 	}
 
 	s.ID = shared.InvoiceID(id)
@@ -323,16 +349,39 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 	s.AccountID = shared.AccountID(accountID)
 	s.ContractID = shared.ContractID(contractID)
 	s.Status = invoice.InvoiceStatus(status)
-	s.LineItems = js.LineItems
-	s.Subtotal = js.Subtotal
-	s.TaxAmount = js.TaxAmount
-	s.DiscountAmount = js.DiscountAmount
-	s.Total = js.Total
-	s.AppliedBalance = js.AppliedBalance
-	s.AmountDue = js.AmountDue
-	s.PaidAmount = js.PaidAmount
-	s.Balance = js.Balance
-	s.BillingPeriod = js.BillingPeriod
+	s.LineItems = lineItems
+
+	// Prefer the lossless JSONB snapshot state when present; otherwise
+	// reconstruct from the BIGINT columns (lossy for non-JPY but gives
+	// a working fallback for rows written by external processes or
+	// pre-migration rows).
+	cur := shared.Currency(currency)
+	if hasSnapshotState {
+		s.Subtotal = ss.Subtotal
+		s.TaxAmount = ss.TaxAmount
+		s.DiscountAmount = ss.DiscountAmount
+		s.Total = ss.Total
+		s.AppliedBalance = ss.AppliedBalance
+		s.AmountDue = ss.AmountDue
+		s.PaidAmount = ss.PaidAmount
+		s.Balance = ss.Balance
+		s.BillingPeriod = ss.BillingPeriod
+	} else {
+		s.Subtotal = moneyFromInt64(subtotal, cur)
+		s.TaxAmount = moneyFromInt64(taxAmount, cur)
+		s.DiscountAmount = moneyFromInt64(discountAmount, cur)
+		s.Total = moneyFromInt64(total, cur)
+		s.AppliedBalance = moneyFromInt64(appliedBalance, cur)
+		s.AmountDue = moneyFromInt64(amountDue, cur)
+		s.PaidAmount = moneyFromInt64(paidAmount, cur)
+		s.Balance = moneyFromInt64(balance, cur)
+	}
+	// Fall back to billing_period_from/to columns if the snapshot state
+	// does not carry a billing period.
+	if s.BillingPeriod.IsZero() && billingFrom != nil && billingTo != nil {
+		s.BillingPeriod = shared.NewDateRange(*billingFrom, *billingTo)
+	}
+
 	if issueDate != nil {
 		s.IssueDate = *issueDate
 	}
