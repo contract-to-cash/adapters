@@ -169,9 +169,15 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 			raw, event.Version, contractID)
 		return err
 
-	case contract.EventTypeContractCancelled, contract.EventTypeContractExpired:
+	case contract.EventTypeContractCancelled:
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models SET status = 'cancelled', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
+			raw, event.Version, contractID)
+		return err
+
+	case contract.EventTypeContractExpired:
+		_, err := q.Exec(ctx,
+			`UPDATE contract_read_models SET status = 'expired', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
 			raw, event.Version, contractID)
 		return err
 

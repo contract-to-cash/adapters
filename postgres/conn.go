@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -64,7 +65,8 @@ func (c Config) ConnString() string {
 	}
 	return fmt.Sprintf(
 		"postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		c.User, c.Password, c.Host, c.Port, c.Database, sslMode,
+		url.QueryEscape(c.User), url.QueryEscape(c.Password),
+		c.Host, c.Port, c.Database, sslMode,
 	)
 }
 

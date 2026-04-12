@@ -40,6 +40,28 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 		return nil
 	}
 
+	// If there is no ambient transaction, wrap the entire append in one so
+	// that a multi-event batch is atomic.
+	if _, ok := TxFromContext(ctx); !ok {
+		pgxTx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin append tx: %w", err)
+		}
+		txCtx := ContextWithTx(ctx, pgxTx)
+		if err := s.appendInTx(txCtx, streamID, events, expectedVersion); err != nil {
+			_ = pgxTx.Rollback(ctx)
+			return err
+		}
+		if err := pgxTx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit append tx: %w", err)
+		}
+		return nil
+	}
+
+	return s.appendInTx(ctx, streamID, events, expectedVersion)
+}
+
+func (s *PostgresEventStore) appendInTx(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	q := s.q(ctx)
 	for i, evt := range events {
 		data, err := json.Marshal(evt.Data)
@@ -71,10 +93,14 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 	return nil
 }
 
+// isVersionConflict reports whether err is a unique-violation specifically
+// on the (stream_id, version) constraint. A PK violation (duplicate event
+// ID) is NOT a version conflict and must be reported as an infra error.
 func isVersionConflict(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return pgErr.Code == pgUniqueViolation
+		return pgErr.Code == pgUniqueViolation &&
+			pgErr.ConstraintName == "events_stream_id_version_key"
 	}
 	return false
 }

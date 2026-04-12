@@ -50,24 +50,39 @@ func (r *PostgresProductRepository) FindByID(ctx context.Context, id shared.Prod
 		Status: product.ProductStatus(status), CreatedAt: createdAt,
 	}
 	if len(features) > 0 {
-		_ = json.Unmarshal(features, &s.Features)
+		if err := json.Unmarshal(features, &s.Features); err != nil {
+			return nil, fmt.Errorf("unmarshal product features: %w", err)
+		}
 	}
 	if len(usageMetrics) > 0 {
-		_ = json.Unmarshal(usageMetrics, &s.UsageMetrics)
+		if err := json.Unmarshal(usageMetrics, &s.UsageMetrics); err != nil {
+			return nil, fmt.Errorf("unmarshal product usage metrics: %w", err)
+		}
 	}
 	if len(metadata) > 0 {
-		_ = json.Unmarshal(metadata, &s.Metadata)
+		if err := json.Unmarshal(metadata, &s.Metadata); err != nil {
+			return nil, fmt.Errorf("unmarshal product metadata: %w", err)
+		}
 	}
 	return product.FromSnapshot(s)
 }
 
 func (r *PostgresProductRepository) Save(ctx context.Context, p *product.Product) error {
 	s := p.ToSnapshot()
-	features, _ := json.Marshal(s.Features)
-	usageMetrics, _ := json.Marshal(s.UsageMetrics)
-	metadata, _ := json.Marshal(s.Metadata)
+	features, err := json.Marshal(s.Features)
+	if err != nil {
+		return fmt.Errorf("marshal features: %w", err)
+	}
+	usageMetrics, err := json.Marshal(s.UsageMetrics)
+	if err != nil {
+		return fmt.Errorf("marshal usage metrics: %w", err)
+	}
+	metadata, err := json.Marshal(s.Metadata)
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
 
-	_, err := r.q(ctx).Exec(ctx,
+	_, err = r.q(ctx).Exec(ctx,
 		`INSERT INTO products (id, name, description, status, features, usage_metrics, metadata, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 		 ON CONFLICT (id) DO UPDATE SET

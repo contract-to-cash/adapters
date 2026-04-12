@@ -38,7 +38,9 @@ func (m *PostgresTxManager) RunInTx(ctx context.Context, fn func(ctx context.Con
 
 	txCtx := ContextWithTx(ctx, pgxTx)
 	if err := fn(txCtx, m.factory(pgxTx)); err != nil {
-		if rbErr := pgxTx.Rollback(ctx); rbErr != nil {
+		// Use a detached context for rollback so it succeeds even if
+		// the original context has been cancelled or timed out.
+		if rbErr := pgxTx.Rollback(context.WithoutCancel(ctx)); rbErr != nil {
 			return fmt.Errorf("rollback after error: %v (original: %w)", rbErr, err)
 		}
 		return err

@@ -34,6 +34,26 @@ func (p *InvoiceProjector) Project(ctx context.Context, event eventstore.Event) 
 }
 
 func (p *InvoiceProjector) Rebuild(ctx context.Context, until time.Time) error {
+	_, inTx := TxFromContext(ctx)
+	if !inTx {
+		pgxTx, err := p.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin rebuild tx: %w", err)
+		}
+		txCtx := ContextWithTx(ctx, pgxTx)
+		if err := p.rebuildInTx(txCtx, until); err != nil {
+			_ = pgxTx.Rollback(ctx)
+			return err
+		}
+		if err := pgxTx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit rebuild tx: %w", err)
+		}
+		return nil
+	}
+	return p.rebuildInTx(ctx, until)
+}
+
+func (p *InvoiceProjector) rebuildInTx(ctx context.Context, until time.Time) error {
 	q := QuerierFromContext(ctx, p.pool)
 
 	if _, err := q.Exec(ctx, `DELETE FROM invoice_read_models`); err != nil {
@@ -83,7 +103,9 @@ func (p *InvoiceProjector) applyEvent(ctx context.Context, event eventstore.Even
 
 	var data map[string]any
 	if len(event.Data) > 0 {
-		_ = json.Unmarshal(event.Data, &data)
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			return fmt.Errorf("unmarshal event data: %w", err)
+		}
 	}
 	raw := event.Data
 	eventType := string(event.Type)

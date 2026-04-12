@@ -352,7 +352,9 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 	}
 	s.VoidReason = voidReason
 	if len(metadata) > 0 {
-		_ = json.Unmarshal(metadata, &s.Metadata)
+		if err := json.Unmarshal(metadata, &s.Metadata); err != nil {
+			return invoice.InvoiceSnapshot{}, fmt.Errorf("unmarshal invoice metadata: %w", err)
+		}
 	}
 	return s, nil
 }

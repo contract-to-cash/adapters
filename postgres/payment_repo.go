@@ -165,7 +165,9 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 		s.ProcessedAt = *processedAt
 	}
 	if len(metadata) > 0 {
-		_ = json.Unmarshal(metadata, &s.Metadata)
+		if err := json.Unmarshal(metadata, &s.Metadata); err != nil {
+			return payment.PaymentSnapshot{}, fmt.Errorf("unmarshal payment metadata: %w", err)
+		}
 	}
 	return s, nil
 }

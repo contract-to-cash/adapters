@@ -3,12 +3,14 @@ package postgrestest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"testing"
 
 	"github.com/contract-to-cash/adapters/postgres"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -61,7 +63,14 @@ func applyMigrations(t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("read migration %s: %v", entry.Name(), err)
 		}
 		if _, err := pool.Exec(ctx, string(data)); err != nil {
-			// Ignore "already exists" errors so tests can be re-run.
+			// Ignore "already exists" errors (42P07=duplicate_table,
+			// 42710=duplicate_object) so tests can re-run against a
+			// persistent database. Any other error is a real failure.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && (pgErr.Code == "42P07" || pgErr.Code == "42710") {
+				continue
+			}
+			t.Fatalf("apply migration %s: %v", entry.Name(), err)
 		}
 	}
 }
