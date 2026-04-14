@@ -3,6 +3,12 @@
 // API Reference: https://docs.fincode.jp/api
 package fincode
 
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
 // PayType represents fincode payment types.
 type PayType string
 
@@ -20,12 +26,16 @@ const (
 )
 
 // PayMethod represents card payment methods.
+//
+// Currently only lump-sum is used by the Gateway. Installment / revolving
+// require a corresponding field in payment.AuthorizeRequest which is not yet
+// defined in core; see TODO in gateway.go:Authorize.
 type PayMethod string
 
 const (
 	PayMethodLumpSum     PayMethod = "1" // 一括払い
-	PayMethodInstallment PayMethod = "2" // 分割払い
-	PayMethodRevolving   PayMethod = "5" // リボ払い
+	PayMethodInstallment PayMethod = "2" // 分割払い (reserved; not wired)
+	PayMethodRevolving   PayMethod = "5" // リボ払い (reserved; not wired)
 )
 
 // PaymentStatus represents fincode payment statuses.
@@ -82,6 +92,17 @@ type CancelPaymentRequest struct {
 	AccessID string  `json:"access_id"`
 }
 
+// ChangeAmountRequest is the request body for PUT /v1/payments/{id}/change.
+// Used to reduce the amount of a captured payment (partial refund).
+// The amount field is the NEW total amount after change, not a delta.
+type ChangeAmountRequest struct {
+	PayType  PayType `json:"pay_type"`
+	AccessID string  `json:"access_id"`
+	JobCode  JobCode `json:"job_code"` // AUTH or CAPTURE
+	Amount   string  `json:"amount"`
+	Tax      string  `json:"tax,omitempty"`
+}
+
 // --- Response types ---
 
 // PaymentResponse represents the common payment response from fincode.
@@ -132,5 +153,74 @@ func (e *ErrorResponse) Error() string {
 	if len(e.Errors) == 0 {
 		return "fincode: unknown error"
 	}
-	return "fincode: " + e.Errors[0].ErrorCode + ": " + e.Errors[0].ErrorMessage
+	parts := make([]string, 0, len(e.Errors))
+	for _, ae := range e.Errors {
+		parts = append(parts, ae.ErrorCode+": "+ae.ErrorMessage)
+	}
+	return "fincode: " + strings.Join(parts, "; ")
 }
+
+// HTTPError represents an HTTP-level error from the fincode API, wrapping the
+// status code and (if the body was JSON) the parsed ErrorResponse. The raw
+// Body is preserved for logging and debugging.
+//
+// Callers can use errors.As to extract *HTTPError for status-based dispatch
+// (retry 5xx/429, fail fast on 4xx user errors) and errors.As to extract
+// *ErrorResponse for fincode error_code inspection.
+type HTTPError struct {
+	StatusCode int
+	Method     string
+	Path       string
+	APIError   *ErrorResponse
+	Body       []byte
+}
+
+func (e *HTTPError) Error() string {
+	if e.APIError != nil {
+		return fmt.Sprintf("fincode: %s %s: HTTP %d: %s", e.Method, e.Path, e.StatusCode, e.APIError.Error())
+	}
+	return fmt.Sprintf("fincode: %s %s: HTTP %d: %s", e.Method, e.Path, e.StatusCode, string(e.Body))
+}
+
+func (e *HTTPError) Unwrap() error {
+	if e.APIError != nil {
+		return e.APIError
+	}
+	return nil
+}
+
+// ValidationError is returned for client-side input validation failures,
+// before any network call is made.
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("fincode: validation: %s: %s", e.Field, e.Message)
+}
+
+// ErrValidation is a sentinel error that ValidationError wraps for errors.Is.
+var ErrValidation = errors.New("fincode: validation failed")
+
+func (e *ValidationError) Is(target error) bool {
+	return target == ErrValidation
+}
+
+// PartialAuthorizeError is returned from Gateway.Authorize when the register
+// step (POST /v1/payments) succeeded but the execute step (PUT /v1/payments/{id})
+// failed. The OrderID and AccessID identify the registered-but-not-executed
+// payment, so the caller can retry the execute step by calling
+// Gateway.ExecuteAuthorize with those values.
+type PartialAuthorizeError struct {
+	OrderID  string
+	AccessID string
+	Cause    error
+}
+
+func (e *PartialAuthorizeError) Error() string {
+	return fmt.Sprintf("fincode: partial authorize: registered order=%s access=%s but execute failed: %v",
+		e.OrderID, e.AccessID, e.Cause)
+}
+
+func (e *PartialAuthorizeError) Unwrap() error { return e.Cause }
