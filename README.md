@@ -9,38 +9,43 @@ module provides production-oriented implementations of those interfaces.
 ## Layout
 
 ```
-mysql/    MySQL 8.0 implementations of the core persistence interfaces
-          (event store first; repositories to follow)
+postgres/   PostgreSQL implementation of the full persistence stack
+            (event store, all repositories, read-model projectors, tx manager)
+fincode/    fincode payment gateway adapter (port.PaymentGateway / webhooks)
+mysql/      MySQL 8.0 event store (eventstore.Store); more repositories to follow
 ```
 
-## Interfaces implemented
+## Coverage
 
-| Core interface | Adapter | Status |
-|---|---|---|
-| `eventstore.Store` | `mysql.EventStore` | ✅ implemented |
-| `contract.Repository` | `mysql.*` | ⬜ planned |
-| `invoice.Repository` | `mysql.*` | ⬜ planned |
-| `payment.Repository` | `mysql.*` | ⬜ planned |
-| `balance.Repository` | `mysql.*` | ⬜ planned |
-| `pricing.PriceRepository` | `mysql.*` | ⬜ planned |
-| `product.Repository` | `mysql.*` | ⬜ planned |
-| `usage.Repository` | `mysql.*` | ⬜ planned |
-| `port.PaymentGateway` / webhook ports | (separate gateway adapter) | ⬜ planned |
+| Core interface | postgres | mysql | fincode |
+|---|---|---|---|
+| `eventstore.Store` | ✅ | ✅ | — |
+| `contract.Repository` | ✅ | ⬜ | — |
+| `invoice.Repository` | ✅ | ⬜ | — |
+| `payment.Repository` | ✅ | ⬜ | — |
+| `balance.Repository` | ✅ | ⬜ | — |
+| `pricing.PriceRepository` | ✅ | ⬜ | — |
+| `product.Repository` | ✅ | ⬜ | — |
+| `usage.Repository` | ✅ | ⬜ | — |
+| payment gateway / webhooks | — | — | ✅ |
+
+The `mysql` package currently provides the event store; the remaining
+repositories are planned and can mirror the `postgres` package, which is the
+reference for the full set.
 
 ## Testing
 
-Unit tests use [`go-sqlmock`](https://github.com/DATA-DOG/go-sqlmock) so the SQL,
-argument binding, transaction boundaries, and error mapping are verified
-deterministically without a running database (`go test ./... -race`).
+- **postgres**: integration tests against a real PostgreSQL.
+- **mysql**: unit tests with [`go-sqlmock`](https://github.com/DATA-DOG/go-sqlmock)
+  so SQL, argument binding, transaction boundaries, and error mapping are verified
+  deterministically without a running database (`go test ./mysql/... -race`).
+  Integration tests against a real MySQL (docker / testcontainers) are a
+  recommended follow-up.
 
-Integration tests against a real MySQL (via docker / testcontainers) are a
-recommended follow-up and are intentionally out of scope for the unit suite.
+## MySQL schema & connection
 
-## Schema & connection
-
-DDL lives next to each adapter (e.g. `mysql/schema.sql`). Apply it before use.
-
-Configure the MySQL DSN with `loc=UTC` (and typically `parseTime=true`), e.g.
+DDL lives in `mysql/schema.sql`; apply it before use. Configure the MySQL DSN
+with `loc=UTC` (and typically `parseTime=true`), e.g.
 `user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true`. All timestamps are stored
 and returned in UTC; the event store scans `DATETIME` columns correctly under
 either `parseTime` setting.
