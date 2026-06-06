@@ -79,6 +79,43 @@ func TestEventStore_Append_Success(t *testing.T) {
 	}
 }
 
+// When an ambient transaction is supplied via ContextWithTx, Append must run
+// the COUNT + INSERT directly on that tx and issue NO outer Begin/Commit — the
+// caller owns the transaction boundary.
+func TestEventStore_Append_UsesAmbientTx(t *testing.T) {
+	store, mock := newTestStore(t)
+	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
+
+	// The caller's transaction. sqlmock matches the Begin/Commit to this one;
+	// the store itself must not Begin/Commit again.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	mock.ExpectExec(`INSERT INTO events`).
+		WithArgs("e1", "contract-1", "contract.created", 1, 1,
+			[]byte(`{"name":"acme"}`), sqlmock.AnyArg(), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	ctx := ContextWithTx(context.Background(), tx)
+
+	if err := store.Append(ctx, "contract-1", events, 0); err != nil {
+		t.Fatalf("Append on ambient tx: %v", err)
+	}
+	// The store must NOT have committed; the caller does.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("caller Commit: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestEventStore_Append_VersionConflict(t *testing.T) {
 	store, mock := newTestStore(t)
 	events := []eventstore.Event{sampleEvent("e9", "contract-1", 6)}

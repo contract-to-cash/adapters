@@ -84,24 +84,49 @@ func New(db *sql.DB, clock shared.Clock, opts ...Option) *EventStore {
 
 var _ eventstore.Store = (*EventStore)(nil)
 
+// q returns the ambient *sql.Tx if one is embedded in ctx, otherwise the pool.
+func (s *EventStore) q(ctx context.Context) Querier {
+	return querierFromContext(ctx, s.db)
+}
+
 // Append persists events to a stream under optimistic concurrency control.
+//
+// If an ambient transaction is present in ctx (see ContextWithTx) the append
+// runs directly on it — the caller owns the begin/commit. Otherwise the store
+// wraps the COUNT check and inserts in its own transaction so the batch is
+// atomic.
 func (s *EventStore) Append(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	if len(events) == 0 {
 		return nil
+	}
+
+	if _, ok := TxFromContext(ctx); ok {
+		// Ambient transaction: run on it directly, no begin/commit here.
+		return s.appendOn(ctx, s.q(ctx), streamID, events, expectedVersion)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("event store: begin tx: %w", err)
 	}
-
-	var current int
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE stream_id = ?", streamID).Scan(&current); err != nil {
+	if err := s.appendOn(ctx, tx, streamID, events, expectedVersion); err != nil {
 		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("event store: commit: %w", err)
+	}
+	return nil
+}
+
+// appendOn performs the COUNT-based optimistic check and inserts on the given
+// Querier (either an ambient *sql.Tx or the store's own tx).
+func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, events []eventstore.Event, expectedVersion int) error {
+	var current int
+	if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE stream_id = ?", streamID).Scan(&current); err != nil {
 		return fmt.Errorf("event store: count events: %w", err)
 	}
 	if current != expectedVersion {
-		_ = tx.Rollback()
 		return versionConflict(streamID, fmt.Errorf("expected version %d but stream is at %d", expectedVersion, current))
 	}
 
@@ -110,30 +135,24 @@ func (s *EventStore) Append(ctx context.Context, streamID string, events []event
 		e := events[i]
 		meta, err := json.Marshal(e.Metadata)
 		if err != nil {
-			_ = tx.Rollback()
 			return fmt.Errorf("event store: marshal metadata for event %s: %w", e.ID, err)
 		}
-		if _, err := tx.ExecContext(ctx, insertEventSQL,
+		if _, err := q.ExecContext(ctx, insertEventSQL,
 			e.ID, e.StreamID, string(e.Type), e.Version, e.SchemaVersion,
 			normalizeJSON(e.Data), meta, e.OccurredAt.UTC(), recordedAt,
 		); err != nil {
-			_ = tx.Rollback()
 			if isDuplicateKey(err) {
 				return versionConflict(streamID, err)
 			}
 			return fmt.Errorf("event store: insert event %s: %w", e.ID, err)
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("event store: commit: %w", err)
-	}
 	return nil
 }
 
 // Load returns all events for a stream ordered by version ascending.
 func (s *EventStore) Load(ctx context.Context, streamID string) ([]eventstore.Event, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.q(ctx).QueryContext(ctx,
 		"SELECT "+eventColumns+" FROM events WHERE stream_id = ? ORDER BY version ASC", streamID)
 	if err != nil {
 		return nil, fmt.Errorf("event store: load stream %s: %w", streamID, err)
@@ -143,7 +162,7 @@ func (s *EventStore) Load(ctx context.Context, streamID string) ([]eventstore.Ev
 
 // LoadUntilVersion returns events with version <= the given version.
 func (s *EventStore) LoadUntilVersion(ctx context.Context, streamID string, version int) ([]eventstore.Event, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.q(ctx).QueryContext(ctx,
 		"SELECT "+eventColumns+" FROM events WHERE stream_id = ? AND version <= ? ORDER BY version ASC",
 		streamID, version)
 	if err != nil {
@@ -154,7 +173,7 @@ func (s *EventStore) LoadUntilVersion(ctx context.Context, streamID string, vers
 
 // LoadUntil returns events with occurred_at <= until.
 func (s *EventStore) LoadUntil(ctx context.Context, streamID string, until time.Time) ([]eventstore.Event, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.q(ctx).QueryContext(ctx,
 		"SELECT "+eventColumns+" FROM events WHERE stream_id = ? AND occurred_at <= ? ORDER BY version ASC",
 		streamID, until.UTC())
 	if err != nil {
@@ -165,7 +184,7 @@ func (s *EventStore) LoadUntil(ctx context.Context, streamID string, until time.
 
 // LoadRange returns events with from <= occurred_at < to.
 func (s *EventStore) LoadRange(ctx context.Context, streamID string, from, to time.Time) ([]eventstore.Event, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.q(ctx).QueryContext(ctx,
 		"SELECT "+eventColumns+" FROM events WHERE stream_id = ? AND occurred_at >= ? AND occurred_at < ? ORDER BY version ASC",
 		streamID, from.UTC(), to.UTC())
 	if err != nil {
@@ -182,11 +201,11 @@ func (s *EventStore) LoadAll(ctx context.Context, fromPosition int64, limit int)
 		err  error
 	)
 	if limit > 0 {
-		rows, err = s.db.QueryContext(ctx,
+		rows, err = s.q(ctx).QueryContext(ctx,
 			"SELECT "+eventColumns+" FROM events WHERE global_position > ? ORDER BY global_position ASC LIMIT ?",
 			fromPosition, limit)
 	} else {
-		rows, err = s.db.QueryContext(ctx,
+		rows, err = s.q(ctx).QueryContext(ctx,
 			"SELECT "+eventColumns+" FROM events WHERE global_position > ? ORDER BY global_position ASC",
 			fromPosition)
 	}
@@ -240,7 +259,7 @@ func (s *EventStore) pollLoop(ctx context.Context, pos int64, ch chan<- eventsto
 
 // SaveSnapshot upserts an aggregate snapshot keyed by (stream_id, version).
 func (s *EventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snapshot) error {
-	if _, err := s.db.ExecContext(ctx, upsertSnapshotSQL,
+	if _, err := s.q(ctx).ExecContext(ctx, upsertSnapshotSQL,
 		snapshot.StreamID, snapshot.Version, normalizeJSON(snapshot.State),
 		snapshot.AsOf.UTC(), snapshot.CreatedAt.UTC(),
 	); err != nil {
@@ -251,7 +270,7 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snaps
 
 // LoadSnapshot loads the latest snapshot for a stream, or (nil, nil) if none.
 func (s *EventStore) LoadSnapshot(ctx context.Context, streamID string) (*eventstore.Snapshot, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.q(ctx).QueryRowContext(ctx,
 		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? ORDER BY version DESC LIMIT 1",
 		streamID)
 	return scanSnapshot(row)
@@ -260,7 +279,7 @@ func (s *EventStore) LoadSnapshot(ctx context.Context, streamID string) (*events
 // LoadSnapshotBefore loads the latest snapshot created before the given time,
 // or (nil, nil) if none.
 func (s *EventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.q(ctx).QueryRowContext(ctx,
 		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 1",
 		streamID, before.UTC())
 	return scanSnapshot(row)
