@@ -225,6 +225,81 @@ func TestEventStore_Load(t *testing.T) {
 	}
 }
 
+// W1: a real go-sql-driver without parseTime=true hands DATETIME columns back as
+// raw bytes. The adapter must scan those into UTC time.Time, not error out.
+func TestEventStore_Load_ScansTextualDatetime(t *testing.T) {
+	store, mock := newTestStore(t)
+	rows := sqlmock.NewRows([]string{
+		"id", "stream_id", "type", "version", "schema_version",
+		"data", "metadata", "occurred_at", "recorded_at", "global_position",
+	}).AddRow("e1", "contract-1", "contract.created", 1, 1,
+		[]byte(`{}`), []byte(`{}`),
+		[]byte("2026-06-01 12:00:00.000000"), []byte("2026-06-01 12:00:00.000000"), int64(1))
+	mock.ExpectQuery(`SELECT .* FROM events WHERE stream_id = \? ORDER BY version ASC`).
+		WithArgs("contract-1").
+		WillReturnRows(rows)
+
+	got, err := store.Load(context.Background(), "contract-1")
+	if err != nil {
+		t.Fatalf("Load with textual datetime: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(got))
+	}
+	if !got[0].OccurredAt.Equal(fixedTime) {
+		t.Errorf("occurred_at not parsed to UTC: got %v want %v", got[0].OccurredAt, fixedTime)
+	}
+	if got[0].OccurredAt.Location() != time.UTC {
+		t.Errorf("occurred_at not in UTC: %v", got[0].OccurredAt.Location())
+	}
+}
+
+// W2: an event with empty Data must not violate the JSON NOT NULL column; the
+// adapter normalizes empty payloads to an empty JSON object.
+func TestEventStore_Append_NormalizesEmptyData(t *testing.T) {
+	store, mock := newTestStore(t)
+	ev := sampleEvent("e1", "contract-1", 1)
+	ev.Data = nil
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	mock.ExpectExec(`INSERT INTO events`).
+		WithArgs("e1", "contract-1", "contract.created", 1, 1,
+			[]byte("{}"), sqlmock.AnyArg(), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := store.Append(context.Background(), "contract-1", []eventstore.Event{ev}, 0); err != nil {
+		t.Fatalf("Append empty data: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestEventStore_SaveSnapshot_NormalizesEmptyState(t *testing.T) {
+	store, mock := newTestStore(t)
+	snap := eventstore.Snapshot{
+		StreamID:  "contract-1",
+		Version:   1,
+		State:     nil,
+		AsOf:      fixedTime,
+		CreatedAt: fixedTime,
+	}
+	mock.ExpectExec(`INSERT INTO snapshots`).
+		WithArgs("contract-1", 1, []byte("{}"), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := store.SaveSnapshot(context.Background(), snap); err != nil {
+		t.Fatalf("SaveSnapshot empty state: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestEventStore_LoadAll_WithLimit(t *testing.T) {
 	store, mock := newTestStore(t)
 	rows := sqlmock.NewRows([]string{

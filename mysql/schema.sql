@@ -3,6 +3,12 @@
 -- The event store is an append-only log. Optimistic concurrency is enforced
 -- structurally by the UNIQUE (stream_id, version) constraint: two concurrent
 -- appends targeting the same expected version cannot both succeed.
+--
+-- DSN: configure the connection with loc=UTC, e.g.
+--   user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true
+-- All timestamps are stored and returned in UTC. The adapter scans DATETIME
+-- under either parseTime setting, but loc=UTC is required so a driver-parsed
+-- time.Time carries UTC wall-clock.
 
 CREATE TABLE IF NOT EXISTS events (
     global_position BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

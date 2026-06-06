@@ -64,6 +64,10 @@ func WithSubscribeBuffer(n int) Option {
 }
 
 // New constructs a MySQL EventStore over an existing *sql.DB.
+//
+// The DSN should set loc=UTC (e.g. ".../db?loc=UTC&parseTime=true"); all
+// timestamps are stored and returned in UTC. The adapter tolerates either
+// parseTime setting when reading DATETIME columns.
 func New(db *sql.DB, clock shared.Clock, opts ...Option) *EventStore {
 	s := &EventStore{
 		db:              db,
@@ -111,7 +115,7 @@ func (s *EventStore) Append(ctx context.Context, streamID string, events []event
 		}
 		if _, err := tx.ExecContext(ctx, insertEventSQL,
 			e.ID, e.StreamID, string(e.Type), e.Version, e.SchemaVersion,
-			[]byte(e.Data), meta, e.OccurredAt.UTC(), recordedAt,
+			normalizeJSON(e.Data), meta, e.OccurredAt.UTC(), recordedAt,
 		); err != nil {
 			_ = tx.Rollback()
 			if isDuplicateKey(err) {
@@ -237,7 +241,7 @@ func (s *EventStore) pollLoop(ctx context.Context, pos int64, ch chan<- eventsto
 // SaveSnapshot upserts an aggregate snapshot keyed by (stream_id, version).
 func (s *EventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snapshot) error {
 	if _, err := s.db.ExecContext(ctx, upsertSnapshotSQL,
-		snapshot.StreamID, snapshot.Version, []byte(snapshot.State),
+		snapshot.StreamID, snapshot.Version, normalizeJSON(snapshot.State),
 		snapshot.AsOf.UTC(), snapshot.CreatedAt.UTC(),
 	); err != nil {
 		return fmt.Errorf("event store: save snapshot for stream %s: %w", snapshot.StreamID, err)
@@ -272,8 +276,8 @@ func scanEvents(rows *sql.Rows) ([]eventstore.Event, error) {
 			typ      string
 			data     []byte
 			meta     []byte
-			occurred time.Time
-			recorded time.Time
+			occurred utcTime
+			recorded utcTime
 			gp       int64
 		)
 		if err := rows.Scan(&e.ID, &e.StreamID, &typ, &e.Version, &e.SchemaVersion,
@@ -288,8 +292,8 @@ func scanEvents(rows *sql.Rows) ([]eventstore.Event, error) {
 				return nil, fmt.Errorf("event store: unmarshal metadata for event %s: %w", e.ID, err)
 			}
 		}
-		e.OccurredAt = occurred.UTC()
-		e.RecordedAt = recorded.UTC()
+		e.OccurredAt = occurred.Time
+		e.RecordedAt = recorded.Time
 		e.GlobalPosition = gp
 		out = append(out, e)
 	}
@@ -303,8 +307,8 @@ func scanSnapshot(row *sql.Row) (*eventstore.Snapshot, error) {
 	var (
 		snap      eventstore.Snapshot
 		state     []byte
-		asOf      time.Time
-		createdAt time.Time
+		asOf      utcTime
+		createdAt utcTime
 	)
 	if err := row.Scan(&snap.StreamID, &snap.Version, &state, &asOf, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -313,7 +317,53 @@ func scanSnapshot(row *sql.Row) (*eventstore.Snapshot, error) {
 		return nil, fmt.Errorf("event store: scan snapshot: %w", err)
 	}
 	snap.State = append(json.RawMessage(nil), state...)
-	snap.AsOf = asOf.UTC()
-	snap.CreatedAt = createdAt.UTC()
+	snap.AsOf = asOf.Time
+	snap.CreatedAt = createdAt.Time
 	return &snap, nil
+}
+
+// normalizeJSON guarantees a non-empty value for JSON NOT NULL columns. An empty
+// or nil payload (the core's Event.Data/Snapshot.State carry no non-empty
+// guarantee) would otherwise be rejected by MySQL as invalid JSON.
+func normalizeJSON(b json.RawMessage) []byte {
+	if len(b) == 0 {
+		return []byte("{}")
+	}
+	return []byte(b)
+}
+
+// utcTime scans a MySQL DATETIME into a UTC time.Time regardless of the driver's
+// parseTime setting: with parseTime=true the driver yields a time.Time (expected
+// to be UTC when the DSN sets loc=UTC); without it the driver yields the raw
+// textual form, which we parse explicitly in UTC. Either way the result is UTC.
+type utcTime struct{ Time time.Time }
+
+func (u *utcTime) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		u.Time = time.Time{}
+	case time.Time:
+		u.Time = v.UTC()
+	case []byte:
+		return u.parse(string(v))
+	case string:
+		return u.parse(v)
+	default:
+		return fmt.Errorf("event store: cannot scan %T into time", src)
+	}
+	return nil
+}
+
+func (u *utcTime) parse(s string) error {
+	if s == "" {
+		u.Time = time.Time{}
+		return nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05"} {
+		if t, err := time.ParseInLocation(layout, s, time.UTC); err == nil {
+			u.Time = t
+			return nil
+		}
+	}
+	return fmt.Errorf("event store: cannot parse datetime %q", s)
 }

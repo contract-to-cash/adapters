@@ -36,6 +36,11 @@ deterministically without a running database (`go test ./... -race`).
 Integration tests against a real MySQL (via docker / testcontainers) are a
 recommended follow-up and are intentionally out of scope for the unit suite.
 
-## Schema
+## Schema & connection
 
 DDL lives next to each adapter (e.g. `mysql/schema.sql`). Apply it before use.
+
+Configure the MySQL DSN with `loc=UTC` (and typically `parseTime=true`), e.g.
+`user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true`. All timestamps are stored
+and returned in UTC; the event store scans `DATETIME` columns correctly under
+either `parseTime` setting.
