@@ -1,0 +1,121 @@
+# CI for contract-to-cash/adapters.
+#
+# The core dependency (github.com/contract-to-cash/core) is a separate
+# repository that is not published to the Go module proxy, so both jobs use a
+# best-effort checkout of core and inject a local `replace` directive. If the
+# checkout fails (e.g. a fork without access to the core repository and no
+# CORE_REPO_TOKEN secret), the Go steps are skipped with a warning instead of
+# failing the build.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: lint + build + unit tests (mysql sqlmock / fincode httptest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout contract-to-cash/core (best effort)
+        id: core
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: contract-to-cash/core
+          path: _core
+          token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt differences in:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+
+      - name: Warn when core is unavailable
+        if: steps.core.outcome != 'success'
+        run: echo "::warning::could not check out contract-to-cash/core (set the CORE_REPO_TOKEN secret); skipping vet/build/test"
+
+      - name: Inject local core replace
+        if: steps.core.outcome == 'success'
+        run: |
+          go mod edit -replace github.com/contract-to-cash/core=./_core
+          go mod tidy
+
+      - name: go vet
+        if: steps.core.outcome == 'success'
+        run: go vet ./...
+
+      - name: go build
+        if: steps.core.outcome == 'success'
+        run: go build ./...
+
+      - name: Unit tests (mysql sqlmock, fincode httptest, postgres compile-only)
+        if: steps.core.outcome == 'success'
+        run: |
+          go test ./mysql/... ./fincode/... -race -count=1
+          # postgres tests need a live database (covered by the integration
+          # job); compile the test binary here to catch API drift early.
+          go test -run NoSuchTest -count=1 ./postgres/...
+
+  postgres-integration:
+    name: postgres integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: adapters_test
+          POSTGRES_PASSWORD: adapters_test
+          POSTGRES_DB: adapters_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapters_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ADAPTERS_TEST_DSN: postgres://adapters_test:adapters_test@localhost:5432/adapters_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout contract-to-cash/core (best effort)
+        id: core
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: contract-to-cash/core
+          path: _core
+          token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Warn when core is unavailable
+        if: steps.core.outcome != 'success'
+        run: echo "::warning::could not check out contract-to-cash/core (set the CORE_REPO_TOKEN secret); skipping postgres integration tests"
+
+      - name: Inject local core replace
+        if: steps.core.outcome == 'success'
+        run: |
+          go mod edit -replace github.com/contract-to-cash/core=./_core
+          go mod tidy
+
+      - name: Integration tests
+        if: steps.core.outcome == 'success'
+        run: go test ./postgres/... -race -count=1
