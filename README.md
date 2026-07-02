@@ -70,14 +70,26 @@ server-side from `expectedVersion`.
   payment's current state first, so a lost execute *response* (payment
   actually captured/authorized) is converted into a success instead of a
   failed re-execute.
-- **Webhooks**: `fincode.WebhookHandler` verifies HMAC-SHA256 (base64) over
-  the raw body against a configurable signature header (default
-  `"signature"`, constant-time comparison, secret required). Known fincode
-  card events map to `port.WebhookEventType` constants; unknown event names
-  are verified and passed through with their raw fincode name as the type.
-  Verify the signature scheme against your fincode dashboard configuration —
-  if your tenant delivers a static signature value instead of an HMAC, front
-  the handler with your own verification.
+- **Webhooks**: `fincode.WebhookHandler` verifies a configurable signature
+  header (default `"signature"`, constant-time comparison) in one of two
+  **explicitly selected** modes — there is **no default**, because fincode's
+  signature scheme could not be confirmed from primary sources and this
+  adapter refuses to bake in an unverified assumption:
+  1. Check in the fincode dashboard / specification whether the signature
+     issued for your webhook subscription is a **fixed string sent verbatim
+     on every delivery** or an **HMAC computed over each request body**.
+  2. Set `WebhookConfig.Mode` accordingly:
+     - `SignatureModeStatic` — `Secret` is the fixed signature string;
+       the header is compared for equality (constant time). *Caution:* this
+       authenticates the sender only; the body is **not** covered by the
+       signature, so payload integrity rests entirely on HTTPS.
+     - `SignatureModeHMAC` — `Secret` is an HMAC key; the header must equal
+       base64(HMAC-SHA256(secret, raw body)), which authenticates sender
+       *and* body.
+  `NewWebhookHandler` returns an error when `Mode` is unset or unknown.
+  Known fincode card events map to `port.WebhookEventType` constants;
+  unknown event names are verified and passed through with their raw fincode
+  name as the type.
 
 ## Testing
 

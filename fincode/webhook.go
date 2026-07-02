@@ -20,10 +20,47 @@ import (
 // webhook signature.
 const DefaultSignatureHeader = "signature"
 
+// SignatureMode selects how the value of the signature header is verified.
+//
+// fincode's official documentation does not state the signature scheme in a
+// way this adapter could confirm from primary sources, so the mode MUST be
+// chosen explicitly: check in the fincode dashboard / specification whether
+// the "signature" issued for your webhook subscription is a fixed string
+// echoed on every delivery (choose SignatureModeStatic) or an HMAC computed
+// over each request body (choose SignatureModeHMAC). There is deliberately
+// no default — leaving Mode empty is a constructor error, so an unverified
+// assumption is never baked in silently.
+type SignatureMode string
+
+const (
+	// SignatureModeStatic treats Secret as the fixed signature string issued
+	// by fincode when the webhook subscription was registered, and compares
+	// it against the header value in constant time.
+	//
+	// LIMITATION: a static signature authenticates the sender only — it is
+	// not bound to the request body, so body integrity rests entirely on
+	// HTTPS transport security. Anyone who learns the value can forge
+	// arbitrary webhook payloads.
+	SignatureModeStatic SignatureMode = "static"
+
+	// SignatureModeHMAC treats Secret as an HMAC key and verifies
+	// HMAC-SHA256(Secret, raw body), standard base64, against the header
+	// value in constant time. This authenticates the sender AND the body.
+	SignatureModeHMAC SignatureMode = "hmac"
+)
+
 // WebhookConfig configures the fincode WebhookHandler.
 type WebhookConfig struct {
-	// Secret is the shared webhook secret configured at fincode when the
-	// webhook subscription is registered. Required.
+	// Mode selects the signature verification scheme. Required — there is no
+	// default. See SignatureMode for how to determine the correct value for
+	// your fincode tenant.
+	Mode SignatureMode
+
+	// Secret is, depending on Mode:
+	//   - SignatureModeStatic: the exact signature string fincode issued for
+	//     the webhook subscription (compared verbatim against the header).
+	//   - SignatureModeHMAC: the shared HMAC key.
+	// Required.
 	Secret string
 
 	// SignatureHeader is the header carrying the signature.
@@ -33,9 +70,9 @@ type WebhookConfig struct {
 
 // WebhookHandler implements port.WebhookHandler for fincode webhooks.
 //
-// Signature scheme: the raw request body is authenticated with
-// HMAC-SHA256(secret, body), encoded as standard base64, and compared in
-// constant time against the value of the signature header.
+// Signature verification is mode-dependent (see SignatureMode): either a
+// constant-time equality check against a fixed expected signature, or
+// HMAC-SHA256(secret, body) in standard base64.
 //
 // Event mapping: known fincode event names are translated to the
 // port.WebhookEventType constants (see toWebhookEventType). Unknown event
@@ -44,6 +81,7 @@ type WebhookConfig struct {
 // kinds without the adapter blocking them. Consumers switch on the port
 // constants and can treat everything else as pass-through.
 type WebhookHandler struct {
+	mode            SignatureMode
 	secret          []byte
 	signatureHeader string
 	clock           shared.Clock
@@ -60,8 +98,24 @@ func WithWebhookClock(clock shared.Clock) WebhookOption {
 	return func(h *WebhookHandler) { h.clock = clock }
 }
 
-// NewWebhookHandler creates a WebhookHandler. The config Secret is required.
+// NewWebhookHandler creates a WebhookHandler. Both cfg.Mode and cfg.Secret
+// are required; an unset or unknown Mode is rejected so that the (unconfirmed)
+// fincode signature scheme is always an explicit integrator decision.
 func NewWebhookHandler(cfg WebhookConfig, opts ...WebhookOption) (*WebhookHandler, error) {
+	switch cfg.Mode {
+	case SignatureModeStatic, SignatureModeHMAC:
+	case "":
+		return nil, &ValidationError{
+			Field: "Mode",
+			Message: "signature mode is required: check the fincode dashboard/spec " +
+				"and set SignatureModeStatic or SignatureModeHMAC explicitly",
+		}
+	default:
+		return nil, &ValidationError{
+			Field:   "Mode",
+			Message: fmt.Sprintf("unknown signature mode %q", cfg.Mode),
+		}
+	}
 	if cfg.Secret == "" {
 		return nil, &ValidationError{Field: "Secret", Message: "webhook secret must not be empty"}
 	}
@@ -70,6 +124,7 @@ func NewWebhookHandler(cfg WebhookConfig, opts ...WebhookOption) (*WebhookHandle
 		header = DefaultSignatureHeader
 	}
 	h := &WebhookHandler{
+		mode:            cfg.Mode,
 		secret:          []byte(cfg.Secret),
 		signatureHeader: header,
 		clock:           shared.SystemClock{},
@@ -91,9 +146,9 @@ type webhookPayload struct {
 	Updated     string `json:"updated"`
 }
 
-// ParseAndVerify verifies the HMAC signature of a raw fincode webhook
-// request and returns the parsed event. All failures are reported as
-// *port.WebhookError with an appropriate code.
+// ParseAndVerify verifies the signature of a raw fincode webhook request
+// (per the configured SignatureMode) and returns the parsed event. All
+// failures are reported as *port.WebhookError with an appropriate code.
 func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequest) (*port.WebhookEvent, error) {
 	if req == nil {
 		return nil, &port.WebhookError{
@@ -148,13 +203,24 @@ func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequ
 	}, nil
 }
 
-// verify performs a constant-time comparison of the header signature against
-// HMAC-SHA256(secret, body) in base64.
+// verify checks the header signature according to the configured mode. Both
+// modes use a constant-time comparison.
 func (h *WebhookHandler) verify(body []byte, headerSig string) bool {
-	mac := hmac.New(sha256.New, h.secret)
-	mac.Write(body)
-	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(strings.TrimSpace(headerSig))) == 1
+	got := []byte(strings.TrimSpace(headerSig))
+	switch h.mode {
+	case SignatureModeStatic:
+		// Fixed signature string: sender authentication only; the body is
+		// not covered (HTTPS is the only integrity guarantee).
+		return subtle.ConstantTimeCompare(h.secret, got) == 1
+	case SignatureModeHMAC:
+		mac := hmac.New(sha256.New, h.secret)
+		mac.Write(body)
+		expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+		return subtle.ConstantTimeCompare([]byte(expected), got) == 1
+	default:
+		// Unreachable: NewWebhookHandler rejects unknown modes.
+		return false
+	}
 }
 
 // eventID derives a deterministic, deduplication-safe event ID. fincode
@@ -215,9 +281,10 @@ func toWebhookEventType(event string) port.WebhookEventType {
 	return port.WebhookEventType(event)
 }
 
-// SignBody computes the signature this handler expects for the given body.
-// Exposed for tests and for consumers that need to verify their fincode
-// dashboard configuration end-to-end.
+// SignBody computes the signature a SignatureModeHMAC handler expects for the
+// given body. Exposed for tests and for consumers that need to verify their
+// fincode dashboard configuration end-to-end. (In SignatureModeStatic the
+// expected signature is simply the configured Secret itself.)
 func SignBody(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)

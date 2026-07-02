@@ -32,7 +32,7 @@ func signedRequest(body []byte) *port.WebhookRequest {
 }
 
 func TestNewWebhookHandler_RequiresSecret(t *testing.T) {
-	_, err := NewWebhookHandler(WebhookConfig{})
+	_, err := NewWebhookHandler(WebhookConfig{Mode: SignatureModeHMAC})
 	if err == nil {
 		t.Fatal("expected error for empty secret")
 	}
@@ -42,8 +42,108 @@ func TestNewWebhookHandler_RequiresSecret(t *testing.T) {
 	}
 }
 
+// The signature mode has NO default: fincode's signature scheme is not
+// confirmed from primary sources, so the integrator must choose explicitly.
+func TestNewWebhookHandler_RequiresExplicitMode(t *testing.T) {
+	_, err := NewWebhookHandler(WebhookConfig{Secret: whSecret})
+	if err == nil {
+		t.Fatal("expected error when Mode is unset")
+	}
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+	if ve.Field != "Mode" {
+		t.Errorf("Field = %q, want Mode", ve.Field)
+	}
+}
+
+func TestNewWebhookHandler_RejectsUnknownMode(t *testing.T) {
+	_, err := NewWebhookHandler(WebhookConfig{Mode: "hmac-sha512", Secret: whSecret})
+	var ve *ValidationError
+	if !errors.As(err, &ve) || ve.Field != "Mode" {
+		t.Fatalf("expected Mode ValidationError for unknown mode, got %v", err)
+	}
+}
+
+// --- Static signature mode ---
+
+func TestWebhook_StaticMode_ValidSignature(t *testing.T) {
+	const staticSig = "fincode-issued-fixed-signature"
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeStatic, Secret: staticSig})
+	body := []byte(`{"event":"payments.card.exec","id":"o_wh_st1","process_date":"2026/06/01 12:00:00.000"}`)
+
+	event, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"signature": staticSig},
+		Body:    body,
+	})
+	if err != nil {
+		t.Fatalf("ParseAndVerify: %v", err)
+	}
+	if event.Type != port.WebhookEventPaymentSucceeded {
+		t.Errorf("Type = %q, want payment.succeeded", event.Type)
+	}
+}
+
+func TestWebhook_StaticMode_WrongSignatureIsRejected(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeStatic, Secret: "expected-signature"})
+	_, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"signature": "some-other-signature"},
+		Body:    []byte(`{"event":"payments.card.exec","id":"o1"}`),
+	})
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Fatalf("expected invalid_signature, got %v", err)
+	}
+}
+
+func TestWebhook_StaticMode_MissingHeaderIsRejected(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeStatic, Secret: "expected-signature"})
+	_, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{},
+		Body:    []byte(`{"event":"payments.card.exec"}`),
+	})
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Fatalf("expected invalid_signature for missing header, got %v", err)
+	}
+}
+
+// Documented limitation of static mode: the signature is not bound to the
+// body, so a tampered body with the correct fixed signature VERIFIES.
+// Body integrity in static mode rests entirely on HTTPS.
+func TestWebhook_StaticMode_DoesNotAuthenticateBody(t *testing.T) {
+	const staticSig = "fincode-issued-fixed-signature"
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeStatic, Secret: staticSig})
+	if _, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"signature": staticSig},
+		Body:    []byte(`{"event":"payments.card.exec","id":"o1","amount":999999}`),
+	}); err != nil {
+		t.Fatalf("static mode intentionally does not cover the body; got %v", err)
+	}
+}
+
+// A static handler must not accept an HMAC signature and vice versa: the two
+// modes are distinct schemes, never interchangeable fallbacks.
+func TestWebhook_ModesAreNotInterchangeable(t *testing.T) {
+	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
+
+	static := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeStatic, Secret: whSecret})
+	if _, err := static.ParseAndVerify(context.Background(), signedRequest(body)); err == nil {
+		t.Error("static handler must reject an HMAC-computed header")
+	}
+
+	hmacH := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
+	if _, err := hmacH.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"signature": whSecret},
+		Body:    body,
+	}); err == nil {
+		t.Error("hmac handler must reject the raw secret as a signature")
+	}
+}
+
 func TestWebhook_ValidSignature(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"event":"payments.card.exec","id":"o_wh_001","order_id":"o_wh_001","process_date":"2026/06/01 12:00:00.000","amount":1000,"status":"CAPTURED"}`)
 
 	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
@@ -70,7 +170,7 @@ func TestWebhook_ValidSignature(t *testing.T) {
 }
 
 func TestWebhook_TamperedBodyIsRejected(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"event":"payments.card.exec","id":"o_wh_001","amount":1000}`)
 	req := signedRequest(body)
 	// Tamper AFTER signing.
@@ -87,7 +187,7 @@ func TestWebhook_TamperedBodyIsRejected(t *testing.T) {
 }
 
 func TestWebhook_WrongSecretIsRejected(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"event":"payments.card.exec","id":"o_wh_001"}`)
 	req := &port.WebhookRequest{
 		Headers: map[string]string{"signature": SignBody("some-other-secret", body)},
@@ -101,7 +201,7 @@ func TestWebhook_WrongSecretIsRejected(t *testing.T) {
 }
 
 func TestWebhook_MissingSignatureHeader(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	_, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
 		Headers: map[string]string{},
 		Body:    []byte(`{"event":"payments.card.exec"}`),
@@ -113,7 +213,7 @@ func TestWebhook_MissingSignatureHeader(t *testing.T) {
 }
 
 func TestWebhook_HeaderLookupIsCaseInsensitive(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
 	req := &port.WebhookRequest{
 		// net/http canonicalizes to "Signature"; the handler must still find it.
@@ -126,7 +226,7 @@ func TestWebhook_HeaderLookupIsCaseInsensitive(t *testing.T) {
 }
 
 func TestWebhook_CustomSignatureHeader(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret, SignatureHeader: "x-fincode-signature"})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret, SignatureHeader: "x-fincode-signature"})
 	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
 
 	req := &port.WebhookRequest{
@@ -144,7 +244,7 @@ func TestWebhook_CustomSignatureHeader(t *testing.T) {
 }
 
 func TestWebhook_InvalidJSONBody(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`not-json`)
 	_, err := h.ParseAndVerify(context.Background(), signedRequest(body))
 	var we *port.WebhookError
@@ -154,7 +254,7 @@ func TestWebhook_InvalidJSONBody(t *testing.T) {
 }
 
 func TestWebhook_MissingEventField(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"id":"o1"}`)
 	_, err := h.ParseAndVerify(context.Background(), signedRequest(body))
 	var we *port.WebhookError
@@ -166,7 +266,7 @@ func TestWebhook_MissingEventField(t *testing.T) {
 // Unknown fincode event names must be verified and passed through with the
 // raw name as the Type, not rejected.
 func TestWebhook_UnknownEventIsPassedThrough(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"event":"payments.applepay.exec","id":"o1"}`)
 
 	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
@@ -197,7 +297,7 @@ func TestWebhook_EventTypeMapping(t *testing.T) {
 // Event IDs must be stable for the same payload (dedup) and distinct across
 // different payments/events.
 func TestWebhook_EventIDStability(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 
 	body1 := []byte(`{"event":"payments.card.exec","id":"o1","process_date":"2026/06/01 12:00:00.000"}`)
 	body2 := []byte(`{"event":"payments.card.exec","id":"o2","process_date":"2026/06/01 12:00:00.000"}`)
@@ -224,7 +324,7 @@ func TestWebhook_EventIDStability(t *testing.T) {
 
 // A payload without a parseable timestamp falls back to the injected clock.
 func TestWebhook_CreatedAtFallsBackToClock(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
 
 	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
@@ -237,7 +337,7 @@ func TestWebhook_CreatedAtFallsBackToClock(t *testing.T) {
 }
 
 func TestWebhook_NilRequest(t *testing.T) {
-	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
 	_, err := h.ParseAndVerify(context.Background(), nil)
 	var we *port.WebhookError
 	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidPayload {
