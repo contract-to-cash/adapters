@@ -36,10 +36,10 @@ const (
 )
 
 type pricingModelEnvelope struct {
-	Kind   pricingModelKind      `json:"kind"`
-	Flat   *pricing.FlatPrice    `json:"flat,omitempty"`
-	Tiered *pricing.TieredPrice  `json:"tiered,omitempty"`
-	Usage  *pricing.UsagePrice   `json:"usage,omitempty"`
+	Kind   pricingModelKind     `json:"kind"`
+	Flat   *pricing.FlatPrice   `json:"flat,omitempty"`
+	Tiered *pricing.TieredPrice `json:"tiered,omitempty"`
+	Usage  *pricing.UsagePrice  `json:"usage,omitempty"`
 }
 
 func marshalPricingModel(m pricing.PricingModel) ([]byte, error) {

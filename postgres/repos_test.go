@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -18,10 +19,29 @@ import (
 	"github.com/contract-to-cash/core/domain/product"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/domain/usage"
+	"github.com/contract-to-cash/core/eventstore"
 )
 
 func jpy(amount int64) shared.Money {
 	return shared.NewMoney(new(big.Rat).SetInt64(amount), "JPY")
+}
+
+// newDraftContract creates an aggregate with a valid ContractCreated event.
+func newDraftContract(t *testing.T, id shared.ContractID, accountID shared.AccountID, priceID shared.PriceID, clock shared.Clock) *contract.ContractAggregate {
+	t.Helper()
+	agg := contract.NewContractAggregate(id, clock)
+	err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: "idem-" + string(id),
+		AccountID:      accountID,
+		PriceID:        priceID,
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
+		Price:          jpy(1000),
+	}, eventstore.EventMetadata{UserID: "test-user"})
+	if err != nil {
+		t.Fatalf("Create contract %s: %v", id, err)
+	}
+	return agg
 }
 
 // --- Contract Repository ---
@@ -29,12 +49,11 @@ func jpy(amount int64) shared.Money {
 func TestContractRepo_SaveAndFindByID(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	es := postgres.NewEventStore(pool)
-	clock := shared.FixedClock{Time: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
 	repo := postgres.NewContractRepository(pool, es, clock)
 	ctx := context.Background()
 
-	agg := contract.NewContractAggregate("c-1", clock)
-	_ = agg.Create("acc-1", "price-1")
+	agg := newDraftContract(t, "c-1", "acc-1", "price-1", clock)
 
 	if err := repo.Save(ctx, agg); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -47,7 +66,7 @@ func TestContractRepo_SaveAndFindByID(t *testing.T) {
 	if found.ID() != "c-1" {
 		t.Errorf("ID = %q, want c-1", found.ID())
 	}
-	if found.Status() != contract.StatusDraft {
+	if found.Status() != contract.ContractStatusDraft {
 		t.Errorf("Status = %q, want draft", found.Status())
 	}
 }
@@ -55,7 +74,7 @@ func TestContractRepo_SaveAndFindByID(t *testing.T) {
 func TestContractRepo_FindByID_NotFound(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	es := postgres.NewEventStore(pool)
-	clock := shared.FixedClock{Time: time.Now()}
+	clock := shared.FixedClock{FixedTime: time.Now()}
 	repo := postgres.NewContractRepository(pool, es, clock)
 	ctx := context.Background()
 
@@ -63,7 +82,7 @@ func TestContractRepo_FindByID_NotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !shared.IsDomainError(err, shared.ErrCodeNotFound) {
+	if !isDomainError(err, shared.ErrCodeNotFound) {
 		t.Errorf("expected not_found, got: %v", err)
 	}
 }
@@ -72,14 +91,13 @@ func TestContractRepo_FindByAccountID(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	es := postgres.NewEventStore(pool)
 	cp := postgres.NewCheckpointStore(pool)
-	clock := shared.FixedClock{Time: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
 	repo := postgres.NewContractRepository(pool, es, clock)
 	proj := postgres.NewContractProjector(pool, es, cp)
 	ctx := context.Background()
 
 	// Create and project a contract.
-	agg := contract.NewContractAggregate("c-2", clock)
-	_ = agg.Create("acc-2", "price-2")
+	agg := newDraftContract(t, "c-2", "acc-2", "price-2", clock)
 	if err := repo.Save(ctx, agg); err != nil {
 		t.Fatal(err)
 	}
@@ -106,12 +124,6 @@ func TestContractRepo_FindByAccountID(t *testing.T) {
 
 // --- Invoice Repository ---
 
-func setupContractReadModel(t *testing.T, pool interface {
-	Exec(ctx context.Context, sql string, args ...any) (interface{ RowsAffected() int64 }, error)
-}, contractID string) {
-	// This is a helper but we need to use the real pool type.
-}
-
 func TestInvoiceRepo_SaveAndFindByID(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	ctx := context.Background()
@@ -128,13 +140,16 @@ func TestInvoiceRepo_SaveAndFindByID(t *testing.T) {
 	snap := invoice.InvoiceSnapshot{
 		ID: "inv-1", InvoiceNumber: "INV-001",
 		AccountID: "acc-inv", ContractID: "c-inv",
-		Status:    invoice.StatusDraft,
-		Subtotal:  jpy(10000), TaxAmount: jpy(1000),
+		Status:   invoice.InvoiceStatusDraft,
+		Subtotal: jpy(10000), TaxAmount: jpy(1000),
 		DiscountAmount: jpy(0), Total: jpy(11000),
 		AppliedBalance: jpy(0), AmountDue: jpy(11000),
 		PaidAmount: jpy(0), Balance: jpy(0),
 	}
-	inv := invoice.NewInvoice(snap)
+	inv, err := invoice.InvoiceFromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("InvoiceFromSnapshot: %v", err)
+	}
 
 	if err := repo.Save(ctx, inv); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -157,7 +172,7 @@ func TestInvoiceRepo_FindByID_NotFound(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	repo := postgres.NewInvoiceRepository(pool)
 	_, err := repo.FindByID(context.Background(), "nonexistent")
-	if !shared.IsDomainError(err, shared.ErrCodeNotFound) {
+	if !isDomainError(err, shared.ErrCodeNotFound) {
 		t.Errorf("expected not_found, got: %v", err)
 	}
 }
@@ -168,20 +183,24 @@ func TestInvoiceRepo_FindByStatus(t *testing.T) {
 	_, _ = pool.Exec(ctx, `INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-st', 'acc-st', 'active')`)
 
 	repo := postgres.NewInvoiceRepository(pool)
-	for _, status := range []invoice.InvoiceStatus{invoice.StatusDraft, invoice.StatusDraft, invoice.StatusIssued} {
+	for i, status := range []invoice.InvoiceStatus{invoice.InvoiceStatusDraft, invoice.InvoiceStatusDraft, invoice.InvoiceStatusIssued} {
 		snap := invoice.InvoiceSnapshot{
-			ID: shared.InvoiceID("inv-" + string(status) + "-" + time.Now().Format("150405.000000000")),
+			ID:        shared.InvoiceID(fmt.Sprintf("inv-%s-%d", status, i)),
 			AccountID: "acc-st", ContractID: "c-st", Status: status,
 			Subtotal: jpy(0), TaxAmount: jpy(0), DiscountAmount: jpy(0),
 			Total: jpy(0), AppliedBalance: jpy(0), AmountDue: jpy(0),
 			PaidAmount: jpy(0), Balance: jpy(0),
 		}
-		if err := repo.Save(ctx, invoice.NewInvoice(snap)); err != nil {
+		inv, err := invoice.InvoiceFromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, inv); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	drafts, err := repo.FindByStatus(ctx, invoice.StatusDraft)
+	drafts, err := repo.FindByStatus(ctx, invoice.InvoiceStatusDraft)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,10 +221,14 @@ func TestPaymentRepo_SaveAndFindByID(t *testing.T) {
 	snap := payment.PaymentSnapshot{
 		ID: "pay-1", InvoiceID: "inv-pay",
 		Amount: jpy(5000), RefundedAmount: jpy(0),
-		Method: payment.MethodCreditCard, Status: payment.StatusCompleted,
+		Method: payment.PaymentMethodCreditCard, Status: payment.PaymentStatusCompleted,
 		IdempotencyKey: "idem-1", ProcessedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
-	if err := repo.Save(ctx, payment.NewPayment(snap)); err != nil {
+	p, err := payment.FromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("FromSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, p); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -228,10 +251,14 @@ func TestPaymentRepo_FindByIdempotencyKey(t *testing.T) {
 	snap := payment.PaymentSnapshot{
 		ID: "pay-idem", InvoiceID: "inv-idem",
 		Amount: jpy(1000), RefundedAmount: jpy(0),
-		Method: payment.MethodCreditCard, Status: payment.StatusCompleted,
+		Method: payment.PaymentMethodCreditCard, Status: payment.PaymentStatusCompleted,
 		IdempotencyKey: "unique-key-1", ProcessedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
-	if err := repo.Save(ctx, payment.NewPayment(snap)); err != nil {
+	p, err := payment.FromSnapshot(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, p); err != nil {
 		t.Fatal(err)
 	}
 
@@ -260,59 +287,21 @@ func TestBalanceRepo_SaveAndFindByID(t *testing.T) {
 	repo := postgres.NewBalanceRepository(pool)
 	ctx := context.Background()
 
+	// Version 0 means the entry has never been persisted: FromSnapshot sets
+	// loadedVersion = Version = 0, which routes Save through the INSERT path.
 	snap := balance.BalanceEntrySnapshot{
 		ID: "be-1", AccountID: "acc-bal",
 		OriginalAmount: jpy(10000), RemainingAmount: jpy(10000),
-		Reason: balance.ReasonCreditGrant, SourceType: balance.SourceTypeManual,
+		Reason: balance.BalanceReasonManualAdjustment, SourceType: balance.BalanceSourceTypeManual,
 		SourceID: "manual-1", Description: "test credit",
-		Version: 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+		Version: 0, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
-	entry := balance.NewBalanceEntry(snap)
-	// Set loaded version to 0 to trigger INSERT path.
-	entry.SetVersion(0)
-	snap2 := entry.ToSnapshot()
-	snap2.Version = 1
-	entry2 := balance.NewBalanceEntry(balance.BalanceEntrySnapshot{
-		ID: "be-1", AccountID: "acc-bal",
-		OriginalAmount: jpy(10000), RemainingAmount: jpy(10000),
-		Reason: balance.ReasonCreditGrant, SourceType: balance.SourceTypeManual,
-		SourceID: "manual-1", Description: "test credit",
-		Version: 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-	})
-	// Hack: create a fresh entry with loadedVersion=0 for the INSERT path.
-	freshSnap := balance.BalanceEntrySnapshot{
-		ID: "be-1", AccountID: "acc-bal",
-		OriginalAmount: jpy(10000), RemainingAmount: jpy(10000),
-		Reason: balance.ReasonCreditGrant, SourceType: balance.SourceTypeManual,
-		SourceID: "manual-1", Description: "test credit",
-		Version: 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-	}
-	freshEntry, _ := balance.FromSnapshot(freshSnap)
-	// FromSnapshot sets loadedVersion to snap.Version (1). We need 0 for INSERT.
-	// Let's just use the raw NewBalanceEntry approach.
-	_ = entry2
-	_ = freshEntry
-
-	// Simplest approach: build entry, set version to achieve loadedVersion=0
-	insertEntry := balance.NewBalanceEntry(balance.BalanceEntrySnapshot{
-		ID: "be-1", AccountID: "acc-bal",
-		OriginalAmount: jpy(10000), RemainingAmount: jpy(10000),
-		Reason: balance.ReasonCreditGrant, SourceType: balance.SourceTypeManual,
-		SourceID: "manual-1", Description: "test credit",
-		Version: 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-	})
-	insertEntry.SetVersion(0) // Reset to 0 to trigger INSERT
-
-	// Now set the snapshot version
-	// Actually NewBalanceEntry sets loadedVersion = snap.Version (1).
-	// SetVersion(0) sets both loadedVersion and snap.Version to 0.
-	// Let's just insert directly via SQL for the test.
-	_, err := pool.Exec(ctx,
-		`INSERT INTO balance_entries (id, account_id, original_amount, remaining_amount, currency,
-			reason, source_type, source_id, description, version, created_at)
-		 VALUES ('be-1', 'acc-bal', 10000, 10000, 'JPY', 'credit_grant', 'manual', 'manual-1', 'test credit', 1, NOW())`)
+	entry, err := balance.FromSnapshot(snap)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, entry); err != nil {
+		t.Fatalf("Save: %v", err)
 	}
 
 	found, err := repo.FindByID(ctx, "be-1")
@@ -385,10 +374,10 @@ func TestUsageRepo_RecordAndGetSummary(t *testing.T) {
 	repo := postgres.NewUsageRepository(pool)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 
-	rec := usage.NewUsageRecord(usage.UsageRecordSnapshot{
-		ID: "ur-1", ContractID: "c-usage", MetricName: "api_calls",
-		Quantity: 100, Timestamp: now, IdempotencyKey: "idem-ur-1",
-	})
+	rec, err := usage.NewUsageRecord("ur-1", "c-usage", "api_calls", 100, now, "idem-ur-1")
+	if err != nil {
+		t.Fatalf("NewUsageRecord: %v", err)
+	}
 	if err := repo.Record(ctx, rec); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -398,7 +387,10 @@ func TestUsageRepo_RecordAndGetSummary(t *testing.T) {
 		t.Fatalf("duplicate Record: %v", err)
 	}
 
-	period := shared.NewDateRange(now.Add(-time.Hour), now.Add(time.Hour))
+	period, err := shared.NewDateRange(now.Add(-time.Hour), now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
 	summary, err := repo.GetSummary(ctx, "c-usage", "api_calls", period)
 	if err != nil {
 		t.Fatal(err)
@@ -417,11 +409,15 @@ func TestProductRepo_SaveAndFindByID(t *testing.T) {
 
 	snap := product.ProductSnapshot{
 		ID: "prod-1", Name: "Test Product", Description: "A test",
-		Status:    product.StatusActive,
+		Status:    product.ProductStatusActive,
 		CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-		Features:  []product.FeatureSnapshot{{Name: "feature-1", Enabled: true}},
+		Features:  []product.Feature{{Name: "feature-1", Included: true}},
 	}
-	if err := repo.Save(ctx, product.NewProduct(snap)); err != nil {
+	prod, err := product.FromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("FromSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, prod); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -442,20 +438,30 @@ func TestPriceRepo_SaveAndFindByID(t *testing.T) {
 
 	// Product must exist for FK.
 	prodRepo := postgres.NewProductRepository(pool)
-	_ = prodRepo.Save(ctx, product.NewProduct(product.ProductSnapshot{
-		ID: "prod-price", Name: "Product", Status: product.StatusActive,
+	prod, err := product.FromSnapshot(product.ProductSnapshot{
+		ID: "prod-price", Name: "Product", Status: product.ProductStatusActive,
 		CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-	}))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prodRepo.Save(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
 
 	repo := postgres.NewPriceRepository(pool)
 	snap := pricing.PriceSnapshot{
 		ID: "price-1", ProductID: "prod-price",
 		Amount: jpy(1000), Currency: "JPY",
-		Status:       pricing.StatusActive,
-		PricingModel: pricing.FlatPrice{Amount: jpy(1000)},
+		Status:       pricing.PriceStatusActive,
+		PricingModel: pricing.FlatPrice{Price: jpy(1000)},
 		CreatedAt:    time.Now().UTC().Truncate(time.Microsecond),
 	}
-	if err := repo.Save(ctx, pricing.NewPrice(snap)); err != nil {
+	price, err := pricing.FromSnapshot(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, price); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -469,8 +475,8 @@ func TestPriceRepo_SaveAndFindByID(t *testing.T) {
 	}
 	if fs.PricingModel == nil {
 		t.Error("PricingModel is nil")
-	} else if fs.PricingModel.Type() != "flat" {
-		t.Errorf("PricingModel.Type = %q, want flat", fs.PricingModel.Type())
+	} else if _, ok := fs.PricingModel.(pricing.FlatPrice); !ok {
+		t.Errorf("PricingModel type = %T, want pricing.FlatPrice", fs.PricingModel)
 	}
 }
 
@@ -479,19 +485,31 @@ func TestPriceRepo_FindActiveByProductID(t *testing.T) {
 	ctx := context.Background()
 
 	prodRepo := postgres.NewProductRepository(pool)
-	_ = prodRepo.Save(ctx, product.NewProduct(product.ProductSnapshot{
-		ID: "prod-active", Name: "P", Status: product.StatusActive,
+	prod, err := product.FromSnapshot(product.ProductSnapshot{
+		ID: "prod-active", Name: "P", Status: product.ProductStatusActive,
 		CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
-	}))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prodRepo.Save(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
 
 	repo := postgres.NewPriceRepository(pool)
-	for _, s := range []pricing.PriceStatus{pricing.StatusActive, pricing.StatusActive, pricing.StatusInactive} {
+	for i, s := range []pricing.PriceStatus{pricing.PriceStatusActive, pricing.PriceStatusActive, pricing.PriceStatusArchived} {
 		snap := pricing.PriceSnapshot{
-			ID: shared.PriceID("pr-" + string(s) + "-" + time.Now().Format("150405.000000000")),
+			ID:        shared.PriceID(fmt.Sprintf("pr-%s-%d", s, i)),
 			ProductID: "prod-active", Amount: jpy(500), Currency: "JPY",
 			Status: s, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 		}
-		_ = repo.Save(ctx, pricing.NewPrice(snap))
+		price, err := pricing.FromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, price); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	active, err := repo.FindActiveByProductID(ctx, "prod-active")
@@ -509,15 +527,14 @@ func TestContractProjector_Rebuild(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	es := postgres.NewEventStore(pool)
 	cp := postgres.NewCheckpointStore(pool)
-	clock := shared.FixedClock{Time: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
 	repo := postgres.NewContractRepository(pool, es, clock)
 	proj := postgres.NewContractProjector(pool, es, cp)
 	ctx := context.Background()
 
 	// Create two contracts.
 	for _, id := range []string{"c-r1", "c-r2"} {
-		agg := contract.NewContractAggregate(shared.ContractID(id), clock)
-		_ = agg.Create(shared.AccountID("acc-"+id), shared.PriceID("p-"+id))
+		agg := newDraftContract(t, shared.ContractID(id), shared.AccountID("acc-"+id), shared.PriceID("p-"+id), clock)
 		if err := repo.Save(ctx, agg); err != nil {
 			t.Fatal(err)
 		}
