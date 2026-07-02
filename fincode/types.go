@@ -1,4 +1,5 @@
-// Package fincode implements a payment.Gateway adapter for the fincode payment API.
+// Package fincode implements the core port.PaymentGateway and
+// port.WebhookHandler interfaces on top of the fincode payment API.
 //
 // API Reference: https://docs.fincode.jp/api
 package fincode
@@ -138,6 +139,40 @@ type PaymentResponse struct {
 	Updated       string        `json:"updated"`
 }
 
+// --- Customer card types (payment methods) ---
+
+// CreateCardRequest is the request body for POST /v1/customers/{customer_id}/cards.
+type CreateCardRequest struct {
+	Token       string `json:"token"`
+	DefaultFlag string `json:"default_flag,omitempty"` // "0" or "1"
+}
+
+// CardResponse represents a stored customer card.
+type CardResponse struct {
+	CustomerID  string `json:"customer_id"`
+	ID          string `json:"id"`
+	DefaultFlag string `json:"default_flag"`
+	CardNo      string `json:"card_no"` // masked
+	Expire      string `json:"expire"`  // yymm
+	HolderName  string `json:"holder_name"`
+	Type        string `json:"type"`
+	Brand       string `json:"brand"`
+	Created     string `json:"created"`
+	Updated     string `json:"updated"`
+}
+
+// CardListResponse is the response body for GET /v1/customers/{customer_id}/cards.
+type CardListResponse struct {
+	List []CardResponse `json:"list"`
+}
+
+// DeleteCardResponse is the response body for DELETE /v1/customers/{customer_id}/cards/{id}.
+type DeleteCardResponse struct {
+	CustomerID string `json:"customer_id"`
+	ID         string `json:"id"`
+	DeleteFlag string `json:"delete_flag"`
+}
+
 // APIError represents a single error from fincode API.
 type APIError struct {
 	ErrorCode    string `json:"error_code"`
@@ -207,11 +242,12 @@ func (e *ValidationError) Is(target error) bool {
 	return target == ErrValidation
 }
 
-// PartialAuthorizeError is returned from Gateway.Authorize when the register
-// step (POST /v1/payments) succeeded but the execute step (PUT /v1/payments/{id})
-// failed. The OrderID and AccessID identify the registered-but-not-executed
-// payment, so the caller can retry the execute step by calling
-// Gateway.ExecuteAuthorize with those values.
+// PartialAuthorizeError is returned from Gateway.Charge / Gateway.Authorize
+// when the register step (POST /v1/payments) succeeded but the execute step
+// (PUT /v1/payments/{id}) failed. The OrderID and AccessID identify the
+// registered-but-not-executed payment, so the caller can retry the execute
+// step by calling Gateway.CompleteCharge / Gateway.CompleteAuthorize with
+// those values. fincode does not bill until the execute step completes.
 type PartialAuthorizeError struct {
 	OrderID  string
 	AccessID string

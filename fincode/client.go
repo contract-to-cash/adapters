@@ -126,6 +126,33 @@ func (c *Client) RetrievePayment(ctx context.Context, orderID string, payType Pa
 	return doJSON[PaymentResponse](c, ctx, http.MethodGet, path, nil)
 }
 
+// --- Customer card API (payment methods) ---
+
+// CreateCard registers a tokenized card for a customer
+// (POST /v1/customers/{customer_id}/cards).
+func (c *Client) CreateCard(ctx context.Context, customerID string, req *CreateCardRequest) (*CardResponse, error) {
+	return doJSON[CardResponse](c, ctx, http.MethodPost,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards", req)
+}
+
+// RetrieveCard gets a stored card (GET /v1/customers/{customer_id}/cards/{id}).
+func (c *Client) RetrieveCard(ctx context.Context, customerID, cardID string) (*CardResponse, error) {
+	return doJSON[CardResponse](c, ctx, http.MethodGet,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards/"+url.PathEscape(cardID), nil)
+}
+
+// ListCards lists a customer's stored cards (GET /v1/customers/{customer_id}/cards).
+func (c *Client) ListCards(ctx context.Context, customerID string) (*CardListResponse, error) {
+	return doJSON[CardListResponse](c, ctx, http.MethodGet,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards", nil)
+}
+
+// DeleteCard removes a stored card (DELETE /v1/customers/{customer_id}/cards/{id}).
+func (c *Client) DeleteCard(ctx context.Context, customerID, cardID string) (*DeleteCardResponse, error) {
+	return doJSON[DeleteCardResponse](c, ctx, http.MethodDelete,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards/"+url.PathEscape(cardID), nil)
+}
+
 // doJSON sends an HTTP request and decodes a JSON response.
 //
 // On success it returns a pointer to a freshly decoded T.
