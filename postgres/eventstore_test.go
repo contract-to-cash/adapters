@@ -86,6 +86,47 @@ func TestEventStore_AppendVersionConflict(t *testing.T) {
 	}
 }
 
+// An expectedVersion AHEAD of the stream must conflict, not silently insert
+// events past a gap in the version sequence. Regression test for the case
+// where a stream at version 1 accepted an append with expectedVersion=10
+// (inserting version 11) because only the UNIQUE constraint guarded appends.
+func TestEventStore_AppendVersionConflict_ExpectedVersionAhead(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	event1 := []eventstore.Event{{
+		ID: "evt-ahead-1", Type: "test.created", SchemaVersion: 1,
+		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+	}}
+	if err := store.Append(ctx, "stream-ahead", event1, 0); err != nil {
+		t.Fatalf("first Append: %v", err)
+	}
+
+	// Stream is at version 1; claiming it is at 10 must be a version
+	// conflict, not a successful insert of version 11.
+	event2 := []eventstore.Event{{
+		ID: "evt-ahead-2", Type: "test.updated", SchemaVersion: 1,
+		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+	}}
+	err := store.Append(ctx, "stream-ahead", event2, 10)
+	if err == nil {
+		t.Fatal("expected version conflict error, got nil")
+	}
+	if !isDomainError(err, shared.ErrCodeVersionConflict) {
+		t.Errorf("expected ErrCodeVersionConflict, got: %v", err)
+	}
+
+	// Nothing may have been inserted past the gap.
+	events, err := store.Load(ctx, "stream-ahead")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(events) != 1 || events[0].Version != 1 {
+		t.Errorf("stream must still contain exactly version 1, got %d events", len(events))
+	}
+}
+
 func TestEventStore_LoadUntilVersion(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	store := postgres.NewEventStore(pool)

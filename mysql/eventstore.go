@@ -265,10 +265,18 @@ func (s *EventStore) pollLoop(ctx context.Context, pos int64, ch chan<- eventsto
 }
 
 // SaveSnapshot upserts an aggregate snapshot keyed by (stream_id, version).
+// A zero CreatedAt (caller did not stamp it) is filled from the store clock,
+// matching the postgres adapter's COALESCE(..., NOW()) fallback —
+// LoadSnapshotBefore filters on created_at, so a persisted zero value would
+// make the snapshot invisible to every temporal query.
 func (s *EventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snapshot) error {
+	createdAt := snapshot.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = s.clock.Now()
+	}
 	if _, err := s.q(ctx).ExecContext(ctx, upsertSnapshotSQL,
 		snapshot.StreamID, snapshot.Version, normalizeJSON(snapshot.State),
-		snapshot.AsOf.UTC(), snapshot.CreatedAt.UTC(),
+		snapshot.AsOf.UTC(), createdAt.UTC(),
 	); err != nil {
 		return fmt.Errorf("event store: save snapshot for stream %s: %w", snapshot.StreamID, err)
 	}
@@ -284,10 +292,11 @@ func (s *EventStore) LoadSnapshot(ctx context.Context, streamID string) (*events
 }
 
 // LoadSnapshotBefore loads the latest snapshot created before the given time,
-// or (nil, nil) if none.
+// or (nil, nil) if none. version DESC breaks ties between snapshots created
+// at the same instant deterministically (highest wins).
 func (s *EventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	row := s.q(ctx).QueryRowContext(ctx,
-		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 1",
+		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC, version DESC LIMIT 1",
 		streamID, before.UTC())
 	return scanSnapshot(row)
 }
