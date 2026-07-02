@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -418,6 +419,28 @@ func TestDeriveOrderID(t *testing.T) {
 	}
 }
 
+func TestDeriveIdempotencyKey(t *testing.T) {
+	k := deriveIdempotencyKey("idem-cap", "change")
+	if len(k) != 30 {
+		t.Errorf("len = %d, want 30", len(k))
+	}
+	if k != deriveIdempotencyKey("idem-cap", "change") {
+		t.Error("derivation must be deterministic")
+	}
+	if k == deriveIdempotencyKey("idem-cap", "capture") {
+		t.Error("distinct ops must derive distinct keys")
+	}
+	if k == deriveIdempotencyKey("idem-cab", "change") {
+		t.Error("distinct base keys must derive distinct keys")
+	}
+	if k == "idem-cap" {
+		t.Error("derived key must differ from the caller's key")
+	}
+	if deriveIdempotencyKey("", "change") != "" {
+		t.Error("empty key must derive an empty key (header omitted)")
+	}
+}
+
 // A caller-supplied IdempotencyKey must fix the fincode order ID so a retried
 // Charge re-registers the same order (permanent dedup, beyond the 30-minute
 // idempotent_key header window).
@@ -461,6 +484,10 @@ func TestGateway_Charge_NoIdempotencyKey_FincodeAssignsOrderID(t *testing.T) {
 // Capture / Void / Cancel / Refund must forward req.IdempotencyKey as the
 // fincode idempotent_key header instead of discarding it.
 func TestGateway_MutatingCalls_ForwardIdempotencyKey(t *testing.T) {
+	// Capture issues up to two mutating calls from one request; each must get
+	// its own derived idempotent_key (fincode's replay scope across endpoints
+	// is unconfirmed, and replaying the /change response on /capture would
+	// skip the real capture).
 	t.Run("capture", func(t *testing.T) {
 		gw, fake, cleanup := setupGateway(t)
 		defer cleanup()
@@ -476,11 +503,17 @@ func TestGateway_MutatingCalls_ForwardIdempotencyKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Capture: %v", err)
 		}
-		if fake.changeIdempotencyHeader != "idem-cap" {
-			t.Errorf("change idempotent_key = %q, want idem-cap", fake.changeIdempotencyHeader)
+		if want := deriveIdempotencyKey("idem-cap", "change"); fake.changeIdempotencyHeader != want {
+			t.Errorf("change idempotent_key = %q, want derived %q", fake.changeIdempotencyHeader, want)
 		}
-		if fake.captureIdempotencyHeader != "idem-cap" {
-			t.Errorf("capture idempotent_key = %q, want idem-cap", fake.captureIdempotencyHeader)
+		if want := deriveIdempotencyKey("idem-cap", "capture"); fake.captureIdempotencyHeader != want {
+			t.Errorf("capture idempotent_key = %q, want derived %q", fake.captureIdempotencyHeader, want)
+		}
+		if fake.changeIdempotencyHeader == "" || fake.captureIdempotencyHeader == "" {
+			t.Error("both calls must carry an idempotent_key")
+		}
+		if fake.changeIdempotencyHeader == fake.captureIdempotencyHeader {
+			t.Error("/change and /capture must NOT share the same idempotent_key")
 		}
 	})
 
@@ -737,6 +770,283 @@ func TestGateway_Charge_RegisterFailure_IsPlainGatewayError(t *testing.T) {
 	}
 	if ge.DeclineCode != "E0100001" {
 		t.Errorf("DeclineCode = %q, want fincode error code E0100001", ge.DeclineCode)
+	}
+}
+
+// --- Idempotent retry recovery (duplicate order ID / lost execute response) ---
+
+// registerFailFincode simulates a fincode where the register step always
+// fails (as it does for a duplicate derived order ID once the idempotent_key
+// header TTL has passed) and GET /v1/payments/{id} reports a configurable
+// order state.
+type registerFailFincode struct {
+	getStatus    PaymentStatus // "" → GET answers 404 (order does not exist)
+	getCalls     int
+	executeCalls int
+}
+
+func (f *registerFailFincode) server() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/payments":
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{
+				Errors: []APIError{{ErrorCode: "E_DUP", ErrorMessage: "order id already exists"}},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/payments/"):
+			f.getCalls++
+			if f.getStatus == "" {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(ErrorResponse{
+					Errors: []APIError{{ErrorCode: "E_NF", ErrorMessage: "order not found"}},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(PaymentResponse{
+				ID:       strings.TrimPrefix(r.URL.Path, "/v1/payments/"),
+				AccessID: "a_recover_001",
+				Status:   f.getStatus,
+				Amount:   1000, TotalAmount: 1000,
+			})
+		default:
+			f.executeCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{
+				Errors: []APIError{{ErrorCode: "E9999", ErrorMessage: "unexpected call"}},
+			})
+		}
+	}))
+}
+
+func recoveryGateway(t *testing.T, fake *registerFailFincode) (*Gateway, func()) {
+	t.Helper()
+	srv := fake.server()
+	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	return NewGateway(client, WithClock(shared.FixedClock{FixedTime: gwFixedTime})), srv.Close
+}
+
+// After the 30-minute idempotent_key TTL, retrying a Charge with the same
+// IdempotencyKey makes fincode reject the derived order ID as a duplicate.
+// If that order was already captured, the retry must replay the success — not
+// misreport a completed payment as a permanent failure.
+func TestGateway_Charge_RegisterDuplicate_AlreadyCaptured_ReplaysSuccess(t *testing.T) {
+	fake := &registerFailFincode{getStatus: StatusCaptured}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	resp, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-recover",
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if resp.Status != port.TransactionStatusCaptured {
+		t.Errorf("Status = %q, want captured", resp.Status)
+	}
+	if want := deriveOrderID("idem-recover"); resp.TransactionID != want {
+		t.Errorf("TransactionID = %q, want derived order %q", resp.TransactionID, want)
+	}
+	if fake.executeCalls != 0 {
+		t.Error("execute must NOT be called when replaying an existing captured order")
+	}
+}
+
+// A duplicate rejection for an order that exists but never completed is
+// recoverable: surface *PartialAuthorizeError with the derived order ID and
+// the access_id obtained from the retrieve, so CompleteCharge can finish it.
+func TestGateway_Charge_RegisterDuplicate_Incomplete_IsPartialAuthorizeError(t *testing.T) {
+	for _, status := range []PaymentStatus{StatusUnprocessed, StatusAuthorized} {
+		t.Run(string(status), func(t *testing.T) {
+			fake := &registerFailFincode{getStatus: status}
+			gw, cleanup := recoveryGateway(t, fake)
+			defer cleanup()
+
+			_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+				Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-recover",
+			})
+			var pae *PartialAuthorizeError
+			if !errors.As(err, &pae) {
+				t.Fatalf("expected *PartialAuthorizeError, got %T: %v", err, err)
+			}
+			if want := deriveOrderID("idem-recover"); pae.OrderID != want {
+				t.Errorf("OrderID = %q, want derived %q", pae.OrderID, want)
+			}
+			if pae.AccessID != "a_recover_001" {
+				t.Errorf("AccessID = %q, want a_recover_001 (from retrieve)", pae.AccessID)
+			}
+			if pae.Cause == nil {
+				t.Error("Cause must carry the register error")
+			}
+		})
+	}
+}
+
+func TestGateway_Authorize_RegisterDuplicate_AlreadyAuthorized_ReplaysSuccess(t *testing.T) {
+	fake := &registerFailFincode{getStatus: StatusAuthorized}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	resp, err := gw.Authorize(context.Background(), &port.AuthorizeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-recover-auth",
+	})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if resp.Status != port.TransactionStatusAuthorized {
+		t.Errorf("Status = %q, want authorized", resp.Status)
+	}
+	if want := deriveOrderID("idem-recover-auth"); resp.AuthorizationID != want {
+		t.Errorf("AuthorizationID = %q, want derived order %q", resp.AuthorizationID, want)
+	}
+}
+
+func TestGateway_Authorize_RegisterDuplicate_Unprocessed_IsPartialAuthorizeError(t *testing.T) {
+	fake := &registerFailFincode{getStatus: StatusUnprocessed}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Authorize(context.Background(), &port.AuthorizeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-recover-auth",
+	})
+	var pae *PartialAuthorizeError
+	if !errors.As(err, &pae) {
+		t.Fatalf("expected *PartialAuthorizeError, got %T: %v", err, err)
+	}
+	if want := deriveOrderID("idem-recover-auth"); pae.OrderID != want {
+		t.Errorf("OrderID = %q, want derived %q", pae.OrderID, want)
+	}
+}
+
+// A genuine register failure (the derived order does not exist at fincode)
+// must surface the ORIGINAL register error.
+func TestGateway_Charge_RegisterFailure_OrderNotFound_ReturnsRegisterError(t *testing.T) {
+	fake := &registerFailFincode{getStatus: ""} // GET → 404
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-recover",
+	})
+	var pae *PartialAuthorizeError
+	if errors.As(err, &pae) {
+		t.Error("an unconfirmed order must not produce PartialAuthorizeError")
+	}
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) {
+		t.Fatalf("expected *port.GatewayError, got %T: %v", err, err)
+	}
+	if ge.DeclineCode != "E_DUP" {
+		t.Errorf("DeclineCode = %q, want the register error code E_DUP", ge.DeclineCode)
+	}
+	if fake.getCalls != 1 {
+		t.Errorf("retrieve calls = %d, want 1", fake.getCalls)
+	}
+}
+
+// Without an IdempotencyKey there is no deterministic order ID to look up:
+// a register failure must not trigger any retrieve.
+func TestGateway_Charge_RegisterFailure_NoKey_SkipsRetrieve(t *testing.T) {
+	fake := &registerFailFincode{getStatus: StatusCaptured}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"),
+	})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) {
+		t.Fatalf("expected *port.GatewayError, got %T: %v", err, err)
+	}
+	if fake.getCalls != 0 {
+		t.Errorf("retrieve calls = %d, want 0 (no key, no lookup)", fake.getCalls)
+	}
+}
+
+// executeFailServer simulates a lost execute response: register succeeds,
+// execute always fails at the HTTP layer, and GET reports a configurable
+// (possibly already completed) state.
+func executeFailServer(getStatus PaymentStatus) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/payments":
+			_ = json.NewEncoder(w).Encode(PaymentResponse{
+				ID: "o_lost_001", AccessID: "a_lost_001", Status: StatusUnprocessed,
+			})
+		case r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(PaymentResponse{
+				ID: "o_lost_001", AccessID: "a_lost_001", Status: getStatus,
+				Amount: 1000, TotalAmount: 1000,
+			})
+		default: // PUT execute
+			w.WriteHeader(http.StatusGatewayTimeout)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{
+				Errors: []APIError{{ErrorCode: "E_TIMEOUT", ErrorMessage: "timeout"}},
+			})
+		}
+	}))
+}
+
+// If the execute response was lost but fincode actually captured the payment,
+// Charge must confirm the final state and return success — not a
+// PartialAuthorizeError for a charge that went through.
+func TestGateway_Charge_ExecuteFailure_AlreadyCaptured_ReplaysSuccess(t *testing.T) {
+	srv := executeFailServer(StatusCaptured)
+	defer srv.Close()
+	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
+		WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
+
+	resp, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"),
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if resp.Status != port.TransactionStatusCaptured {
+		t.Errorf("Status = %q, want captured", resp.Status)
+	}
+	if resp.TransactionID != "o_lost_001" {
+		t.Errorf("TransactionID = %q, want o_lost_001", resp.TransactionID)
+	}
+}
+
+func TestGateway_Authorize_ExecuteFailure_AlreadyAuthorized_ReplaysSuccess(t *testing.T) {
+	srv := executeFailServer(StatusAuthorized)
+	defer srv.Close()
+	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
+		WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
+
+	resp, err := gw.Authorize(context.Background(), &port.AuthorizeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"),
+	})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if resp.Status != port.TransactionStatusAuthorized {
+		t.Errorf("Status = %q, want authorized", resp.Status)
+	}
+}
+
+// An execute failure whose retrieve still reports the order as UNPROCESSED
+// keeps the PartialAuthorizeError contract (see also
+// TestGateway_Charge_PartialFailure_ThenCompleteCharge, whose retrieve
+// answers UNPROCESSED through the same path).
+func TestGateway_Charge_ExecuteFailure_Unprocessed_IsPartialAuthorizeError(t *testing.T) {
+	srv := executeFailServer(StatusUnprocessed)
+	defer srv.Close()
+	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
+		WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"),
+	})
+	var pae *PartialAuthorizeError
+	if !errors.As(err, &pae) {
+		t.Fatalf("expected *PartialAuthorizeError, got %T: %v", err, err)
+	}
+	if pae.OrderID != "o_lost_001" || pae.AccessID != "a_lost_001" {
+		t.Errorf("ids = %q/%q, want o_lost_001/a_lost_001", pae.OrderID, pae.AccessID)
 	}
 }
 

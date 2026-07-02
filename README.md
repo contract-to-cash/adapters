@@ -55,15 +55,23 @@ server-side from `expectedVersion`.
   (`"o" + base32(sha256(key))[:29]`, lowercase), so a retry re-registers the
   same order and fincode rejects the duplicate — permanent deduplication as
   required by the core `PaymentService`, not just the 30-minute
-  `idempotent_key` header window (the header is still sent as well).
-  Capture/Void/Cancel/Refund forward their `IdempotencyKey` as the
-  `idempotent_key` header too.
+  `idempotent_key` header window (the header is still sent as well). On such
+  a duplicate rejection the adapter retrieves the existing order and replays
+  its outcome (success if already completed, `*PartialAuthorizeError` if
+  registered but not executed). Void/Cancel/Refund forward their
+  `IdempotencyKey` as the `idempotent_key` header verbatim; Capture, which
+  can issue `/change` + `/capture` from one request, forwards a distinct
+  per-operation key derived from it for each call.
 - **Refunds**: fincode has no refund endpoint; full refunds go through
   `/cancel`, partial refunds through `/change` (amount reduction), and
   `RefundResponse.RefundID` is the payment ID. Partial refunds are a
   read-modify-write without compare-and-set on the fincode side: **serialize
   refund operations against the same payment in your caller** — concurrent
-  refunds can silently lose one (last write wins on the new total).
+  refunds can silently lose one (last write wins on the new total). Retrying
+  a partial refund with the same `IdempotencyKey` is safe only within
+  fincode's 30-minute `idempotent_key` TTL; after that the amount reduction
+  is applied again (double refund), so **callers must also prevent duplicate
+  refund requests via their own refund records**.
 - **Two-step recovery**: register/execute is not atomic at the HTTP layer; a
   failure between the steps returns `*fincode.PartialAuthorizeError` and is
   recovered with `CompleteCharge` / `CompleteAuthorize`. Both check the

@@ -243,8 +243,10 @@ func (e *ValidationError) Is(target error) bool {
 }
 
 // PartialAuthorizeError is returned from Gateway.Charge / Gateway.Authorize
-// when the register step (POST /v1/payments) succeeded but the execute step
-// (PUT /v1/payments/{id}) failed. The OrderID and AccessID identify the
+// when an order is registered at fincode (POST /v1/payments) but not executed
+// to completion: either the execute step (PUT /v1/payments/{id}) failed, or a
+// retried request found an order left in that state by an earlier attempt
+// with the same IdempotencyKey. The OrderID and AccessID identify the
 // registered-but-not-executed payment, so the caller can retry the execute
 // step by calling Gateway.CompleteCharge / Gateway.CompleteAuthorize with
 // those values. fincode does not bill until the execute step completes.

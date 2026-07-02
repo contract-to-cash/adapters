@@ -89,10 +89,14 @@ func (g *Gateway) SupportedMethods() []port.PaymentMethodType {
 // retried Charge re-registers the SAME order and fincode rejects the
 // duplicate instead of double-charging — this holds permanently, satisfying
 // the core PaymentService contract that the gateway deduplicates on
-// IdempotencyKey. The key is additionally forwarded as the fincode
-// `idempotent_key` header (30-minute TTL per fincode docs) so short-window
-// retries get the original response back rather than an error. An empty
-// IdempotencyKey lets fincode assign the order ID.
+// IdempotencyKey. On such a duplicate rejection the adapter looks the
+// existing order up and replays its outcome: a success response if it is
+// already CAPTURED, or a recoverable *PartialAuthorizeError if it was
+// registered but never executed to completion. The key is additionally
+// forwarded as the fincode `idempotent_key` header (30-minute TTL per
+// fincode docs) so short-window retries get the original response back
+// rather than an error. An empty IdempotencyKey lets fincode assign the
+// order ID.
 //
 // Payment source: exactly one of req.Token (fincode.js token) or a stored
 // card is required. A stored card is addressed either by req.PaymentMethodID
@@ -222,12 +226,32 @@ func (g *Gateway) registerAndExecute(ctx context.Context, jobCode JobCode, amoun
 	}
 	createResp, err := g.client.CreatePayment(ctx, createReq, idempotencyKey)
 	if err != nil {
-		// Register failure: no order exists at fincode, plain gateway error.
+		// With an IdempotencyKey the order ID is deterministic, so this
+		// failure may be fincode rejecting the duplicate ID of an order that
+		// an earlier attempt already registered — and possibly already
+		// executed (the idempotent_key header replays responses only within
+		// its 30-minute TTL). Resolve against the order's actual state before
+		// reporting failure, so a payment that in fact succeeded is replayed
+		// as a success instead of being misreported as permanently failed.
+		if createReq.ID != "" {
+			if resp, resolveErr := g.resolveExistingOrder(ctx, createReq.ID, jobCode, err); resp != nil || resolveErr != nil {
+				return resp, resolveErr
+			}
+		}
+		// Genuine register failure (order could not be confirmed to exist):
+		// plain gateway error.
 		return nil, g.wrapGatewayError("register payment", err)
 	}
 
 	execResp, err := g.executeRegistered(ctx, createResp.ID, createResp.AccessID, src)
 	if err != nil {
+		// The execute response may have been lost (timeout, connection
+		// reset) after fincode actually processed it — the same hazard
+		// CompleteCharge / CompleteAuthorize guard against. Confirm the final
+		// state before reporting a partial failure.
+		if current, rErr := g.client.RetrievePayment(ctx, createResp.ID, PayTypeCard); rErr == nil && current.Status == successStatus(jobCode) {
+			return current, nil
+		}
 		// Execute failure: the order IS registered. Surface the IDs so the
 		// caller can retry via CompleteCharge / CompleteAuthorize.
 		return nil, &PartialAuthorizeError{
@@ -237,6 +261,47 @@ func (g *Gateway) registerAndExecute(ctx context.Context, jobCode JobCode, amoun
 		}
 	}
 	return execResp, nil
+}
+
+// successStatus returns the fincode payment status that marks a job as fully
+// completed: CAPTURED for one-step charges, AUTHORIZED for auth-only.
+func successStatus(jobCode JobCode) PaymentStatus {
+	if jobCode == JobCodeAuth {
+		return StatusAuthorized
+	}
+	return StatusCaptured
+}
+
+// resolveExistingOrder resolves a register failure for a deterministic
+// (idempotency-key-derived) order ID against the order's current state at
+// fincode:
+//
+//   - order reached successStatus(jobCode) → (order, nil): an earlier attempt
+//     already succeeded; replay it as a success.
+//   - order exists but is incomplete (UNPROCESSED, or AUTHORIZED under a
+//     CAPTURE job) → (nil, *PartialAuthorizeError) carrying the order and
+//     access IDs so the caller can finish via CompleteCharge /
+//     CompleteAuthorize.
+//   - order not found / state not retrievable or not recognized → (nil, nil):
+//     the caller falls back to the original register error.
+func (g *Gateway) resolveExistingOrder(ctx context.Context, orderID string, jobCode JobCode, registerErr error) (*PaymentResponse, error) {
+	current, err := g.client.RetrievePayment(ctx, orderID, PayTypeCard)
+	if err != nil {
+		return nil, nil
+	}
+	if current.Status == successStatus(jobCode) {
+		return current, nil
+	}
+	switch current.Status {
+	case StatusUnprocessed, StatusAuthorized:
+		return nil, &PartialAuthorizeError{
+			OrderID:  orderID,
+			AccessID: current.AccessID,
+			Cause:    g.wrapGatewayError("register payment", registerErr),
+		}
+	default:
+		return nil, nil
+	}
 }
 
 // executeRegistered executes a previously registered payment.
@@ -279,6 +344,13 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 		return nil, err
 	}
 
+	// Capture can issue two mutating calls (/change then /capture) from a
+	// single port request. fincode does not document whether idempotent_key
+	// replay is scoped per endpoint, so sending req.IdempotencyKey verbatim on
+	// both could make the /capture call replay the cached /change response and
+	// skip the real capture. Each call therefore uses its own key derived from
+	// the caller's (see deriveIdempotencyKey); single-call operations
+	// (Void/Cancel/Refund) keep forwarding the caller's key verbatim.
 	if req.Amount != nil {
 		amount, err := jpyAmount("Amount", *req.Amount)
 		if err != nil {
@@ -290,7 +362,7 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 				AccessID: current.AccessID,
 				JobCode:  JobCodeAuth,
 				Amount:   strconv.FormatInt(amount, 10),
-			}, WithIdempotencyKey(req.IdempotencyKey)); err != nil {
+			}, WithIdempotencyKey(deriveIdempotencyKey(req.IdempotencyKey, "change"))); err != nil {
 				return nil, g.wrapGatewayError("change amount before capture", err)
 			}
 		}
@@ -299,7 +371,7 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 	resp, err := g.client.CapturePayment(ctx, req.AuthorizationID, &CapturePaymentRequest{
 		PayType:  PayTypeCard,
 		AccessID: current.AccessID,
-	}, WithIdempotencyKey(req.IdempotencyKey))
+	}, WithIdempotencyKey(deriveIdempotencyKey(req.IdempotencyKey, "capture")))
 	if err != nil {
 		return nil, g.wrapGatewayError("capture payment", err)
 	}
@@ -390,6 +462,14 @@ func (g *Gateway) Cancel(ctx context.Context, req *port.CancelRequest) (*port.Ca
 // so the adapter cannot detect a concurrent modification. Callers MUST
 // serialize refund operations against the same payment; running them
 // concurrently can lose a refund (last write wins on the new total).
+//
+// Idempotency: req.IdempotencyKey is forwarded as the fincode idempotent_key
+// header, whose replay window is 30 minutes (fincode TTL). Retrying a PARTIAL
+// refund with the same key is safe only within that window: after the TTL the
+// read-modify-write runs again and lowers the total a second time (double
+// refund). fincode offers no permanent dedup for /change, so callers must
+// keep their own refund history and suppress duplicate refund requests beyond
+// that window.
 func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.RefundResponse, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -622,6 +702,26 @@ func deriveOrderID(idempotencyKey string) string {
 	sum := sha256.Sum256([]byte(idempotencyKey))
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
 	return "o" + strings.ToLower(enc)[:29]
+}
+
+// deriveIdempotencyKey derives a per-operation fincode idempotent_key from a
+// caller-supplied idempotency key, using the same construction as
+// deriveOrderID (lowercase unpadded base32 of SHA-256, truncated to 30
+// characters). It is used when a single port-level request maps onto MORE
+// than one fincode mutating call (Capture's /change + /capture): fincode does
+// not document the replay scope of idempotent_key, and if it is not scoped
+// per endpoint, reusing the caller's key verbatim would let the second call
+// replay the first call's cached response. Distinct ops derive distinct keys,
+// and the derivation is deterministic, so a retried port request still
+// replays each individual call within the header's TTL. Returns "" when the
+// key is empty.
+func deriveIdempotencyKey(idempotencyKey, op string) string {
+	if idempotencyKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(idempotencyKey + "|" + op))
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
+	return strings.ToLower(enc)[:30]
 }
 
 // joinPaymentMethodID builds the composite port payment method ID.
