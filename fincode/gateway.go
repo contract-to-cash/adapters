@@ -282,12 +282,26 @@ func successStatus(jobCode JobCode) PaymentStatus {
 //     CAPTURE job) → (nil, *PartialAuthorizeError) carrying the order and
 //     access IDs so the caller can finish via CompleteCharge /
 //     CompleteAuthorize.
-//   - order not found / state not retrievable or not recognized → (nil, nil):
-//     the caller falls back to the original register error.
+//   - order not found (HTTP 404) or state not recognized → (nil, nil): the
+//     caller falls back to the original register error.
+//   - retrieve failed for any other reason (network error, 5xx, ...) →
+//     (nil, retryable *port.GatewayError): the order may exist and may even
+//     be captured, so the outcome is unknown; reporting the original
+//     non-retryable register error here would misrecord a possibly-succeeded
+//     payment as permanently failed.
 func (g *Gateway) resolveExistingOrder(ctx context.Context, orderID string, jobCode JobCode, registerErr error) (*PaymentResponse, error) {
 	current, err := g.client.RetrievePayment(ctx, orderID, PayTypeCard)
 	if err != nil {
-		return nil, nil
+		var he *HTTPError
+		if errors.As(err, &he) && he.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, &port.GatewayError{
+			Code:      port.ErrorCodeGatewayUnavailable,
+			Message:   fmt.Sprintf("fincode: payment state for order %s could not be verified after a duplicate-order register failure; retry to resolve", orderID),
+			Retryable: true,
+			RawError:  errors.Join(registerErr, err),
+		}
 	}
 	if current.Status == successStatus(jobCode) {
 		return current, nil

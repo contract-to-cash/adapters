@@ -781,6 +781,7 @@ func TestGateway_Charge_RegisterFailure_IsPlainGatewayError(t *testing.T) {
 // order state.
 type registerFailFincode struct {
 	getStatus    PaymentStatus // "" → GET answers 404 (order does not exist)
+	getFailWith  int           // non-zero → GET answers this HTTP status (transient failure)
 	getCalls     int
 	executeCalls int
 }
@@ -796,6 +797,13 @@ func (f *registerFailFincode) server() *httptest.Server {
 			})
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/payments/"):
 			f.getCalls++
+			if f.getFailWith != 0 {
+				w.WriteHeader(f.getFailWith)
+				_ = json.NewEncoder(w).Encode(ErrorResponse{
+					Errors: []APIError{{ErrorCode: "E_TMP", ErrorMessage: "temporarily unavailable"}},
+				})
+				return
+			}
 			if f.getStatus == "" {
 				w.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(w).Encode(ErrorResponse{
@@ -938,6 +946,38 @@ func TestGateway_Charge_RegisterFailure_OrderNotFound_ReturnsRegisterError(t *te
 	}
 	if ge.DeclineCode != "E_DUP" {
 		t.Errorf("DeclineCode = %q, want the register error code E_DUP", ge.DeclineCode)
+	}
+	if fake.getCalls != 1 {
+		t.Errorf("retrieve calls = %d, want 1", fake.getCalls)
+	}
+}
+
+// When the order state cannot be verified (retrieve fails transiently, not
+// 404), the payment may in fact have succeeded. The gateway must NOT fall
+// back to the original non-retryable register error; it must report a
+// retryable "state unknown" error so the caller retries instead of recording
+// a possibly-captured payment as permanently failed.
+func TestGateway_Charge_RegisterFailure_RetrieveUnavailable_IsRetryable(t *testing.T) {
+	fake := &registerFailFincode{getFailWith: http.StatusInternalServerError}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-recover",
+	})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) {
+		t.Fatalf("expected *port.GatewayError, got %T: %v", err, err)
+	}
+	if !ge.Retryable {
+		t.Error("unverifiable order state must be reported as retryable")
+	}
+	if ge.Code != port.ErrorCodeGatewayUnavailable {
+		t.Errorf("Code = %q, want %q", ge.Code, port.ErrorCodeGatewayUnavailable)
+	}
+	var he *HTTPError
+	if !errors.As(ge.RawError, &he) {
+		t.Error("RawError should preserve the underlying error chain")
 	}
 	if fake.getCalls != 1 {
 		t.Errorf("retrieve calls = %d, want 1", fake.getCalls)
