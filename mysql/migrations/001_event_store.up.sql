@@ -30,7 +30,6 @@ CREATE TABLE events (
     PRIMARY KEY (global_position),
     UNIQUE KEY uq_event_id (id),
     UNIQUE KEY uq_stream_version (stream_id, version),
-    KEY idx_events_global_position (global_position),
     KEY idx_events_type (type),
     KEY idx_events_stream_occurred (stream_id, occurred_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
