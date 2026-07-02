@@ -50,7 +50,10 @@ type fakeFincode struct {
 	currentTotal  int64
 	currentStatus PaymentStatus
 
-	idempotencyHeader string
+	idempotencyHeader        string // POST /v1/payments (register)
+	captureIdempotencyHeader string // PUT .../capture
+	cancelIdempotencyHeader  string // PUT .../cancel
+	changeIdempotencyHeader  string // PUT .../change
 }
 
 func (f *fakeFincode) paymentJSON(status PaymentStatus, total int64) PaymentResponse {
@@ -104,14 +107,17 @@ func (f *fakeFincode) handler() http.Handler {
 
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/payments/o_gw_order_001/capture":
 			f.captureCalled = true
+			f.captureIdempotencyHeader = r.Header.Get("idempotent_key")
 			_ = json.NewEncoder(w).Encode(f.paymentJSON(StatusCaptured, 1000))
 
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/payments/o_gw_order_001/cancel":
 			f.cancelCalled = true
+			f.cancelIdempotencyHeader = r.Header.Get("idempotent_key")
 			_ = json.NewEncoder(w).Encode(f.paymentJSON(StatusCanceled, 0))
 
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/payments/o_gw_order_001/change":
 			f.changeCalled = true
+			f.changeIdempotencyHeader = r.Header.Get("idempotent_key")
 			_ = json.NewDecoder(r.Body).Decode(&f.lastChange)
 			newTotal, _ := strconv.ParseInt(f.lastChange.Amount, 10, 64)
 			_ = json.NewEncoder(w).Encode(f.paymentJSON(StatusCaptured, newTotal))
@@ -332,6 +338,306 @@ func TestGateway_Charge_Rejects3DS(t *testing.T) {
 	}
 }
 
+// Amounts outside int64 must be rejected, not silently wrapped: big.Rat →
+// int64 conversion without a range check would turn 2^64+100 yen into a
+// 100 yen charge.
+func TestGateway_Charge_RejectsAmountBeyondInt64(t *testing.T) {
+	gw := unreachableGateway()
+	huge := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(100)) // 2^64 + 100
+	// Sanity: this is exactly the silent-wrap hazard.
+	if got := new(big.Int).SetInt64(huge.Int64()); got.Cmp(big.NewInt(100)) != 0 {
+		t.Fatalf("test premise: (2^64+100).Int64() = %v, want wrapped 100", got)
+	}
+	amount := shared.NewMoney(new(big.Rat).SetInt(huge), shared.CurrencyJPY)
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: amount,
+		Token:  strPtr("tok"),
+	})
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+}
+
+// The overflow guard applies to every amount path, including the ones that
+// read the amount after a successful retrieve (Capture, Refund).
+func TestGateway_OverflowAmountRejectedOnAllPaths(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusAuthorized
+	fake.currentTotal = 1000
+
+	huge := shared.NewMoney(
+		new(big.Rat).SetInt(new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(100))),
+		shared.CurrencyJPY)
+
+	var ve *ValidationError
+
+	_, err := gw.Authorize(context.Background(), &port.AuthorizeRequest{Amount: huge, Token: strPtr("tok")})
+	if !errors.As(err, &ve) {
+		t.Errorf("Authorize: expected *ValidationError, got %v", err)
+	}
+	_, err = gw.Capture(context.Background(), &port.CaptureRequest{
+		AuthorizationID: "o_gw_order_001", Amount: &huge,
+	})
+	if !errors.As(err, &ve) {
+		t.Errorf("Capture: expected *ValidationError, got %v", err)
+	}
+	_, err = gw.Refund(context.Background(), &port.RefundRequest{
+		TransactionID: "o_gw_order_001", Amount: &huge,
+	})
+	if !errors.As(err, &ve) {
+		t.Errorf("Refund: expected *ValidationError, got %v", err)
+	}
+	if fake.captureCalled || fake.changeCalled || fake.cancelCalled {
+		t.Error("no mutating fincode call may be made with an overflowing amount")
+	}
+}
+
+// --- Idempotency (order ID derivation) ---
+
+func TestDeriveOrderID(t *testing.T) {
+	id := deriveOrderID("idem-uuid-abc")
+	if len(id) != 30 {
+		t.Errorf("len = %d, want 30", len(id))
+	}
+	for _, r := range id {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			t.Errorf("unexpected character %q in derived order ID %q", r, id)
+		}
+	}
+	if id != deriveOrderID("idem-uuid-abc") {
+		t.Error("derivation must be deterministic")
+	}
+	if id == deriveOrderID("idem-uuid-abd") {
+		t.Error("distinct keys must derive distinct order IDs")
+	}
+	if deriveOrderID("") != "" {
+		t.Error("empty key must not derive an order ID (fincode assigns it)")
+	}
+}
+
+// A caller-supplied IdempotencyKey must fix the fincode order ID so a retried
+// Charge re-registers the same order (permanent dedup, beyond the 30-minute
+// idempotent_key header window).
+func TestGateway_Charge_IdempotencyKeyFixesOrderID(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount:         jpy(1000),
+		Token:          strPtr("tok"),
+		IdempotencyKey: "idem-uuid-abc",
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if fake.lastCreate.ID != deriveOrderID("idem-uuid-abc") {
+		t.Errorf("register body id = %q, want derived %q", fake.lastCreate.ID, deriveOrderID("idem-uuid-abc"))
+	}
+	// The header-based short-window idempotency is still forwarded.
+	if fake.idempotencyHeader != "idem-uuid-abc" {
+		t.Errorf("idempotent_key = %q, want idem-uuid-abc", fake.idempotencyHeader)
+	}
+}
+
+func TestGateway_Charge_NoIdempotencyKey_FincodeAssignsOrderID(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000),
+		Token:  strPtr("tok"),
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if fake.lastCreate.ID != "" {
+		t.Errorf("register body id = %q, want empty (fincode-assigned)", fake.lastCreate.ID)
+	}
+}
+
+// Capture / Void / Cancel / Refund must forward req.IdempotencyKey as the
+// fincode idempotent_key header instead of discarding it.
+func TestGateway_MutatingCalls_ForwardIdempotencyKey(t *testing.T) {
+	t.Run("capture", func(t *testing.T) {
+		gw, fake, cleanup := setupGateway(t)
+		defer cleanup()
+		fake.currentStatus = StatusAuthorized
+		fake.currentTotal = 1000
+
+		amount := jpy(600)
+		_, err := gw.Capture(context.Background(), &port.CaptureRequest{
+			AuthorizationID: "o_gw_order_001",
+			Amount:          &amount,
+			IdempotencyKey:  "idem-cap",
+		})
+		if err != nil {
+			t.Fatalf("Capture: %v", err)
+		}
+		if fake.changeIdempotencyHeader != "idem-cap" {
+			t.Errorf("change idempotent_key = %q, want idem-cap", fake.changeIdempotencyHeader)
+		}
+		if fake.captureIdempotencyHeader != "idem-cap" {
+			t.Errorf("capture idempotent_key = %q, want idem-cap", fake.captureIdempotencyHeader)
+		}
+	})
+
+	t.Run("void", func(t *testing.T) {
+		gw, fake, cleanup := setupGateway(t)
+		defer cleanup()
+		fake.currentStatus = StatusAuthorized
+
+		_, err := gw.Void(context.Background(), &port.VoidRequest{
+			AuthorizationID: "o_gw_order_001",
+			IdempotencyKey:  "idem-void",
+		})
+		if err != nil {
+			t.Fatalf("Void: %v", err)
+		}
+		if fake.cancelIdempotencyHeader != "idem-void" {
+			t.Errorf("cancel idempotent_key = %q, want idem-void", fake.cancelIdempotencyHeader)
+		}
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		gw, fake, cleanup := setupGateway(t)
+		defer cleanup()
+
+		_, err := gw.Cancel(context.Background(), &port.CancelRequest{
+			TransactionID:  "o_gw_order_001",
+			IdempotencyKey: "idem-cancel",
+		})
+		if err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		if fake.cancelIdempotencyHeader != "idem-cancel" {
+			t.Errorf("cancel idempotent_key = %q, want idem-cancel", fake.cancelIdempotencyHeader)
+		}
+	})
+
+	t.Run("refund full", func(t *testing.T) {
+		gw, fake, cleanup := setupGateway(t)
+		defer cleanup()
+		fake.currentTotal = 1000
+
+		_, err := gw.Refund(context.Background(), &port.RefundRequest{
+			TransactionID:  "o_gw_order_001",
+			IdempotencyKey: "idem-refund",
+		})
+		if err != nil {
+			t.Fatalf("Refund: %v", err)
+		}
+		if fake.cancelIdempotencyHeader != "idem-refund" {
+			t.Errorf("cancel idempotent_key = %q, want idem-refund", fake.cancelIdempotencyHeader)
+		}
+	})
+
+	t.Run("refund partial", func(t *testing.T) {
+		gw, fake, cleanup := setupGateway(t)
+		defer cleanup()
+		fake.currentTotal = 1000
+
+		amount := jpy(300)
+		_, err := gw.Refund(context.Background(), &port.RefundRequest{
+			TransactionID:  "o_gw_order_001",
+			Amount:         &amount,
+			IdempotencyKey: "idem-refund-p",
+		})
+		if err != nil {
+			t.Fatalf("Refund: %v", err)
+		}
+		if fake.changeIdempotencyHeader != "idem-refund-p" {
+			t.Errorf("change idempotent_key = %q, want idem-refund-p", fake.changeIdempotencyHeader)
+		}
+	})
+}
+
+// --- Lost-response recovery (CompleteCharge / CompleteAuthorize) ---
+
+// If the original execute succeeded but its response was lost, the payment is
+// already CAPTURED: CompleteCharge must return success from the retrieved
+// state WITHOUT re-executing (re-execute would fail and misreport a
+// successful charge as failed).
+func TestGateway_CompleteCharge_AlreadyCaptured_SkipsExecute(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusCaptured
+	fake.currentTotal = 1000
+
+	resp, err := gw.CompleteCharge(context.Background(), "o_gw_order_001", "a_gw_access_001",
+		&port.ChargeRequest{Amount: jpy(1000), Token: strPtr("tok")})
+	if err != nil {
+		t.Fatalf("CompleteCharge: %v", err)
+	}
+	if !fake.retrieveCalled {
+		t.Error("expected retrieve before deciding to re-execute")
+	}
+	if fake.executeCalled {
+		t.Error("execute must NOT be called when the payment is already captured")
+	}
+	if resp.Status != port.TransactionStatusCaptured {
+		t.Errorf("Status = %q, want captured", resp.Status)
+	}
+	if resp.TransactionID != "o_gw_order_001" {
+		t.Errorf("TransactionID = %q", resp.TransactionID)
+	}
+}
+
+// An actually-unprocessed payment still goes through the execute retry.
+func TestGateway_CompleteCharge_Unprocessed_Executes(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusUnprocessed
+
+	resp, err := gw.CompleteCharge(context.Background(), "o_gw_order_001", "a_gw_access_001",
+		&port.ChargeRequest{Amount: jpy(1000), Token: strPtr("tok")})
+	if err != nil {
+		t.Fatalf("CompleteCharge: %v", err)
+	}
+	if !fake.executeCalled {
+		t.Error("expected execute for an unprocessed payment")
+	}
+	if resp.Status != port.TransactionStatusCaptured {
+		t.Errorf("Status = %q, want captured", resp.Status)
+	}
+}
+
+func TestGateway_CompleteAuthorize_AlreadyAuthorized_SkipsExecute(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusAuthorized
+	fake.currentTotal = 2000
+
+	resp, err := gw.CompleteAuthorize(context.Background(), "o_gw_order_001", "a_gw_access_001",
+		&port.AuthorizeRequest{Amount: jpy(2000), Token: strPtr("tok")})
+	if err != nil {
+		t.Fatalf("CompleteAuthorize: %v", err)
+	}
+	if fake.executeCalled {
+		t.Error("execute must NOT be called when the payment is already authorized")
+	}
+	if resp.Status != port.TransactionStatusAuthorized {
+		t.Errorf("Status = %q, want authorized", resp.Status)
+	}
+}
+
+func TestGateway_CompleteAuthorize_Unprocessed_Executes(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusUnprocessed
+
+	_, err := gw.CompleteAuthorize(context.Background(), "o_gw_order_001", "a_gw_access_001",
+		&port.AuthorizeRequest{Amount: jpy(2000), Token: strPtr("tok")})
+	if err != nil {
+		t.Fatalf("CompleteAuthorize: %v", err)
+	}
+	if !fake.executeCalled {
+		t.Error("expected execute for an unprocessed payment")
+	}
+}
+
 // Partial failure (register succeeded, execute failed) surfaces
 // *PartialAuthorizeError with the registered IDs; CompleteCharge recovers.
 func TestGateway_Charge_PartialFailure_ThenCompleteCharge(t *testing.T) {
@@ -339,6 +645,14 @@ func TestGateway_Charge_PartialFailure_ThenCompleteCharge(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/payments" {
+			_ = json.NewEncoder(w).Encode(PaymentResponse{
+				ID: "o_partial_001", AccessID: "a_partial_001", Status: StatusUnprocessed,
+			})
+			return
+		}
+		if r.Method == http.MethodGet {
+			// CompleteCharge checks the current state first; report the
+			// payment as still unprocessed so the execute retry path runs.
 			_ = json.NewEncoder(w).Encode(PaymentResponse{
 				ID: "o_partial_001", AccessID: "a_partial_001", Status: StatusUnprocessed,
 			})

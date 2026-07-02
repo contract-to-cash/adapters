@@ -2,6 +2,8 @@ package fincode
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"math/big"
@@ -82,9 +84,15 @@ func (g *Gateway) SupportedMethods() []port.PaymentMethodType {
 // AccessID; retry via CompleteCharge with the same values. fincode does not
 // bill until step 2 completes.
 //
-// Idempotency: req.IdempotencyKey is forwarded as the fincode
-// `idempotent_key` header on step 1 (UUID v4, 30-minute TTL per fincode
-// docs), so retries return the same registered order instead of duplicating.
+// Idempotency: when req.IdempotencyKey is set, the fincode order ID for
+// step 1 is derived deterministically from it (see deriveOrderID), so a
+// retried Charge re-registers the SAME order and fincode rejects the
+// duplicate instead of double-charging — this holds permanently, satisfying
+// the core PaymentService contract that the gateway deduplicates on
+// IdempotencyKey. The key is additionally forwarded as the fincode
+// `idempotent_key` header (30-minute TTL per fincode docs) so short-window
+// retries get the original response back rather than an error. An empty
+// IdempotencyKey lets fincode assign the order ID.
 //
 // Payment source: exactly one of req.Token (fincode.js token) or a stored
 // card is required. A stored card is addressed either by req.PaymentMethodID
@@ -120,6 +128,12 @@ func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.Ch
 // CompleteCharge retries the execute step of a Charge that failed with
 // *PartialAuthorizeError. orderID and accessID come from that error; req is
 // reused for its payment source (Token / PaymentMethodID / CustomerID).
+//
+// Before re-executing, the payment's current state is fetched: if the earlier
+// execute actually succeeded but its response was lost (timeout, connection
+// reset), the payment is already CAPTURED and re-executing would fail —
+// turning a successful charge into a reported failure. In that case the
+// current state is converted into a success response instead.
 func (g *Gateway) CompleteCharge(ctx context.Context, orderID, accessID string, req *port.ChargeRequest) (*port.ChargeResponse, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -127,6 +141,13 @@ func (g *Gateway) CompleteCharge(ctx context.Context, orderID, accessID string, 
 	src, err := resolvePaymentSource(req.Token, req.PaymentMethodID, req.CustomerID)
 	if err != nil {
 		return nil, err
+	}
+	current, err := g.retrieve(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status == StatusCaptured {
+		return g.toChargeResponse(current), nil
 	}
 	resp, err := g.executeRegistered(ctx, orderID, accessID, src)
 	if err != nil {
@@ -165,7 +186,9 @@ func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*p
 }
 
 // CompleteAuthorize retries the execute step of an Authorize that failed with
-// *PartialAuthorizeError. See CompleteCharge.
+// *PartialAuthorizeError. See CompleteCharge — the same lost-response
+// recovery applies: an already-AUTHORIZED payment is converted into a success
+// response without re-executing.
 func (g *Gateway) CompleteAuthorize(ctx context.Context, orderID, accessID string, req *port.AuthorizeRequest) (*port.AuthorizeResponse, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -173,6 +196,13 @@ func (g *Gateway) CompleteAuthorize(ctx context.Context, orderID, accessID strin
 	src, err := resolvePaymentSource(req.Token, req.PaymentMethodID, req.CustomerID)
 	if err != nil {
 		return nil, err
+	}
+	current, err := g.retrieve(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status == StatusAuthorized {
+		return g.toAuthorizeResponse(current), nil
 	}
 	resp, err := g.executeRegistered(ctx, orderID, accessID, src)
 	if err != nil {
@@ -184,6 +214,7 @@ func (g *Gateway) CompleteAuthorize(ctx context.Context, orderID, accessID strin
 // registerAndExecute performs the two-step fincode payment flow.
 func (g *Gateway) registerAndExecute(ctx context.Context, jobCode JobCode, amount int64, description, idempotencyKey string, src paymentSource) (*PaymentResponse, error) {
 	createReq := &CreatePaymentRequest{
+		ID:           deriveOrderID(idempotencyKey),
 		PayType:      PayTypeCard,
 		JobCode:      jobCode,
 		Amount:       strconv.FormatInt(amount, 10),
@@ -259,7 +290,7 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 				AccessID: current.AccessID,
 				JobCode:  JobCodeAuth,
 				Amount:   strconv.FormatInt(amount, 10),
-			}); err != nil {
+			}, WithIdempotencyKey(req.IdempotencyKey)); err != nil {
 				return nil, g.wrapGatewayError("change amount before capture", err)
 			}
 		}
@@ -268,7 +299,7 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 	resp, err := g.client.CapturePayment(ctx, req.AuthorizationID, &CapturePaymentRequest{
 		PayType:  PayTypeCard,
 		AccessID: current.AccessID,
-	})
+	}, WithIdempotencyKey(req.IdempotencyKey))
 	if err != nil {
 		return nil, g.wrapGatewayError("capture payment", err)
 	}
@@ -304,7 +335,7 @@ func (g *Gateway) Void(ctx context.Context, req *port.VoidRequest) (*port.VoidRe
 	resp, err := g.client.CancelPayment(ctx, req.AuthorizationID, &CancelPaymentRequest{
 		PayType:  PayTypeCard,
 		AccessID: current.AccessID,
-	})
+	}, WithIdempotencyKey(req.IdempotencyKey))
 	if err != nil {
 		return nil, g.wrapGatewayError("void payment", err)
 	}
@@ -331,7 +362,7 @@ func (g *Gateway) Cancel(ctx context.Context, req *port.CancelRequest) (*port.Ca
 	resp, err := g.client.CancelPayment(ctx, req.TransactionID, &CancelPaymentRequest{
 		PayType:  PayTypeCard,
 		AccessID: current.AccessID,
-	})
+	}, WithIdempotencyKey(req.IdempotencyKey))
 	if err != nil {
 		return nil, g.wrapGatewayError("cancel payment", err)
 	}
@@ -353,6 +384,12 @@ func (g *Gateway) Cancel(ctx context.Context, req *port.CancelRequest) (*port.Ca
 //
 // Because there is no fincode refund object, RefundResponse.RefundID is the
 // payment (order) ID.
+//
+// Concurrency: partial refunds are a read-modify-write (retrieve current
+// total, then /change to total-refund) and fincode offers no compare-and-set,
+// so the adapter cannot detect a concurrent modification. Callers MUST
+// serialize refund operations against the same payment; running them
+// concurrently can lose a refund (last write wins on the new total).
 func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.RefundResponse, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -382,7 +419,7 @@ func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.Re
 		resp, err = g.client.CancelPayment(ctx, req.TransactionID, &CancelPaymentRequest{
 			PayType:  PayTypeCard,
 			AccessID: current.AccessID,
-		})
+		}, WithIdempotencyKey(req.IdempotencyKey))
 		if err != nil {
 			return nil, g.wrapGatewayError("refund (full, via cancel)", err)
 		}
@@ -392,7 +429,7 @@ func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.Re
 			AccessID: current.AccessID,
 			JobCode:  JobCodeCapture,
 			Amount:   strconv.FormatInt(total-refundAmount, 10),
-		})
+		}, WithIdempotencyKey(req.IdempotencyKey))
 		if err != nil {
 			return nil, g.wrapGatewayError("refund (partial, via change)", err)
 		}
@@ -567,6 +604,26 @@ func resolvePaymentSource(token *string, paymentMethodID *string, customerID str
 	}
 }
 
+// deriveOrderID deterministically maps a caller-supplied idempotency key onto
+// a fincode order ID, giving permanent idempotency: a retried request
+// registers the SAME order ID and fincode rejects the duplicate, so the
+// header-based `idempotent_key` (30-minute TTL) is not the only guard against
+// double charging. Returns "" (fincode assigns the ID) when the key is empty.
+//
+// Derivation: "o" + first 29 characters of lowercase unpadded base32 of
+// SHA-256(key), 30 characters total. fincode's exact order-ID constraints are
+// not confirmed from primary sources, so the format stays conservatively
+// within [0-9a-z] and 30 characters; 29 base32 chars carry 145 bits of the
+// hash, making collisions between distinct keys practically impossible.
+func deriveOrderID(idempotencyKey string) string {
+	if idempotencyKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(idempotencyKey))
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
+	return "o" + strings.ToLower(enc)[:29]
+}
+
 // joinPaymentMethodID builds the composite port payment method ID.
 func joinPaymentMethodID(customerID, cardID string) string {
 	return customerID + "/" + cardID
@@ -717,7 +774,7 @@ func jpyMoney(amount int64) shared.Money {
 }
 
 // jpyAmount validates a shared.Money for use with fincode: JPY, positive,
-// integral.
+// integral, and within int64 range.
 func jpyAmount(field string, m shared.Money) (int64, error) {
 	if m.Currency() != shared.CurrencyJPY {
 		return 0, &port.GatewayError{
@@ -725,10 +782,19 @@ func jpyAmount(field string, m shared.Money) (int64, error) {
 			Message: fmt.Sprintf("fincode supports JPY only, got %q", m.Currency()),
 		}
 	}
-	if !m.Amount().IsInt() {
+	amt := m.Amount()
+	if amt == nil || !amt.IsInt() {
 		return 0, &ValidationError{Field: field, Message: "JPY amount must be an integer"}
 	}
-	v := m.Int64()
+	// amt is a normalized big.Rat with denominator 1 here, so the numerator IS
+	// the integer value. Range-check it before converting: big.Int.Int64 (and
+	// therefore shared.Money.Int64) silently wraps values outside int64,
+	// which would turn e.g. 2^64+100 yen into a 100 yen charge.
+	num := amt.Num()
+	if !num.IsInt64() {
+		return 0, &ValidationError{Field: field, Message: "JPY amount exceeds int64 range"}
+	}
+	v := num.Int64()
 	if v <= 0 {
 		return 0, &ValidationError{Field: field, Message: "must be positive"}
 	}
