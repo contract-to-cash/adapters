@@ -1,0 +1,246 @@
+package fincode
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/contract-to-cash/core/application/port"
+	"github.com/contract-to-cash/core/domain/shared"
+)
+
+// compile-time conformance check.
+var _ port.WebhookHandler = (*WebhookHandler)(nil)
+
+const whSecret = "wh_secret_test_abc"
+
+func newTestWebhookHandler(t *testing.T, cfg WebhookConfig) *WebhookHandler {
+	t.Helper()
+	h, err := NewWebhookHandler(cfg, WithWebhookClock(shared.FixedClock{FixedTime: gwFixedTime}))
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+	return h
+}
+
+func signedRequest(body []byte) *port.WebhookRequest {
+	return &port.WebhookRequest{
+		Headers: map[string]string{"signature": SignBody(whSecret, body)},
+		Body:    body,
+	}
+}
+
+func TestNewWebhookHandler_RequiresSecret(t *testing.T) {
+	_, err := NewWebhookHandler(WebhookConfig{})
+	if err == nil {
+		t.Fatal("expected error for empty secret")
+	}
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+}
+
+func TestWebhook_ValidSignature(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"event":"payments.card.exec","id":"o_wh_001","order_id":"o_wh_001","process_date":"2026/06/01 12:00:00.000","amount":1000,"status":"CAPTURED"}`)
+
+	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
+	if err != nil {
+		t.Fatalf("ParseAndVerify: %v", err)
+	}
+	if event.Type != port.WebhookEventPaymentSucceeded {
+		t.Errorf("Type = %q, want payment.succeeded", event.Type)
+	}
+	if event.ID == "" {
+		t.Error("event ID must be non-empty for deduplication")
+	}
+	if string(event.RawData) != string(body) {
+		t.Error("RawData must preserve the exact body bytes")
+	}
+	if string(event.Data) != string(body) {
+		t.Error("Data must carry the raw JSON payload")
+	}
+	// process_date is JST → 03:00 UTC.
+	want := time.Date(2026, 6, 1, 3, 0, 0, 0, time.UTC)
+	if !event.CreatedAt.Equal(want) {
+		t.Errorf("CreatedAt = %v, want %v", event.CreatedAt, want)
+	}
+}
+
+func TestWebhook_TamperedBodyIsRejected(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"event":"payments.card.exec","id":"o_wh_001","amount":1000}`)
+	req := signedRequest(body)
+	// Tamper AFTER signing.
+	req.Body = []byte(`{"event":"payments.card.exec","id":"o_wh_001","amount":999999}`)
+
+	_, err := h.ParseAndVerify(context.Background(), req)
+	var we *port.WebhookError
+	if !errors.As(err, &we) {
+		t.Fatalf("expected *port.WebhookError, got %T: %v", err, err)
+	}
+	if we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Errorf("Code = %q, want invalid_signature", we.Code)
+	}
+}
+
+func TestWebhook_WrongSecretIsRejected(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"event":"payments.card.exec","id":"o_wh_001"}`)
+	req := &port.WebhookRequest{
+		Headers: map[string]string{"signature": SignBody("some-other-secret", body)},
+		Body:    body,
+	}
+	_, err := h.ParseAndVerify(context.Background(), req)
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Fatalf("expected invalid_signature, got %v", err)
+	}
+}
+
+func TestWebhook_MissingSignatureHeader(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	_, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{},
+		Body:    []byte(`{"event":"payments.card.exec"}`),
+	})
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Fatalf("expected invalid_signature for missing header, got %v", err)
+	}
+}
+
+func TestWebhook_HeaderLookupIsCaseInsensitive(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
+	req := &port.WebhookRequest{
+		// net/http canonicalizes to "Signature"; the handler must still find it.
+		Headers: map[string]string{"Signature": SignBody(whSecret, body)},
+		Body:    body,
+	}
+	if _, err := h.ParseAndVerify(context.Background(), req); err != nil {
+		t.Fatalf("ParseAndVerify with canonicalized header: %v", err)
+	}
+}
+
+func TestWebhook_CustomSignatureHeader(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret, SignatureHeader: "x-fincode-signature"})
+	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
+
+	req := &port.WebhookRequest{
+		Headers: map[string]string{"x-fincode-signature": SignBody(whSecret, body)},
+		Body:    body,
+	}
+	if _, err := h.ParseAndVerify(context.Background(), req); err != nil {
+		t.Fatalf("ParseAndVerify with custom header: %v", err)
+	}
+
+	// The default header must no longer be accepted.
+	if _, err := h.ParseAndVerify(context.Background(), signedRequest(body)); err == nil {
+		t.Fatal("expected rejection when signature is on the wrong header")
+	}
+}
+
+func TestWebhook_InvalidJSONBody(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`not-json`)
+	_, err := h.ParseAndVerify(context.Background(), signedRequest(body))
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidPayload {
+		t.Fatalf("expected invalid_payload, got %v", err)
+	}
+}
+
+func TestWebhook_MissingEventField(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"id":"o1"}`)
+	_, err := h.ParseAndVerify(context.Background(), signedRequest(body))
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidPayload {
+		t.Fatalf("expected invalid_payload, got %v", err)
+	}
+}
+
+// Unknown fincode event names must be verified and passed through with the
+// raw name as the Type, not rejected.
+func TestWebhook_UnknownEventIsPassedThrough(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"event":"payments.applepay.exec","id":"o1"}`)
+
+	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
+	if err != nil {
+		t.Fatalf("ParseAndVerify: %v", err)
+	}
+	if event.Type != port.WebhookEventType("payments.applepay.exec") {
+		t.Errorf("Type = %q, want raw pass-through", event.Type)
+	}
+}
+
+func TestWebhook_EventTypeMapping(t *testing.T) {
+	cases := map[string]port.WebhookEventType{
+		"payments.card.regist":     port.WebhookEventPaymentPending,
+		"payments.card.exec":       port.WebhookEventPaymentSucceeded,
+		"payments.card.capture":    port.WebhookEventPaymentSucceeded,
+		"payments.card.cancel":     port.WebhookEventRefundSucceeded,
+		"card.regist":              port.WebhookEventPaymentMethodAttached,
+		"subscription.card.regist": port.WebhookEventSubscriptionCreated,
+	}
+	for name, want := range cases {
+		if got := toWebhookEventType(name); got != want {
+			t.Errorf("toWebhookEventType(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// Event IDs must be stable for the same payload (dedup) and distinct across
+// different payments/events.
+func TestWebhook_EventIDStability(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+
+	body1 := []byte(`{"event":"payments.card.exec","id":"o1","process_date":"2026/06/01 12:00:00.000"}`)
+	body2 := []byte(`{"event":"payments.card.exec","id":"o2","process_date":"2026/06/01 12:00:00.000"}`)
+
+	e1a, err := h.ParseAndVerify(context.Background(), signedRequest(body1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e1b, err := h.ParseAndVerify(context.Background(), signedRequest(body1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := h.ParseAndVerify(context.Background(), signedRequest(body2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e1a.ID != e1b.ID {
+		t.Errorf("same payload must yield the same event ID: %q vs %q", e1a.ID, e1b.ID)
+	}
+	if e1a.ID == e2.ID {
+		t.Errorf("different payments must yield different event IDs: %q", e1a.ID)
+	}
+}
+
+// A payload without a parseable timestamp falls back to the injected clock.
+func TestWebhook_CreatedAtFallsBackToClock(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	body := []byte(`{"event":"payments.card.exec","id":"o1"}`)
+
+	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !event.CreatedAt.Equal(gwFixedTime) {
+		t.Errorf("CreatedAt = %v, want clock fallback %v", event.CreatedAt, gwFixedTime)
+	}
+}
+
+func TestWebhook_NilRequest(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Secret: whSecret})
+	_, err := h.ParseAndVerify(context.Background(), nil)
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidPayload {
+		t.Fatalf("expected invalid_payload for nil request, got %v", err)
+	}
+}
