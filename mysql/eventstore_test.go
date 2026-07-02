@@ -218,6 +218,41 @@ func TestEventStore_LoadSnapshotBefore(t *testing.T) {
 	}
 }
 
+// The stored version must be derived from expectedVersion (expected+i+1) and
+// the stored stream id from the streamID argument — never from the
+// caller-populated Event.Version / Event.StreamID fields. A caller passing
+// stale or inconsistent values must not be able to break the version sequence
+// (parity with the postgres adapter, whose INSERT derives both server-side).
+func TestEventStore_Append_DerivesVersionFromExpectedVersion(t *testing.T) {
+	store, mock := newTestStore(t)
+
+	// Caller-supplied Version (99) and StreamID ("wrong-stream") disagree with
+	// the Append arguments; the derived values must win.
+	e1 := sampleEvent("e6", "wrong-stream", 99)
+	e2 := sampleEvent("e7", "wrong-stream", 42)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(5))
+	mock.ExpectExec(`INSERT INTO events`).
+		WithArgs("e6", "contract-1", "contract.created", 6, 1,
+			[]byte(`{"name":"acme"}`), sqlmock.AnyArg(), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO events`).
+		WithArgs("e7", "contract-1", "contract.created", 7, 1,
+			[]byte(`{"name":"acme"}`), sqlmock.AnyArg(), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectCommit()
+
+	if err := store.Append(context.Background(), "contract-1", []eventstore.Event{e1, e2}, 5); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestEventStore_Append_EmptyIsNoop(t *testing.T) {
 	store, mock := newTestStore(t)
 	// No DB interaction expected at all.

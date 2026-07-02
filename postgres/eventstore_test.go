@@ -81,7 +81,7 @@ func TestEventStore_AppendVersionConflict(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected version conflict error, got nil")
 	}
-	if !shared.IsDomainError(err, shared.ErrCodeVersionConflict) {
+	if !isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Errorf("expected ErrCodeVersionConflict, got: %v", err)
 	}
 }
@@ -199,6 +199,9 @@ func TestEventStore_Snapshot(t *testing.T) {
 	}
 }
 
+// LoadSnapshotBefore must cut off on the snapshot creation time (CreatedAt),
+// not the as_of time — parity with core's infrastructure/inmemory reference
+// implementation (snapshots[i].CreatedAt.Before(before)).
 func TestEventStore_SnapshotBefore(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	store := postgres.NewEventStore(pool)
@@ -207,18 +210,23 @@ func TestEventStore_SnapshotBefore(t *testing.T) {
 	t1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	t2 := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 
+	// v1: created at t1. Its as_of is deliberately far in the FUTURE so the
+	// test fails if the implementation filters on as_of instead of created_at.
 	if err := store.SaveSnapshot(ctx, eventstore.Snapshot{
-		StreamID: "s1", Version: 1, State: json.RawMessage(`{"v":1}`), AsOf: t1,
+		StreamID: "s1", Version: 1, State: json.RawMessage(`{"v":1}`),
+		AsOf: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), CreatedAt: t1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SaveSnapshot(ctx, eventstore.Snapshot{
-		StreamID: "s1", Version: 5, State: json.RawMessage(`{"v":5}`), AsOf: t2,
+		StreamID: "s1", Version: 5, State: json.RawMessage(`{"v":5}`),
+		AsOf: t2, CreatedAt: t2,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Before t2 should return version 1.
+	// Before t2 should return v1 (created strictly before t2; v5 is excluded
+	// because CreatedAt < before is strict).
 	snap, err := store.LoadSnapshotBefore(ctx, "s1", t2)
 	if err != nil {
 		t.Fatal(err)
@@ -227,13 +235,55 @@ func TestEventStore_SnapshotBefore(t *testing.T) {
 		t.Errorf("expected snapshot v1, got %v", snap)
 	}
 
-	// Before t1 should return nil.
+	// After both creation times, the LATEST-created snapshot wins.
+	snap, err = store.LoadSnapshotBefore(ctx, "s1", t2.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap == nil || snap.Version != 5 {
+		t.Errorf("expected snapshot v5, got %v", snap)
+	}
+
+	// Before t1 should return nil (strict inequality: created_at == before is excluded).
 	snap, err = store.LoadSnapshotBefore(ctx, "s1", t1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snap != nil {
 		t.Errorf("expected nil, got %v", snap)
+	}
+}
+
+// LoadRange must be a half-open interval: from <= occurred_at < to — parity
+// with core's infrastructure/inmemory reference implementation.
+func TestEventStore_LoadRange_HalfOpenInterval(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	from := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	mid := time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+
+	events := []eventstore.Event{
+		{ID: "evt-before", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: from.Add(-time.Second)},
+		{ID: "evt-at-from", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: from},
+		{ID: "evt-mid", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: mid},
+		{ID: "evt-at-to", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: to},
+	}
+	if err := store.Append(ctx, "stream-range", events, 0); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	loaded, err := store.LoadRange(ctx, "stream-range", from, to)
+	if err != nil {
+		t.Fatalf("LoadRange: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("got %d events, want 2 (from is inclusive, to is exclusive)", len(loaded))
+	}
+	if loaded[0].ID != "evt-at-from" || loaded[1].ID != "evt-mid" {
+		t.Errorf("unexpected events in range: %q, %q", loaded[0].ID, loaded[1].ID)
 	}
 }
 

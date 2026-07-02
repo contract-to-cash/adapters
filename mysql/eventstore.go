@@ -121,6 +121,12 @@ func (s *EventStore) Append(ctx context.Context, streamID string, events []event
 
 // appendOn performs the COUNT-based optimistic check and inserts on the given
 // Querier (either an ambient *sql.Tx or the store's own tx).
+//
+// The stored version is derived server-side as expectedVersion+i+1 (and the
+// stream id from the streamID argument), matching the postgres adapter. The
+// caller-populated Event.Version / Event.StreamID fields are ignored so a
+// stale or inconsistent caller value cannot diverge from the optimistic
+// concurrency baseline.
 func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, events []eventstore.Event, expectedVersion int) error {
 	var current int
 	if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE stream_id = ?", streamID).Scan(&current); err != nil {
@@ -137,8 +143,9 @@ func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, e
 		if err != nil {
 			return fmt.Errorf("event store: marshal metadata for event %s: %w", e.ID, err)
 		}
+		version := expectedVersion + i + 1
 		if _, err := q.ExecContext(ctx, insertEventSQL,
-			e.ID, e.StreamID, string(e.Type), e.Version, e.SchemaVersion,
+			e.ID, streamID, string(e.Type), version, e.SchemaVersion,
 			normalizeJSON(e.Data), meta, e.OccurredAt.UTC(), recordedAt,
 		); err != nil {
 			if isDuplicateKey(err) {

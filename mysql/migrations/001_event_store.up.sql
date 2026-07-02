@@ -41,5 +41,5 @@ CREATE TABLE snapshots (
     as_of      DATETIME(6)  NOT NULL,
     created_at DATETIME(6)  NOT NULL DEFAULT NOW(6),
     PRIMARY KEY (stream_id, version),
-    KEY idx_snapshots_stream_asof (stream_id, as_of)
+    KEY idx_snapshots_stream_created (stream_id, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
