@@ -113,6 +113,40 @@ CI (`.github/workflows/ci.yml`) checks out `contract-to-cash/core` best-effort
 and injects a local `replace`; building this module standalone requires the
 core repository to be available (it is not published to the Go module proxy).
 
+## Migrations
+
+Migration files live in `postgres/migrations/` and `mysql/migrations/`
+(001–004) and are applied in filename order.
+
+**Pre-release history rewrite (001):** this adapter collection is unreleased
+(no tags; the module did not even build before the current series of fixes),
+so instead of stacking corrective 005+ migrations, `001_event_store.up.sql`
+was edited in place:
+
+- mysql: dropped `idx_events_global_position`, which duplicated the PRIMARY
+  KEY on `global_position` exactly.
+- postgres + mysql: the snapshots index was repointed from
+  `(stream_id, as_of)` to `(stream_id, created_at)` to match the
+  `LoadSnapshotBefore` query (which filters and orders on `created_at`).
+
+If you already applied an older 001 to an environment, reconcile manually:
+
+```sql
+-- mysql only: remove the index that duplicates the PRIMARY KEY
+ALTER TABLE events DROP INDEX idx_events_global_position;
+
+-- postgres
+DROP INDEX IF EXISTS idx_snapshots_stream_asof;
+CREATE INDEX idx_snapshots_stream_created ON snapshots (stream_id, created_at DESC);
+
+-- mysql
+ALTER TABLE snapshots DROP INDEX idx_snapshots_stream_asof;
+ALTER TABLE snapshots ADD KEY idx_snapshots_stream_created (stream_id, created_at);
+```
+
+Once this module is tagged, migration files become immutable and schema
+changes will only ship as new numbered migrations.
+
 ## MySQL schema & connection
 
 Apply the DDL in `mysql/migrations/` (001–004) before use; `mysql/schema.sql`
