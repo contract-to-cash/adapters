@@ -464,6 +464,8 @@ func TestGateway_ListPaymentMethods(t *testing.T) {
 	}
 	lb, _ := json.Marshal(list)
 	f.on("GET /v1/payment_methods", string(lb))
+	// The customer records pm_2 as its default invoice payment method.
+	f.on("GET /v1/customers/cus_1", `{"id":"cus_1","object":"customer","invoice_settings":{"default_payment_method":{"id":"pm_2","object":"payment_method"}}}`)
 	g := f.gateway(WithClock(fixedClock))
 
 	methods, err := g.ListPaymentMethods(context.Background(), "cus_1")
@@ -478,6 +480,13 @@ func TestGateway_ListPaymentMethods(t *testing.T) {
 	}
 	if methods[1].Card == nil || methods[1].Card.Brand != port.CardBrandMastercard {
 		t.Errorf("second card = %+v", methods[1].Card)
+	}
+	// IsDefault is resolved from the customer's invoice settings.
+	if methods[0].IsDefault {
+		t.Errorf("pm_1 should not be default")
+	}
+	if !methods[1].IsDefault {
+		t.Errorf("pm_2 should be default")
 	}
 }
 
@@ -505,5 +514,68 @@ func TestNewClient_RequiresSecret(t *testing.T) {
 	_, err := NewClient(Config{})
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("want ValidationError, got %v", err)
+	}
+}
+
+// TestGateway_ContextCancellation verifies the caller's context is propagated
+// to the Stripe SDK: a canceled context aborts the request rather than being
+// silently ignored. The fake server blocks until the request context is done.
+func TestGateway_ContextPropagated(t *testing.T) {
+	f := newFakeStripe(t)
+	f.routes["POST /v1/payment_intents"] = func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // block until the caller cancels
+		http.Error(w, "context canceled", http.StatusRequestTimeout)
+	}
+	g := f.gateway(WithClock(fixedClock))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	pmID := "pm_card"
+	_, err := g.Charge(ctx, &port.ChargeRequest{Amount: jpy(1000), PaymentMethodID: &pmID})
+	if err == nil {
+		t.Fatal("expected error from canceled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error should wrap context.Canceled, got %v", err)
+	}
+}
+
+func TestGateway_Charge_DebitCardType(t *testing.T) {
+	f := newFakeStripe(t)
+	obj := map[string]any{
+		"id": "pi_d", "object": "payment_intent", "amount": 1000, "currency": "jpy",
+		"status": "succeeded", "created": 1_700_000_000,
+		"payment_method": map[string]any{
+			"id": "pm_d", "object": "payment_method", "type": "card",
+			"card": map[string]any{"brand": "visa", "funding": "debit"},
+		},
+	}
+	b, _ := json.Marshal(obj)
+	f.on("POST /v1/payment_intents", string(b))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_d"
+	resp, err := g.Charge(context.Background(), &port.ChargeRequest{Amount: jpy(1000), PaymentMethodID: &pmID})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if resp.PaymentMethodType != port.PaymentMethodTypeDebitCard {
+		t.Errorf("PaymentMethodType = %q, want debit_card", resp.PaymentMethodType)
+	}
+}
+
+func TestGateway_GetPaymentMethod_DefaultResolved(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_1", `{"id":"pm_1","object":"payment_method","type":"card","customer":{"id":"cus_1"},"card":{"brand":"visa","last4":"4242"}}`)
+	f.on("GET /v1/customers/cus_1", `{"id":"cus_1","object":"customer","invoice_settings":{"default_payment_method":{"id":"pm_1","object":"payment_method"}}}`)
+	g := f.gateway(WithClock(fixedClock))
+
+	detail, err := g.GetPaymentMethod(context.Background(), "pm_1")
+	if err != nil {
+		t.Fatalf("GetPaymentMethod: %v", err)
+	}
+	if !detail.IsDefault {
+		t.Errorf("pm_1 should be reported as default")
 	}
 }

@@ -105,6 +105,24 @@ func TestWebhook_EventMapping(t *testing.T) {
 	}
 }
 
+func TestWebhook_CanceledIntentPassthrough(t *testing.T) {
+	h := newHandler(t)
+	body := eventBody("evt_c", "payment_intent.canceled")
+	sig := signStripe(testWebhookSecret, 1_700_000_000, body)
+
+	event, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"Stripe-Signature": sig},
+		Body:    body,
+	})
+	if err != nil {
+		t.Fatalf("ParseAndVerify: %v", err)
+	}
+	// Must NOT be mapped to payment.failed; passes through with raw name.
+	if event.Type != port.WebhookEventType("payment_intent.canceled") {
+		t.Errorf("Type = %q, want raw passthrough (not payment.failed)", event.Type)
+	}
+}
+
 func TestWebhook_MissingSignature(t *testing.T) {
 	h := newHandler(t)
 	body := eventBody("evt_3", "payment_intent.succeeded")

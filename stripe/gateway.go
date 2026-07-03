@@ -93,6 +93,7 @@ func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.Ch
 	applyThreeDS(params, req.ThreeDSecure)
 	applyMetadata(&params.Params, req.Metadata)
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
+	setContext(&params.Params, ctx)
 
 	pi, err := g.client.paymentIntents.New(params)
 	if err != nil {
@@ -128,6 +129,7 @@ func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*p
 	applyThreeDS(params, req.ThreeDSecure)
 	applyMetadata(&params.Params, req.Metadata)
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
+	setContext(&params.Params, ctx)
 
 	pi, err := g.client.paymentIntents.New(params)
 	if err != nil {
@@ -153,6 +155,7 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 	}
 	applyMetadata(&params.Params, req.Metadata)
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
+	setContext(&params.Params, ctx)
 
 	pi, err := g.client.paymentIntents.Capture(req.AuthorizationID, params)
 	if err != nil {
@@ -181,6 +184,7 @@ func (g *Gateway) Void(ctx context.Context, req *port.VoidRequest) (*port.VoidRe
 		CancellationReason: stripego.String(string(stripego.PaymentIntentCancellationReasonAbandoned)),
 	}
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
+	setContext(&params.Params, ctx)
 
 	pi, err := g.client.paymentIntents.Cancel(req.AuthorizationID, params)
 	if err != nil {
@@ -204,6 +208,7 @@ func (g *Gateway) Cancel(ctx context.Context, req *port.CancelRequest) (*port.Ca
 		CancellationReason: stripego.String(string(stripego.PaymentIntentCancellationReasonRequestedByCustomer)),
 	}
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
+	setContext(&params.Params, ctx)
 
 	pi, err := g.client.paymentIntents.Cancel(req.TransactionID, params)
 	if err != nil {
@@ -237,6 +242,7 @@ func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.Re
 	}
 	applyMetadata(&params.Params, req.Metadata)
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
+	setContext(&params.Params, ctx)
 
 	r, err := g.client.refunds.New(params)
 	if err != nil {
@@ -258,7 +264,9 @@ func (g *Gateway) GetTransaction(ctx context.Context, transactionID string) (*po
 	if transactionID == "" {
 		return nil, &ValidationError{Field: "transactionID", Message: "must not be empty"}
 	}
-	pi, err := g.client.paymentIntents.Get(transactionID, nil)
+	params := &stripego.PaymentIntentParams{}
+	setContext(&params.Params, ctx)
+	pi, err := g.client.paymentIntents.Get(transactionID, params)
 	if err != nil {
 		return nil, g.wrapGatewayError("get transaction", err)
 	}
@@ -271,6 +279,13 @@ func (g *Gateway) GetTransaction(ctx context.Context, transactionID string) (*po
 // client-side via Stripe.js/Elements and passed as Token) to a customer. When
 // SetAsDefault is true, it is also set as the customer's default invoice
 // payment method.
+//
+// The two steps (attach, then set-default) are NOT atomic: if the attach
+// succeeds but the default update fails, the method returns the update error
+// while the payment method remains attached to the customer. Retrying is safe
+// — re-attaching an already-attached PaymentMethod to the same customer is a
+// no-op on Stripe's side — so callers should retry the whole call rather than
+// treat the error as "nothing happened".
 func (g *Gateway) RegisterPaymentMethod(ctx context.Context, req *port.RegisterPaymentMethodRequest) (*port.PaymentMethodDetail, error) {
 	if req.CustomerID == "" {
 		return nil, &ValidationError{Field: "CustomerID", Message: "must not be empty"}
@@ -279,19 +294,23 @@ func (g *Gateway) RegisterPaymentMethod(ctx context.Context, req *port.RegisterP
 		return nil, &ValidationError{Field: "Token", Message: "a Stripe PaymentMethod ID (pm_...) is required"}
 	}
 
-	pm, err := g.client.paymentMethods.Attach(req.Token, &stripego.PaymentMethodAttachParams{
+	attachParams := &stripego.PaymentMethodAttachParams{
 		Customer: stripego.String(req.CustomerID),
-	})
+	}
+	setContext(&attachParams.Params, ctx)
+	pm, err := g.client.paymentMethods.Attach(req.Token, attachParams)
 	if err != nil {
 		return nil, g.wrapGatewayError("attach payment method", err)
 	}
 
 	if req.SetAsDefault {
-		if _, err := g.client.customers.Update(req.CustomerID, &stripego.CustomerParams{
+		updateParams := &stripego.CustomerParams{
 			InvoiceSettings: &stripego.CustomerInvoiceSettingsParams{
 				DefaultPaymentMethod: stripego.String(pm.ID),
 			},
-		}); err != nil {
+		}
+		setContext(&updateParams.Params, ctx)
+		if _, err := g.client.customers.Update(req.CustomerID, updateParams); err != nil {
 			return nil, g.wrapGatewayError("set default payment method", err)
 		}
 	}
@@ -304,43 +323,91 @@ func (g *Gateway) DeletePaymentMethod(ctx context.Context, paymentMethodID strin
 	if paymentMethodID == "" {
 		return &ValidationError{Field: "paymentMethodID", Message: "must not be empty"}
 	}
-	if _, err := g.client.paymentMethods.Detach(paymentMethodID, nil); err != nil {
+	params := &stripego.PaymentMethodDetachParams{}
+	setContext(&params.Params, ctx)
+	if _, err := g.client.paymentMethods.Detach(paymentMethodID, params); err != nil {
 		return g.wrapGatewayError("detach payment method", err)
 	}
 	return nil
 }
 
-// GetPaymentMethod retrieves a PaymentMethod by ID.
+// GetPaymentMethod retrieves a PaymentMethod by ID. The IsDefault flag is
+// resolved from the owning customer's invoice settings when the payment method
+// is attached to one (Stripe records the default on the Customer, not the
+// PaymentMethod), which costs one extra customer lookup.
 func (g *Gateway) GetPaymentMethod(ctx context.Context, paymentMethodID string) (*port.PaymentMethodDetail, error) {
 	if paymentMethodID == "" {
 		return nil, &ValidationError{Field: "paymentMethodID", Message: "must not be empty"}
 	}
-	pm, err := g.client.paymentMethods.Get(paymentMethodID, nil)
+	params := &stripego.PaymentMethodParams{}
+	setContext(&params.Params, ctx)
+	pm, err := g.client.paymentMethods.Get(paymentMethodID, params)
 	if err != nil {
 		return nil, g.wrapGatewayError("get payment method", err)
 	}
-	return toPaymentMethodDetail(pm, false), nil
+
+	isDefault := false
+	if pm.Customer != nil {
+		defaultID, err := g.defaultPaymentMethodID(ctx, pm.Customer.ID)
+		if err != nil {
+			return nil, err
+		}
+		isDefault = defaultID != "" && defaultID == pm.ID
+	}
+	return toPaymentMethodDetail(pm, isDefault), nil
 }
 
-// ListPaymentMethods lists a customer's stored card payment methods.
+// ListPaymentMethods lists a customer's stored card payment methods, marking
+// the one recorded as the customer's default (Stripe stores the default on the
+// Customer's invoice settings, not on each PaymentMethod).
 func (g *Gateway) ListPaymentMethods(ctx context.Context, customerID string) ([]*port.PaymentMethodDetail, error) {
 	if customerID == "" {
 		return nil, &ValidationError{Field: "customerID", Message: "must not be empty"}
 	}
+
+	defaultID, err := g.defaultPaymentMethodID(ctx, customerID)
+	if err != nil {
+		return nil, err
+	}
+
 	params := &stripego.PaymentMethodListParams{
 		Customer: stripego.String(customerID),
 		Type:     stripego.String(string(stripego.PaymentMethodTypeCard)),
 	}
+	// ListParams carries its own Context field (promoted here); the SDK's list
+	// backend applies it per page request.
+	params.Context = ctx
 	iter := g.client.paymentMethods.List(params)
 
 	var out []*port.PaymentMethodDetail
 	for iter.Next() {
-		out = append(out, toPaymentMethodDetail(iter.PaymentMethod(), false))
+		pm := iter.PaymentMethod()
+		out = append(out, toPaymentMethodDetail(pm, defaultID != "" && pm.ID == defaultID))
 	}
 	if err := iter.Err(); err != nil {
 		return nil, g.wrapGatewayError("list payment methods", err)
 	}
 	return out, nil
+}
+
+// defaultPaymentMethodID returns the customer's default invoice payment method
+// ID, or "" when none is set. Used to populate PaymentMethodDetail.IsDefault
+// on read, since Stripe records the default on the Customer rather than on each
+// PaymentMethod.
+func (g *Gateway) defaultPaymentMethodID(ctx context.Context, customerID string) (string, error) {
+	if customerID == "" {
+		return "", nil
+	}
+	params := &stripego.CustomerParams{}
+	setContext(&params.Params, ctx)
+	cust, err := g.client.customers.Get(customerID, params)
+	if err != nil {
+		return "", g.wrapGatewayError("get customer", err)
+	}
+	if cust.InvoiceSettings != nil && cust.InvoiceSettings.DefaultPaymentMethod != nil {
+		return cust.InvoiceSettings.DefaultPaymentMethod.ID, nil
+	}
+	return "", nil
 }
 
 // --- Response mapping ---
@@ -351,7 +418,7 @@ func (g *Gateway) toChargeResponse(pi *stripego.PaymentIntent) *port.ChargeRespo
 		Status:            mapIntentStatus(pi.Status),
 		Amount:            fromMinorUnits(pi.Amount, pi.Currency),
 		PaymentMethodID:   intentPaymentMethodID(pi),
-		PaymentMethodType: port.PaymentMethodTypeCreditCard,
+		PaymentMethodType: intentPaymentMethodType(pi),
 		CreatedAt:         unixTime(pi.Created),
 		Metadata:          pi.Metadata,
 		ThreeDSecure:      threeDSResult(pi),
@@ -405,6 +472,7 @@ func toPaymentMethodDetail(pm *stripego.PaymentMethod, isDefault bool) *port.Pay
 		d.CustomerID = pm.Customer.ID
 	}
 	if pm.Card != nil {
+		d.Type = cardFundingToMethodType(pm.Card.Funding)
 		d.Card = &port.CardDetails{
 			Brand:       toCardBrand(string(pm.Card.Brand)),
 			Last4:       pm.Card.Last4,
@@ -454,11 +522,38 @@ func setIdempotencyKey(params *stripego.Params, key string) {
 	}
 }
 
+// setContext threads the caller's context onto the Stripe request params. The
+// SDK backend only applies it when non-nil (stripe.go: req.WithContext), so
+// without this every call would ignore the caller's deadline/cancellation.
+func setContext(params *stripego.Params, ctx context.Context) {
+	params.Context = ctx
+}
+
 func intentPaymentMethodID(pi *stripego.PaymentIntent) string {
 	if pi.PaymentMethod != nil {
 		return pi.PaymentMethod.ID
 	}
 	return ""
+}
+
+// intentPaymentMethodType reports the actual method used, distinguishing debit
+// from credit when the PaymentIntent's payment method is expanded and carries
+// card funding. Falls back to credit_card when funding is unknown.
+func intentPaymentMethodType(pi *stripego.PaymentIntent) port.PaymentMethodType {
+	if pi.PaymentMethod != nil && pi.PaymentMethod.Card != nil {
+		return cardFundingToMethodType(pi.PaymentMethod.Card.Funding)
+	}
+	return port.PaymentMethodTypeCreditCard
+}
+
+// cardFundingToMethodType maps Stripe card funding to a port payment method
+// type. Only "debit" is distinguished; everything else (credit, prepaid,
+// unknown) reports as credit_card.
+func cardFundingToMethodType(funding stripego.CardFunding) port.PaymentMethodType {
+	if funding == stripego.CardFundingDebit {
+		return port.PaymentMethodTypeDebitCard
+	}
+	return port.PaymentMethodTypeCreditCard
 }
 
 func threeDSResult(pi *stripego.PaymentIntent) *port.ThreeDSecureResult {

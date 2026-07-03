@@ -142,7 +142,11 @@ var stripeEventMap = map[string]port.WebhookEventType{
 	"payment_intent.succeeded":      port.WebhookEventPaymentSucceeded,
 	"payment_intent.payment_failed": port.WebhookEventPaymentFailed,
 	"payment_intent.processing":     port.WebhookEventPaymentPending,
-	"payment_intent.canceled":       port.WebhookEventPaymentFailed,
+	// payment_intent.canceled is deliberately NOT mapped to payment.failed: a
+	// canceled PaymentIntent (a voided/abandoned authorization or a
+	// customer-requested cancel) is not a failed payment, and mapping it there
+	// would trigger the core's dunning / past-due handling for a payment that
+	// was never even attempted. It passes through with its raw Stripe name.
 	"charge.refunded":               port.WebhookEventRefundSucceeded,
 	"refund.created":                port.WebhookEventRefundSucceeded,
 	"refund.updated":                port.WebhookEventRefundSucceeded,
