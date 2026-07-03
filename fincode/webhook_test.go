@@ -71,7 +71,7 @@ func TestNewWebhookHandler_RejectsUnknownMode(t *testing.T) {
 func TestWebhook_StaticMode_ValidSignature(t *testing.T) {
 	const staticSig = "fincode-issued-fixed-signature"
 	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeStatic, Secret: staticSig})
-	body := []byte(`{"event":"payments.card.exec","id":"o_wh_st1","process_date":"2026/06/01 12:00:00.000"}`)
+	body := []byte(`{"event":"payments.card.exec","id":"o_wh_st1","status":"CAPTURED","process_date":"2026/06/01 12:00:00.000"}`)
 
 	event, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
 		Headers: map[string]string{"signature": staticSig},
@@ -280,17 +280,79 @@ func TestWebhook_UnknownEventIsPassedThrough(t *testing.T) {
 
 func TestWebhook_EventTypeMapping(t *testing.T) {
 	cases := map[string]port.WebhookEventType{
-		"payments.card.regist":     port.WebhookEventPaymentPending,
-		"payments.card.exec":       port.WebhookEventPaymentSucceeded,
+		"payments.card.regist": port.WebhookEventPaymentPending,
+		// capture always commits funds, so it is the reliable success signal.
 		"payments.card.capture":    port.WebhookEventPaymentSucceeded,
-		"payments.card.cancel":     port.WebhookEventRefundSucceeded,
 		"card.regist":              port.WebhookEventPaymentMethodAttached,
 		"subscription.card.regist": port.WebhookEventSubscriptionCreated,
 	}
 	for name, want := range cases {
-		if got := toWebhookEventType(name); got != want {
+		if got := toWebhookEventType(webhookPayload{Event: name}); got != want {
 			t.Errorf("toWebhookEventType(%q) = %q, want %q", name, got, want)
 		}
+	}
+}
+
+// payments.card.exec fires for both one-step charges (status CAPTURED, funds
+// committed) and auth-only executions (status AUTHORIZED, funds merely held).
+// Only a CAPTURED exec may be reported as a completed payment; anything else
+// is a typed pass-through so an authorization hold is never booked as money
+// received.
+func TestWebhook_ExecStatusDisambiguation(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
+
+	cases := []struct {
+		name string
+		body string
+		want port.WebhookEventType
+	}{
+		{
+			name: "captured exec is a completed payment",
+			body: `{"event":"payments.card.exec","id":"o_exec_cap","status":"CAPTURED"}`,
+			want: port.WebhookEventPaymentSucceeded,
+		},
+		{
+			name: "authorized exec is a hold, not a payment",
+			body: `{"event":"payments.card.exec","id":"o_exec_auth","status":"AUTHORIZED"}`,
+			want: port.WebhookEventType("payments.card.exec"),
+		},
+		{
+			name: "exec without a status is not guessed",
+			body: `{"event":"payments.card.exec","id":"o_exec_nostatus"}`,
+			want: port.WebhookEventType("payments.card.exec"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event, err := h.ParseAndVerify(context.Background(), signedRequest([]byte(tc.body)))
+			if err != nil {
+				t.Fatalf("ParseAndVerify: %v", err)
+			}
+			if event.Type != tc.want {
+				t.Errorf("Type = %q, want %q", event.Type, tc.want)
+			}
+		})
+	}
+}
+
+// payments.card.cancel is ambiguous by construction: this adapter implements
+// Void (auth reversal, no funds moved), Cancel, and full Refund all through
+// the same /cancel endpoint, so the resulting event cannot be classified as
+// a refund. It must be passed through with its raw name — mapping it to
+// refund.succeeded would let an Authorize→Void appear as a full refund.
+func TestWebhook_CancelIsPassedThroughNotRefund(t *testing.T) {
+	h := newTestWebhookHandler(t, WebhookConfig{Mode: SignatureModeHMAC, Secret: whSecret})
+	body := []byte(`{"event":"payments.card.cancel","id":"o_cancel_1","status":"CANCELED"}`)
+
+	event, err := h.ParseAndVerify(context.Background(), signedRequest(body))
+	if err != nil {
+		t.Fatalf("ParseAndVerify: %v", err)
+	}
+	if event.Type == port.WebhookEventRefundSucceeded {
+		t.Fatal("payments.card.cancel must NOT be classified as refund.succeeded")
+	}
+	if event.Type != port.WebhookEventType("payments.card.cancel") {
+		t.Errorf("Type = %q, want raw pass-through", event.Type)
 	}
 }
 

@@ -141,6 +141,7 @@ type webhookPayload struct {
 	Event       string `json:"event"`
 	ID          string `json:"order_id"`
 	PaymentID   string `json:"id"`
+	Status      string `json:"status"`
 	ProcessDate string `json:"process_date"`
 	Created     string `json:"created"`
 	Updated     string `json:"updated"`
@@ -196,7 +197,7 @@ func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequ
 
 	return &port.WebhookEvent{
 		ID:        h.eventID(payload, req.Body),
-		Type:      toWebhookEventType(payload.Event),
+		Type:      toWebhookEventType(payload),
 		CreatedAt: createdAt,
 		Data:      json.RawMessage(req.Body),
 		RawData:   req.Body,
@@ -260,25 +261,55 @@ func lookupHeader(headers map[string]string, name string) (string, bool) {
 // fincodeEventMap translates fincode webhook event names to port event
 // types. Only confidently-mappable card payment events are listed; anything
 // else is passed through with its raw fincode name.
+//
+// Deliberately NOT mapped (typed pass-through with the raw fincode name):
+//
+//   - "payments.card.exec" is mapped only when the payload status shows the
+//     funds were committed (see toWebhookEventType): exec fires for both
+//     one-step charges (status CAPTURED) and auth-only executions (status
+//     AUTHORIZED, funds merely held), and an authorization is not a
+//     completed payment. There is no double signal for one-step charges:
+//     fincode only emits "payments.card.capture" when the separate /capture
+//     call runs, which never happens on the one-step path.
+//
+//   - "payments.card.cancel" cannot be classified by this adapter. fincode
+//     has no dedicated refund endpoint, so this gateway implements Void
+//     (auth reversal, no funds moved), Cancel, AND full Refund all via
+//     PUT /v1/payments/{id}/cancel — the resulting cancel event is
+//     ambiguous between "authorization released" and "money returned".
+//     Mapping it to port.WebhookEventRefundSucceeded would let a plain
+//     Authorize→Void show up as a full refund in the consumer's ledger.
+//     Consumers that need the distinction must retrieve the payment state
+//     (GetTransaction / their own payment records) and decide from context.
 var fincodeEventMap = map[string]port.WebhookEventType{
 	"payments.card.regist":     port.WebhookEventPaymentPending,
-	"payments.card.exec":       port.WebhookEventPaymentSucceeded,
-	"payments.card.capture":    port.WebhookEventPaymentSucceeded,
-	"payments.card.cancel":     port.WebhookEventRefundSucceeded,
+	"payments.card.capture":    port.WebhookEventPaymentSucceeded, // capture always commits funds
 	"card.regist":              port.WebhookEventPaymentMethodAttached,
 	"subscription.card.regist": port.WebhookEventSubscriptionCreated,
 	"subscription.card.update": port.WebhookEventSubscriptionUpdated,
 	"subscription.card.delete": port.WebhookEventSubscriptionCanceled,
 }
 
-// toWebhookEventType maps a fincode event name to a port.WebhookEventType.
-// Unknown names are preserved as-is (typed pass-through) rather than
-// rejected, so new fincode event kinds remain observable.
-func toWebhookEventType(event string) port.WebhookEventType {
-	if t, ok := fincodeEventMap[event]; ok {
+// toWebhookEventType maps a fincode webhook payload to a
+// port.WebhookEventType. Unknown or ambiguous events are preserved as-is
+// (typed pass-through with the raw fincode event name) rather than rejected,
+// so new fincode event kinds remain observable and nothing is misclassified.
+func toWebhookEventType(p webhookPayload) port.WebhookEventType {
+	if p.Event == "payments.card.exec" {
+		// exec completes a payment only when the payload status says the
+		// funds were committed. An AUTHORIZED exec is a hold, not a payment
+		// (the later capture emits payments.card.capture → PaymentSucceeded);
+		// a missing or unrecognized status is passed through rather than
+		// guessed. See fincodeEventMap for the full rationale.
+		if PaymentStatus(p.Status) == StatusCaptured {
+			return port.WebhookEventPaymentSucceeded
+		}
+		return port.WebhookEventType(p.Event)
+	}
+	if t, ok := fincodeEventMap[p.Event]; ok {
 		return t
 	}
-	return port.WebhookEventType(event)
+	return port.WebhookEventType(p.Event)
 }
 
 // SignBody computes the signature a SignatureModeHMAC handler expects for the

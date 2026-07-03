@@ -97,7 +97,20 @@ server-side from `expectedVersion`.
   `NewWebhookHandler` returns an error when `Mode` is unset or unknown.
   Known fincode card events map to `port.WebhookEventType` constants;
   unknown event names are verified and passed through with their raw fincode
-  name as the type.
+  name as the type. Two events are deliberately conservative:
+  - `payments.card.exec` maps to `payment.succeeded` **only when the payload
+    `status` is `CAPTURED`** (one-step charge). An `AUTHORIZED` exec is a
+    funds hold, not a completed payment, and is passed through with its raw
+    name — the later capture emits `payments.card.capture`, which always maps
+    to `payment.succeeded` (no double signal: one-step charges never emit a
+    capture event). A missing/unknown `status` is passed through, not guessed.
+  - `payments.card.cancel` is **never** mapped to `refund.succeeded`: this
+    adapter implements Void (auth reversal, no funds moved), Cancel, and full
+    Refund all through the same `/cancel` endpoint, so a cancel event cannot
+    distinguish "authorization released" from "money returned". It is passed
+    through with its raw name; consumers that need to know whether funds
+    moved must retrieve the payment state (e.g. `GetTransaction` or their own
+    payment records) and decide from context.
 
 ## Testing
 
