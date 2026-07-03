@@ -671,6 +671,45 @@ func TestGateway_CompleteAuthorize_Unprocessed_Executes(t *testing.T) {
 	}
 }
 
+// Empty orderID / accessID must be rejected with a validation error on the
+// CompleteCharge / CompleteAuthorize recovery paths (the IDs come from a
+// *PartialAuthorizeError, so a mis-wired caller could pass zero values). An
+// empty orderID is caught by the state retrieve; an empty accessID by
+// executeRegistered — in both cases before any execute call is issued.
+func TestGateway_CompleteChargeAndAuthorize_ValidatesIDs(t *testing.T) {
+	// Empty orderID: rejected before any network call.
+	gw := unreachableGateway()
+	if _, err := gw.CompleteCharge(context.Background(), "", "a1",
+		&port.ChargeRequest{Amount: jpy(1000), Token: strPtr("tok")}); err == nil {
+		t.Error("CompleteCharge: expected error for empty orderID")
+	}
+	if _, err := gw.CompleteAuthorize(context.Background(), "", "a1",
+		&port.AuthorizeRequest{Amount: jpy(1000), Token: strPtr("tok")}); err == nil {
+		t.Error("CompleteAuthorize: expected error for empty orderID")
+	}
+
+	// Empty accessID: the retrieve succeeds (payment still incomplete), then
+	// executeRegistered rejects the missing accessID before executing.
+	gwc, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusUnprocessed
+
+	_, err := gwc.CompleteCharge(context.Background(), "o_gw_order_001", "",
+		&port.ChargeRequest{Amount: jpy(1000), Token: strPtr("tok")})
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Errorf("CompleteCharge(empty accessID): expected *ValidationError, got %T: %v", err, err)
+	}
+	_, err = gwc.CompleteAuthorize(context.Background(), "o_gw_order_001", "",
+		&port.AuthorizeRequest{Amount: jpy(1000), Token: strPtr("tok")})
+	if !errors.As(err, &ve) {
+		t.Errorf("CompleteAuthorize(empty accessID): expected *ValidationError, got %T: %v", err, err)
+	}
+	if fake.executeCalled {
+		t.Error("execute must NOT be called with an empty accessID")
+	}
+}
+
 // Partial failure (register succeeded, execute failed) surfaces
 // *PartialAuthorizeError with the registered IDs; CompleteCharge recovers.
 func TestGateway_Charge_PartialFailure_ThenCompleteCharge(t *testing.T) {
@@ -1346,6 +1385,29 @@ func TestGateway_Refund_RequiresTransactionID(t *testing.T) {
 	var ve *ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+}
+
+// A non-positive refund amount is rejected with a validation error before any
+// mutating call is issued.
+func TestGateway_Refund_NegativeOrZeroAmount(t *testing.T) {
+	for _, amountValue := range []int64{0, -100} {
+		gw, fake, cleanup := setupGateway(t)
+		fake.currentTotal = 1000
+
+		amount := jpy(amountValue)
+		_, err := gw.Refund(context.Background(), &port.RefundRequest{
+			TransactionID: "o_gw_order_001",
+			Amount:        &amount,
+		})
+		var ve *ValidationError
+		if !errors.As(err, &ve) {
+			t.Errorf("Refund(amount=%d): expected *ValidationError, got %T: %v", amountValue, err, err)
+		}
+		if fake.changeCalled || fake.cancelCalled {
+			t.Errorf("Refund(amount=%d): no mutating call should have been made", amountValue)
+		}
+		cleanup()
 	}
 }
 
