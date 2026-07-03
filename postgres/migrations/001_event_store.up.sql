@@ -38,4 +38,4 @@ CREATE TABLE snapshots (
     PRIMARY KEY (stream_id, version)
 );
 
-CREATE INDEX idx_snapshots_stream_created ON snapshots (stream_id, created_at DESC);
+CREATE INDEX idx_snapshots_stream_asof ON snapshots (stream_id, as_of DESC);

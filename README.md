@@ -124,40 +124,29 @@ core repository to be available (it is not published to the Go module proxy).
 ## Migrations
 
 Migration files live in `postgres/migrations/` and `mysql/migrations/`
-(001–004) and are applied in filename order.
+(001–005) and are applied in filename order. Applied migration files are
+immutable: schema corrections ship as new numbered migrations, never as
+in-place edits of already-published files.
 
-**Pre-release history rewrite (001):** this adapter collection is unreleased
-(no tags; the module did not even build before the current series of fixes),
-so instead of stacking corrective 005+ migrations, `001_event_store.up.sql`
-was edited in place:
+**005_event_store_index_fixes** corrects two indexes created by 001:
 
-- mysql: dropped `idx_events_global_position`, which duplicated the PRIMARY
-  KEY on `global_position` exactly.
-- postgres + mysql: the snapshots index was repointed from
-  `(stream_id, as_of)` to `(stream_id, created_at)` to match the
-  `LoadSnapshotBefore` query (which filters and orders on `created_at`).
+- mysql: drops `idx_events_global_position`, which duplicated the PRIMARY
+  KEY on `global_position` exactly (postgres is unaffected: there
+  `global_position` is not the primary key, so its index is not redundant).
+- postgres + mysql: repoints the snapshots index from `(stream_id, as_of)`
+  to `(stream_id, created_at)` to match the `LoadSnapshotBefore` query
+  (which filters and orders on `created_at`).
 
-If you already applied an older 001 to an environment, reconcile manually:
-
-```sql
--- mysql only: remove the index that duplicates the PRIMARY KEY
-ALTER TABLE events DROP INDEX idx_events_global_position;
-
--- postgres
-DROP INDEX IF EXISTS idx_snapshots_stream_asof;
-CREATE INDEX idx_snapshots_stream_created ON snapshots (stream_id, created_at DESC);
-
--- mysql
-ALTER TABLE snapshots DROP INDEX idx_snapshots_stream_asof;
-ALTER TABLE snapshots ADD KEY idx_snapshots_stream_created (stream_id, created_at);
-```
-
-Once this module is tagged, migration files become immutable and schema
-changes will only ship as new numbered migrations.
+No manual reconciliation is needed — just apply 005. Both variants are
+idempotent, so environments that applied the original 001 and environments
+that already fixed the indexes by hand converge on the same final schema:
+the postgres file uses `DROP INDEX IF EXISTS` / `CREATE INDEX IF NOT
+EXISTS`; MySQL 8.0 supports neither, so the mysql file guards each change
+with an `information_schema` lookup executed through a prepared statement.
 
 ## MySQL schema & connection
 
-Apply the DDL in `mysql/migrations/` (001–004) before use; `mysql/schema.sql`
+Apply the DDL in `mysql/migrations/` (001–005) before use; `mysql/schema.sql`
 contains the standalone event-store tables. Configure the MySQL DSN with
 `loc=UTC` (and typically `parseTime=true`), e.g.
 `user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true`. All timestamps are stored

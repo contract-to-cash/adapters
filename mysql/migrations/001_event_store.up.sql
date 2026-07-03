@@ -30,6 +30,7 @@ CREATE TABLE events (
     PRIMARY KEY (global_position),
     UNIQUE KEY uq_event_id (id),
     UNIQUE KEY uq_stream_version (stream_id, version),
+    KEY idx_events_global_position (global_position),
     KEY idx_events_type (type),
     KEY idx_events_stream_occurred (stream_id, occurred_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
@@ -41,5 +42,5 @@ CREATE TABLE snapshots (
     as_of      DATETIME(6)  NOT NULL,
     created_at DATETIME(6)  NOT NULL DEFAULT NOW(6),
     PRIMARY KEY (stream_id, version),
-    KEY idx_snapshots_stream_created (stream_id, created_at)
+    KEY idx_snapshots_stream_asof (stream_id, as_of)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;

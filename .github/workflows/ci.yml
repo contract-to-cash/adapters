@@ -72,13 +72,12 @@ jobs:
         if: steps.core.outcome == 'success'
         run: go build ./...
 
-      - name: Unit tests (mysql sqlmock, fincode httptest, postgres compile-only)
+      # postgres tests need a live database; they are covered by the
+      # integration job, and `go vet ./...` above already type-checks the
+      # postgres package (tests included).
+      - name: Unit tests (mysql sqlmock, fincode httptest)
         if: steps.core.outcome == 'success'
-        run: |
-          go test ./mysql/... ./fincode/... -race -count=1
-          # postgres tests need a live database (covered by the integration
-          # job); compile the test binary here to catch API drift early.
-          go test -run NoSuchTest -count=1 ./postgres/...
+        run: go test ./mysql/... ./fincode/... -race -count=1
 
   postgres-integration:
     name: postgres integration tests
