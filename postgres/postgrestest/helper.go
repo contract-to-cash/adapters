@@ -19,10 +19,16 @@ const defaultDSN = "postgres://adapters_test:adapters_test@localhost:5432/adapte
 // NewPool creates a pgxpool.Pool for testing. It applies all migrations after
 // truncating every application table, so each test starts with a clean schema.
 // The pool is closed automatically when the test finishes.
+//
+// Database selection: ADAPTERS_TEST_DSN, falling back to defaultDSN. When no
+// database is reachable, the test is SKIPPED if the DSN was implicit (local
+// development without postgres must not go red) but FAILED if
+// ADAPTERS_TEST_DSN was set explicitly (CI must not silently skip).
 func NewPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
 	dsn := os.Getenv("ADAPTERS_TEST_DSN")
+	explicitDSN := dsn != ""
 	if dsn == "" {
 		dsn = defaultDSN
 	}
@@ -30,12 +36,18 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("create pool: %v", err)
+		if explicitDSN {
+			t.Fatalf("create pool: %v", err)
+		}
+		t.Skipf("skipping postgres integration test: invalid default DSN (%v); set ADAPTERS_TEST_DSN to run", err)
 	}
 	t.Cleanup(pool.Close)
 
 	if err := pool.Ping(ctx); err != nil {
-		t.Fatalf("ping: %v", err)
+		if explicitDSN {
+			t.Fatalf("ping %s: %v", dsn, err)
+		}
+		t.Skipf("skipping postgres integration test: no database reachable at default DSN (%v); set ADAPTERS_TEST_DSN to run", err)
 	}
 
 	applyMigrations(t, pool)

@@ -28,15 +28,15 @@ func (r *PostgresInvoiceRepository) q(ctx context.Context) Querier {
 }
 
 type invoiceJSONState struct {
-	Subtotal       shared.Money              `json:"subtotal"`
-	TaxAmount      shared.Money              `json:"tax_amount"`
-	DiscountAmount shared.Money              `json:"discount_amount"`
-	Total          shared.Money              `json:"total"`
-	AppliedBalance shared.Money              `json:"applied_balance"`
-	AmountDue      shared.Money              `json:"amount_due"`
-	PaidAmount     shared.Money              `json:"paid_amount"`
-	Balance        shared.Money              `json:"balance"`
-	BillingPeriod  shared.DateRange          `json:"billing_period"`
+	Subtotal       shared.Money               `json:"subtotal"`
+	TaxAmount      shared.Money               `json:"tax_amount"`
+	DiscountAmount shared.Money               `json:"discount_amount"`
+	Total          shared.Money               `json:"total"`
+	AppliedBalance shared.Money               `json:"applied_balance"`
+	AmountDue      shared.Money               `json:"amount_due"`
+	PaidAmount     shared.Money               `json:"paid_amount"`
+	Balance        shared.Money               `json:"balance"`
+	BillingPeriod  shared.DateRange           `json:"billing_period"`
 	LineItems      []invoice.LineItemSnapshot `json:"line_items"`
 }
 

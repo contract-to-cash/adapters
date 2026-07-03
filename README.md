@@ -17,7 +17,8 @@ fincode/    fincode payment gateway adapter (port.PaymentGateway / webhooks)
 
 ## Coverage
 
-`postgres` and `mysql` implement the same set of core interfaces.
+`postgres` and `mysql` implement the same set of core interfaces (see the
+Testing section for the difference in how each is verified).
 
 | Core interface | postgres | mysql | fincode |
 |---|---|---|---|
@@ -32,20 +33,133 @@ fincode/    fincode payment gateway adapter (port.PaymentGateway / webhooks)
 | `usage.Repository` | ✅ | ✅ | — |
 | `tx.TxManager` | ✅ | ✅ | — |
 | `projection.Projector` (contract + invoice) | ✅ | ✅ | — |
-| payment gateway / webhooks | — | — | ✅ |
+| `port.PaymentGateway` | — | — | ✅ (card / JPY only) |
+| `port.WebhookHandler` | — | — | ✅ |
+
+Event store semantics follow the core reference implementation
+(`infrastructure/inmemory/event_store.go`) in both SQL adapters:
+`LoadRange` is half-open (`from <= occurred_at < to`), `LoadSnapshotBefore`
+cuts off on snapshot `CreatedAt`, and `Append` derives event versions
+server-side from `expectedVersion`.
+
+### fincode scope and conventions
+
+- **Credit cards / JPY only.** `SupportedMethods()` reports `credit_card`;
+  other payment method types, non-JPY currencies, and the 3D Secure flow are
+  rejected with typed `port.GatewayError`s rather than silently ignored.
+- **IDs**: the port-level `TransactionID` / `AuthorizationID` is the fincode
+  payment (order) ID; the adapter re-fetches `access_id` internally. Payment
+  method IDs are composite `"<customer_id>/<card_id>"`.
+- **Idempotency**: when `IdempotencyKey` is set on Charge/Authorize, the
+  fincode order ID is derived deterministically from the key
+  (`"o" + base32(sha256(key))[:29]`, lowercase), so a retry re-registers the
+  same order and fincode rejects the duplicate — permanent deduplication as
+  required by the core `PaymentService`, not just the 30-minute
+  `idempotent_key` header window (the header is still sent as well). On such
+  a duplicate rejection the adapter retrieves the existing order and replays
+  its outcome (success if already completed, `*PartialAuthorizeError` if
+  registered but not executed). Void/Cancel/Refund forward their
+  `IdempotencyKey` as the `idempotent_key` header verbatim; Capture, which
+  can issue `/change` + `/capture` from one request, forwards a distinct
+  per-operation key derived from it for each call.
+- **Refunds**: fincode has no refund endpoint; full refunds go through
+  `/cancel`, partial refunds through `/change` (amount reduction), and
+  `RefundResponse.RefundID` is the payment ID. Partial refunds are a
+  read-modify-write without compare-and-set on the fincode side: **serialize
+  refund operations against the same payment in your caller** — concurrent
+  refunds can silently lose one (last write wins on the new total). Retrying
+  a partial refund with the same `IdempotencyKey` is safe only within
+  fincode's 30-minute `idempotent_key` TTL; after that the amount reduction
+  is applied again (double refund), so **callers must also prevent duplicate
+  refund requests via their own refund records**.
+- **Two-step recovery**: register/execute is not atomic at the HTTP layer; a
+  failure between the steps returns `*fincode.PartialAuthorizeError` and is
+  recovered with `CompleteCharge` / `CompleteAuthorize`. Both check the
+  payment's current state first, so a lost execute *response* (payment
+  actually captured/authorized) is converted into a success instead of a
+  failed re-execute.
+- **Webhooks**: `fincode.WebhookHandler` verifies a configurable signature
+  header (default `"signature"`, constant-time comparison) in one of two
+  **explicitly selected** modes — there is **no default**, because fincode's
+  signature scheme could not be confirmed from primary sources and this
+  adapter refuses to bake in an unverified assumption:
+  1. Check in the fincode dashboard / specification whether the signature
+     issued for your webhook subscription is a **fixed string sent verbatim
+     on every delivery** or an **HMAC computed over each request body**.
+  2. Set `WebhookConfig.Mode` accordingly:
+     - `SignatureModeStatic` — `Secret` is the fixed signature string;
+       the header is compared for equality (constant time). *Caution:* this
+       authenticates the sender only; the body is **not** covered by the
+       signature, so payload integrity rests entirely on HTTPS.
+     - `SignatureModeHMAC` — `Secret` is an HMAC key; the header must equal
+       base64(HMAC-SHA256(secret, raw body)), which authenticates sender
+       *and* body.
+  `NewWebhookHandler` returns an error when `Mode` is unset or unknown.
+  Known fincode card events map to `port.WebhookEventType` constants;
+  unknown event names are verified and passed through with their raw fincode
+  name as the type. Two events are deliberately conservative:
+  - `payments.card.exec` maps to `payment.succeeded` **only when the payload
+    `status` is `CAPTURED`** (one-step charge). An `AUTHORIZED` exec is a
+    funds hold, not a completed payment, and is passed through with its raw
+    name — the later capture emits `payments.card.capture`, which always maps
+    to `payment.succeeded` (no double signal: one-step charges never emit a
+    capture event). A missing/unknown `status` is passed through, not guessed.
+  - `payments.card.cancel` is **never** mapped to `refund.succeeded`: this
+    adapter implements Void (auth reversal, no funds moved), Cancel, and full
+    Refund all through the same `/cancel` endpoint, so a cancel event cannot
+    distinguish "authorization released" from "money returned". It is passed
+    through with its raw name; consumers that need to know whether funds
+    moved must retrieve the payment state (e.g. `GetTransaction` or their own
+    payment records) and decide from context.
 
 ## Testing
 
-- **postgres**: integration tests against a real PostgreSQL.
+The interface coverage of `postgres` and `mysql` is identical, but the
+verification level differs:
+
+- **postgres**: integration tests against a real PostgreSQL (schema,
+  constraints, transactions, and concurrency behavior are exercised
+  end-to-end). Without a reachable database the suite self-skips; setting
+  `ADAPTERS_TEST_DSN` makes an unreachable database a hard failure (used in
+  CI, which runs a `postgres:16` service container).
 - **mysql**: unit tests with [`go-sqlmock`](https://github.com/DATA-DOG/go-sqlmock)
   so SQL, argument binding, transaction boundaries, and error mapping are verified
-  deterministically without a running database (`go test ./mysql/... -race`).
-  Integration tests against a real MySQL (docker / testcontainers) are a
-  recommended follow-up.
+  deterministically without a running database (`go test ./mysql/... -race`) —
+  but no real MySQL server is exercised. Integration tests against a real
+  MySQL (docker / testcontainers) are a recommended follow-up.
+- **fincode**: `httptest`-based unit tests against a fake fincode server
+  (no live API calls).
+
+CI (`.github/workflows/ci.yml`) checks out `contract-to-cash/core` best-effort
+and injects a local `replace`; building this module standalone requires the
+core repository to be available (it is not published to the Go module proxy).
+
+## Migrations
+
+Migration files live in `postgres/migrations/` and `mysql/migrations/`
+(001–005) and are applied in filename order. Applied migration files are
+immutable: schema corrections ship as new numbered migrations, never as
+in-place edits of already-published files.
+
+**005_event_store_index_fixes** corrects two indexes created by 001:
+
+- mysql: drops `idx_events_global_position`, which duplicated the PRIMARY
+  KEY on `global_position` exactly (postgres is unaffected: there
+  `global_position` is not the primary key, so its index is not redundant).
+- postgres + mysql: repoints the snapshots index from `(stream_id, as_of)`
+  to `(stream_id, created_at)` to match the `LoadSnapshotBefore` query
+  (which filters and orders on `created_at`).
+
+No manual reconciliation is needed — just apply 005. Both variants are
+idempotent, so environments that applied the original 001 and environments
+that already fixed the indexes by hand converge on the same final schema:
+the postgres file uses `DROP INDEX IF EXISTS` / `CREATE INDEX IF NOT
+EXISTS`; MySQL 8.0 supports neither, so the mysql file guards each change
+with an `information_schema` lookup executed through a prepared statement.
 
 ## MySQL schema & connection
 
-Apply the DDL in `mysql/migrations/` (001–004) before use; `mysql/schema.sql`
+Apply the DDL in `mysql/migrations/` (001–005) before use; `mysql/schema.sql`
 contains the standalone event-store tables. Configure the MySQL DSN with
 `loc=UTC` (and typically `parseTime=true`), e.g.
 `user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true`. All timestamps are stored

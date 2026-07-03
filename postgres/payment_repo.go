@@ -131,14 +131,14 @@ const selectPaymentSQL = `
 
 func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 	var (
-		s                                          payment.PaymentSnapshot
-		id, invoiceID                              string
-		idempotencyKey                             *string
-		amount, refundedAmount                     int64
-		currency, status, method                   string
-		gatewayTransactionID, failureReason        string
-		processedAt                                *time.Time
-		metadata                                   json.RawMessage
+		s                                   payment.PaymentSnapshot
+		id, invoiceID                       string
+		idempotencyKey                      *string
+		amount, refundedAmount              int64
+		currency, status, method            string
+		gatewayTransactionID, failureReason string
+		processedAt                         *time.Time
+		metadata                            json.RawMessage
 	)
 	if err := t.Scan(
 		&id, &invoiceID, &idempotencyKey, &amount, &refundedAmount, &currency,

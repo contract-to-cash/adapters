@@ -124,7 +124,7 @@ func TestEventStore_DuplicateIDIsNotVersionConflict(t *testing.T) {
 		t.Fatal("expected error from duplicate event ID")
 	}
 	// Should NOT be a version conflict error.
-	if shared.IsDomainError(err, shared.ErrCodeVersionConflict) {
+	if isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Error("duplicate event ID should not be reported as version conflict")
 	}
 }
@@ -144,8 +144,8 @@ func TestCreditNoteRepo_SaveAndFindByID(t *testing.T) {
 	snap := invoice.CreditNoteSnapshot{
 		ID: "cn-1", Number: "CN-001",
 		InvoiceID: "inv-cn", ContractID: "c-cn", AccountID: "acc-cn",
-		Status: invoice.CreditNoteStatusDraft, Reason: invoice.CreditNoteReasonError,
-		Memo: "test memo",
+		Status: invoice.CreditNoteStatusDraft, Reason: invoice.CreditNoteReasonDuplicate,
+		Memo:         "test memo",
 		Subtotal:     jpy(10000),
 		TaxAmount:    jpy(1000),
 		Total:        jpy(11000),
@@ -154,7 +154,11 @@ func TestCreditNoteRepo_SaveAndFindByID(t *testing.T) {
 		IssuedAt:     &now,
 		CreatedAt:    now,
 	}
-	if err := repo.Save(ctx, invoice.NewCreditNote(snap)); err != nil {
+	cn, err := invoice.CreditNoteFromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("CreditNoteFromSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, cn); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -169,8 +173,8 @@ func TestCreditNoteRepo_SaveAndFindByID(t *testing.T) {
 	if fs.Total.Int64() != 11000 {
 		t.Errorf("Total = %d, want 11000", fs.Total.Int64())
 	}
-	if string(fs.Reason) != "error" {
-		t.Errorf("Reason = %q, want error", fs.Reason)
+	if string(fs.Reason) != "duplicate" {
+		t.Errorf("Reason = %q, want duplicate", fs.Reason)
 	}
 }
 
@@ -183,13 +187,17 @@ func TestCreditNoteRepo_FindByInvoiceID(t *testing.T) {
 	repo := postgres.NewCreditNoteRepository(pool)
 	for i := 0; i < 2; i++ {
 		snap := invoice.CreditNoteSnapshot{
-			ID: shared.CreditNoteID(fmt.Sprintf("cn-find-%d", i)),
+			ID:        shared.CreditNoteID(fmt.Sprintf("cn-find-%d", i)),
 			InvoiceID: "inv-cn2", ContractID: "c-cn2", AccountID: "acc-cn2",
 			Status: invoice.CreditNoteStatusDraft, Subtotal: jpy(0), TaxAmount: jpy(0),
 			Total: jpy(0), CreditAmount: jpy(0), RefundAmount: jpy(0),
 			CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 		}
-		if err := repo.Save(ctx, invoice.NewCreditNote(snap)); err != nil {
+		cn, err := invoice.CreditNoteFromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, cn); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -207,7 +215,7 @@ func TestCreditNoteRepo_FindByID_NotFound(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	repo := postgres.NewCreditNoteRepository(pool)
 	_, err := repo.FindByID(context.Background(), "nonexistent")
-	if !shared.IsDomainError(err, shared.ErrCodeNotFound) {
+	if !isDomainError(err, shared.ErrCodeNotFound) {
 		t.Errorf("expected not_found, got: %v", err)
 	}
 }
@@ -219,23 +227,20 @@ func TestBalanceRepo_SaveInsertPath(t *testing.T) {
 	repo := postgres.NewBalanceRepository(pool)
 	ctx := context.Background()
 
+	// Version 0 means the entry has never been persisted: FromSnapshot sets
+	// loadedVersion = Version = 0, which routes Save through the INSERT path.
 	snap := balance.BalanceEntrySnapshot{
 		ID: "be-insert", AccountID: "acc-insert",
 		OriginalAmount:  shared.NewMoney(new(big.Rat).SetInt64(5000), "JPY"),
 		RemainingAmount: shared.NewMoney(new(big.Rat).SetInt64(5000), "JPY"),
-		Reason: balance.ReasonCreditGrant, SourceType: balance.SourceTypeManual,
+		Reason:          balance.BalanceReasonManualAdjustment, SourceType: balance.BalanceSourceTypeManual,
 		SourceID: "manual-ins", Description: "insert test",
-		Version: 1, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+		Version: 0, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
-	// NewBalanceEntry sets loadedVersion = snap.Version = 1.
-	// For INSERT path, we need loadedVersion = 0.
-	entry := balance.NewBalanceEntry(snap)
-	entry.SetVersion(0) // This resets both loadedVersion and snap.Version to 0.
-
-	// We need a fresh entry with version=1 and loadedVersion=0.
-	// Since our stub's SetVersion sets both, we work around it:
-	// Create with version=0 (so loadedVersion=0 after SetVersion), then the
-	// snap we pass to Save will have version=0 too. The INSERT stores version=0.
+	entry, err := balance.FromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("FromSnapshot: %v", err)
+	}
 	if err := repo.Save(ctx, entry); err != nil {
 		t.Fatalf("Save INSERT: %v", err)
 	}

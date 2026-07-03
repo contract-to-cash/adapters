@@ -70,13 +70,14 @@ func WithHTTPClient(hc *http.Client) ClientOption {
 	return func(c *Client) { c.httpClient = hc }
 }
 
-// requestOption configures a single HTTP request (e.g., for setting
+// RequestOption configures a single HTTP request (e.g., for setting
 // per-request headers like idempotent_key).
-type requestOption func(*http.Request)
+type RequestOption func(*http.Request)
 
-// withIdempotencyKey sets the fincode idempotent_key header.
-// Per fincode docs: UUID v4, 30-minute TTL. Same key returns same response.
-func withIdempotencyKey(key string) requestOption {
+// WithIdempotencyKey sets the fincode idempotent_key header. An empty key is
+// a no-op. Per fincode docs: 30-minute TTL, the same key returns the same
+// response instead of re-processing.
+func WithIdempotencyKey(key string) RequestOption {
 	return func(r *http.Request) {
 		if key != "" {
 			r.Header.Set("idempotent_key", key)
@@ -90,7 +91,7 @@ func withIdempotencyKey(key string) requestOption {
 // `idempotent_key` header so retries within 30 minutes return the same
 // registered order rather than creating a duplicate.
 func (c *Client) CreatePayment(ctx context.Context, req *CreatePaymentRequest, idempotencyKey string) (*PaymentResponse, error) {
-	return doJSON[PaymentResponse](c, ctx, http.MethodPost, "/v1/payments", req, withIdempotencyKey(idempotencyKey))
+	return doJSON[PaymentResponse](c, ctx, http.MethodPost, "/v1/payments", req, WithIdempotencyKey(idempotencyKey))
 }
 
 // ExecutePayment executes a registered payment (PUT /v1/payments/{id}).
@@ -99,23 +100,25 @@ func (c *Client) ExecutePayment(ctx context.Context, orderID string, req *Execut
 }
 
 // CapturePayment captures an authorized payment (PUT /v1/payments/{id}/capture).
-func (c *Client) CapturePayment(ctx context.Context, orderID string, req *CapturePaymentRequest) (*PaymentResponse, error) {
-	return doJSON[PaymentResponse](c, ctx, http.MethodPut, "/v1/payments/"+url.PathEscape(orderID)+"/capture", req)
+// A non-empty idempotencyKey is forwarded as the fincode `idempotent_key`
+// header (fincode accepts the header on POST/PUT endpoints; see CreatePayment).
+func (c *Client) CapturePayment(ctx context.Context, orderID string, req *CapturePaymentRequest, opts ...RequestOption) (*PaymentResponse, error) {
+	return doJSON[PaymentResponse](c, ctx, http.MethodPut, "/v1/payments/"+url.PathEscape(orderID)+"/capture", req, opts...)
 }
 
 // CancelPayment cancels a payment (PUT /v1/payments/{id}/cancel).
 // For AUTHORIZED payments this voids the authorization; for CAPTURED card
 // payments fincode attempts a reversal which may or may not complete
 // depending on the acquirer's settlement state.
-func (c *Client) CancelPayment(ctx context.Context, orderID string, req *CancelPaymentRequest) (*PaymentResponse, error) {
-	return doJSON[PaymentResponse](c, ctx, http.MethodPut, "/v1/payments/"+url.PathEscape(orderID)+"/cancel", req)
+func (c *Client) CancelPayment(ctx context.Context, orderID string, req *CancelPaymentRequest, opts ...RequestOption) (*PaymentResponse, error) {
+	return doJSON[PaymentResponse](c, ctx, http.MethodPut, "/v1/payments/"+url.PathEscape(orderID)+"/cancel", req, opts...)
 }
 
 // ChangeAmount modifies a payment's amount (PUT /v1/payments/{id}/change).
 // The request's Amount is the NEW total amount, not a delta. Used to implement
 // partial refunds by lowering the amount of a CAPTURED payment.
-func (c *Client) ChangeAmount(ctx context.Context, orderID string, req *ChangeAmountRequest) (*PaymentResponse, error) {
-	return doJSON[PaymentResponse](c, ctx, http.MethodPut, "/v1/payments/"+url.PathEscape(orderID)+"/change", req)
+func (c *Client) ChangeAmount(ctx context.Context, orderID string, req *ChangeAmountRequest, opts ...RequestOption) (*PaymentResponse, error) {
+	return doJSON[PaymentResponse](c, ctx, http.MethodPut, "/v1/payments/"+url.PathEscape(orderID)+"/change", req, opts...)
 }
 
 // RetrievePayment gets payment details (GET /v1/payments/{id}).
@@ -126,6 +129,33 @@ func (c *Client) RetrievePayment(ctx context.Context, orderID string, payType Pa
 	return doJSON[PaymentResponse](c, ctx, http.MethodGet, path, nil)
 }
 
+// --- Customer card API (payment methods) ---
+
+// CreateCard registers a tokenized card for a customer
+// (POST /v1/customers/{customer_id}/cards).
+func (c *Client) CreateCard(ctx context.Context, customerID string, req *CreateCardRequest) (*CardResponse, error) {
+	return doJSON[CardResponse](c, ctx, http.MethodPost,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards", req)
+}
+
+// RetrieveCard gets a stored card (GET /v1/customers/{customer_id}/cards/{id}).
+func (c *Client) RetrieveCard(ctx context.Context, customerID, cardID string) (*CardResponse, error) {
+	return doJSON[CardResponse](c, ctx, http.MethodGet,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards/"+url.PathEscape(cardID), nil)
+}
+
+// ListCards lists a customer's stored cards (GET /v1/customers/{customer_id}/cards).
+func (c *Client) ListCards(ctx context.Context, customerID string) (*CardListResponse, error) {
+	return doJSON[CardListResponse](c, ctx, http.MethodGet,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards", nil)
+}
+
+// DeleteCard removes a stored card (DELETE /v1/customers/{customer_id}/cards/{id}).
+func (c *Client) DeleteCard(ctx context.Context, customerID, cardID string) (*DeleteCardResponse, error) {
+	return doJSON[DeleteCardResponse](c, ctx, http.MethodDelete,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards/"+url.PathEscape(cardID), nil)
+}
+
 // doJSON sends an HTTP request and decodes a JSON response.
 //
 // On success it returns a pointer to a freshly decoded T.
@@ -133,16 +163,16 @@ func (c *Client) RetrievePayment(ctx context.Context, orderID string, payType Pa
 // raw body, and (if the body is a well-formed ErrorResponse) the parsed
 // APIError chain.
 //
-// doJSON also returns the raw response body via the result wrapper so that
-// callers wanting to preserve the exact server bytes (for audit/RawResponse)
-// can do so without re-marshalling. The public entry points discard the raw
-// bytes; internal helpers use doJSONRaw when they need them.
-func doJSON[T any](c *Client, ctx context.Context, method, path string, body any, opts ...requestOption) (*T, error) {
+// doJSON delegates to doJSONRaw and discards the raw response bytes. Nothing
+// in this package currently consumes them; doJSONRaw exists so a future
+// caller that needs the exact server bytes (audit / RawResponse) can get
+// them without re-marshalling.
+func doJSON[T any](c *Client, ctx context.Context, method, path string, body any, opts ...RequestOption) (*T, error) {
 	result, _, err := doJSONRaw[T](c, ctx, method, path, body, opts...)
 	return result, err
 }
 
-func doJSONRaw[T any](c *Client, ctx context.Context, method, path string, body any, opts ...requestOption) (*T, json.RawMessage, error) {
+func doJSONRaw[T any](c *Client, ctx context.Context, method, path string, body any, opts ...RequestOption) (*T, json.RawMessage, error) {
 	var reqBody io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)

@@ -63,6 +63,26 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 
 func (s *PostgresEventStore) appendInTx(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	q := s.q(ctx)
+
+	// Optimistic-concurrency pre-check (same transaction as the inserts,
+	// mirroring the mysql adapter): the UNIQUE (stream_id, version)
+	// constraint alone only catches expectedVersion <= current. An
+	// expectedVersion AHEAD of the stream would otherwise insert events at
+	// versions current+gap+1..., silently leaving a hole in the version
+	// sequence. A racing append that passes this check is still caught by
+	// the UNIQUE constraint below.
+	var current int
+	if err := q.QueryRow(ctx,
+		`SELECT COUNT(*) FROM events WHERE stream_id = $1`, streamID).Scan(&current); err != nil {
+		return fmt.Errorf("count events: %w", err)
+	}
+	if current != expectedVersion {
+		return shared.NewDomainError(
+			shared.ErrCodeVersionConflict,
+			fmt.Sprintf("stream %q expected version %d but stream is at %d", streamID, expectedVersion, current),
+		)
+	}
+
 	for i, evt := range events {
 		data, err := json.Marshal(evt.Data)
 		if err != nil {
@@ -140,10 +160,12 @@ func (s *PostgresEventStore) LoadUntil(ctx context.Context, streamID string, unt
 	return scanEvents(rows)
 }
 
+// LoadRange returns events with from <= occurred_at < to (half-open interval,
+// matching the core reference implementation in infrastructure/inmemory).
 func (s *PostgresEventStore) LoadRange(ctx context.Context, streamID string, from, to time.Time) ([]eventstore.Event, error) {
 	rows, err := s.q(ctx).Query(ctx,
 		`SELECT id, stream_id, type, version, schema_version, data, metadata, occurred_at, recorded_at, global_position
-		 FROM events WHERE stream_id = $1 AND occurred_at >= $2 AND occurred_at <= $3 ORDER BY version ASC`,
+		 FROM events WHERE stream_id = $1 AND occurred_at >= $2 AND occurred_at < $3 ORDER BY version ASC`,
 		streamID, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("load events in range: %w", err)
@@ -244,12 +266,19 @@ func (s *PostgresEventStore) SaveSnapshot(ctx context.Context, snapshot eventsto
 	if err != nil {
 		return fmt.Errorf("marshal snapshot state: %w", err)
 	}
+	// Persist the caller-provided CreatedAt (core's SnapshotService stamps it
+	// via shared.Clock); LoadSnapshotBefore filters on it. Fall back to the
+	// database clock when the caller left it zero.
+	var createdAt any
+	if !snapshot.CreatedAt.IsZero() {
+		createdAt = snapshot.CreatedAt
+	}
 	_, err = s.q(ctx).Exec(ctx,
-		`INSERT INTO snapshots (stream_id, version, state, as_of)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO snapshots (stream_id, version, state, as_of, created_at)
+		 VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW()))
 		 ON CONFLICT (stream_id, version) DO UPDATE
-		   SET state = EXCLUDED.state, as_of = EXCLUDED.as_of`,
-		snapshot.StreamID, snapshot.Version, state, snapshot.AsOf)
+		   SET state = EXCLUDED.state, as_of = EXCLUDED.as_of, created_at = EXCLUDED.created_at`,
+		snapshot.StreamID, snapshot.Version, state, snapshot.AsOf, createdAt)
 	if err != nil {
 		return fmt.Errorf("save snapshot: %w", err)
 	}
@@ -262,10 +291,15 @@ func (s *PostgresEventStore) LoadSnapshot(ctx context.Context, streamID string) 
 		 FROM snapshots WHERE stream_id = $1 ORDER BY version DESC LIMIT 1`, streamID)
 }
 
+// LoadSnapshotBefore returns the latest snapshot whose CreatedAt is strictly
+// before the given time, or (nil, nil) if none. The cutoff is the snapshot
+// creation time (created_at), not the as_of time, matching the core reference
+// implementation in infrastructure/inmemory. version DESC breaks ties between
+// snapshots created at the same instant deterministically (highest wins).
 func (s *PostgresEventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	return s.loadSnapshotRow(ctx,
 		`SELECT stream_id, version, state, as_of, created_at
-		 FROM snapshots WHERE stream_id = $1 AND as_of < $2 ORDER BY version DESC LIMIT 1`,
+		 FROM snapshots WHERE stream_id = $1 AND created_at < $2 ORDER BY created_at DESC, version DESC LIMIT 1`,
 		streamID, before)
 }
 

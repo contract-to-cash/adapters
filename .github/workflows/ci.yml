@@ -1,0 +1,135 @@
+# CI for contract-to-cash/adapters.
+#
+# The core dependency (github.com/contract-to-cash/core) is a separate
+# repository that is not published to the Go module proxy, so both jobs check
+# out core and inject a local `replace` directive. A failed core checkout is
+# a HARD failure for pushes to main and for PRs from branches of this
+# repository — otherwise a missing/expired CORE_REPO_TOKEN would skip every
+# test and still report green. Only PRs from forks (which cannot receive the
+# CORE_REPO_TOKEN secret) downgrade the failure to a warning + skip.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: lint + build + unit tests (mysql sqlmock / fincode httptest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # gofmt runs BEFORE the core checkout so the _core working copy can
+      # never be swept into the formatting check.
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt differences in:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+
+      - name: Checkout contract-to-cash/core
+        id: core
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: contract-to-cash/core
+          path: _core
+          token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
+
+      - name: Fail when core is unavailable (non-fork)
+        if: steps.core.outcome != 'success' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+        run: |
+          echo "::error::could not check out contract-to-cash/core (set/renew the CORE_REPO_TOKEN secret); refusing to pass without running any tests"
+          exit 1
+
+      - name: Warn when core is unavailable (fork PR only)
+        if: steps.core.outcome != 'success' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+        run: echo "::warning::could not check out contract-to-cash/core from a fork PR (secrets unavailable); skipping vet/build/test"
+
+      - name: Inject local core replace
+        if: steps.core.outcome == 'success'
+        run: |
+          go mod edit -replace github.com/contract-to-cash/core=./_core
+          go mod tidy
+
+      - name: go vet
+        if: steps.core.outcome == 'success'
+        run: go vet ./...
+
+      - name: go build
+        if: steps.core.outcome == 'success'
+        run: go build ./...
+
+      # postgres tests need a live database; they are covered by the
+      # integration job, and `go vet ./...` above already type-checks the
+      # postgres package (tests included).
+      - name: Unit tests (mysql sqlmock, fincode httptest)
+        if: steps.core.outcome == 'success'
+        run: go test ./mysql/... ./fincode/... -race -count=1
+
+  postgres-integration:
+    name: postgres integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: adapters_test
+          POSTGRES_PASSWORD: adapters_test
+          POSTGRES_DB: adapters_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapters_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ADAPTERS_TEST_DSN: postgres://adapters_test:adapters_test@localhost:5432/adapters_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout contract-to-cash/core
+        id: core
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: contract-to-cash/core
+          path: _core
+          token: ${{ secrets.CORE_REPO_TOKEN || github.token }}
+
+      - name: Fail when core is unavailable (non-fork)
+        if: steps.core.outcome != 'success' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork)
+        run: |
+          echo "::error::could not check out contract-to-cash/core (set/renew the CORE_REPO_TOKEN secret); refusing to pass without running any tests"
+          exit 1
+
+      - name: Warn when core is unavailable (fork PR only)
+        if: steps.core.outcome != 'success' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+        run: echo "::warning::could not check out contract-to-cash/core from a fork PR (secrets unavailable); skipping postgres integration tests"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Inject local core replace
+        if: steps.core.outcome == 'success'
+        run: |
+          go mod edit -replace github.com/contract-to-cash/core=./_core
+          go mod tidy
+
+      - name: Integration tests
+        if: steps.core.outcome == 'success'
+        run: go test ./postgres/... -race -count=1

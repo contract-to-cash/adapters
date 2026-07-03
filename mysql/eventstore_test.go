@@ -205,7 +205,7 @@ func TestEventStore_LoadSnapshotBefore(t *testing.T) {
 	before := fixedTime.Add(time.Hour)
 	rows := sqlmock.NewRows([]string{"stream_id", "version", "state", "as_of", "created_at"}).
 		AddRow("contract-1", 7, []byte(`{"s":1}`), fixedTime, fixedTime)
-	mock.ExpectQuery(`SELECT .* FROM snapshots WHERE stream_id = \? AND created_at < \? ORDER BY created_at DESC LIMIT 1`).
+	mock.ExpectQuery(`SELECT .* FROM snapshots WHERE stream_id = \? AND created_at < \? ORDER BY created_at DESC, version DESC LIMIT 1`).
 		WithArgs("contract-1", before).
 		WillReturnRows(rows)
 
@@ -215,6 +215,41 @@ func TestEventStore_LoadSnapshotBefore(t *testing.T) {
 	}
 	if snap == nil || snap.Version != 7 {
 		t.Fatalf("unexpected snapshot: %+v", snap)
+	}
+}
+
+// The stored version must be derived from expectedVersion (expected+i+1) and
+// the stored stream id from the streamID argument — never from the
+// caller-populated Event.Version / Event.StreamID fields. A caller passing
+// stale or inconsistent values must not be able to break the version sequence
+// (parity with the postgres adapter, whose INSERT derives both server-side).
+func TestEventStore_Append_DerivesVersionFromExpectedVersion(t *testing.T) {
+	store, mock := newTestStore(t)
+
+	// Caller-supplied Version (99) and StreamID ("wrong-stream") disagree with
+	// the Append arguments; the derived values must win.
+	e1 := sampleEvent("e6", "wrong-stream", 99)
+	e2 := sampleEvent("e7", "wrong-stream", 42)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(5))
+	mock.ExpectExec(`INSERT INTO events`).
+		WithArgs("e6", "contract-1", "contract.created", 6, 1,
+			[]byte(`{"name":"acme"}`), sqlmock.AnyArg(), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO events`).
+		WithArgs("e7", "contract-1", "contract.created", 7, 1,
+			[]byte(`{"name":"acme"}`), sqlmock.AnyArg(), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectCommit()
+
+	if err := store.Append(context.Background(), "contract-1", []eventstore.Event{e1, e2}, 5); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
@@ -365,6 +400,31 @@ func TestEventStore_SaveSnapshot(t *testing.T) {
 		State:     []byte(`{"status":"active"}`),
 		AsOf:      fixedTime,
 		CreatedAt: fixedTime,
+	}
+	mock.ExpectExec(`INSERT INTO snapshots`).
+		WithArgs("contract-1", 42, []byte(`{"status":"active"}`), fixedTime, fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := store.SaveSnapshot(context.Background(), snap); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A zero CreatedAt must be stamped with the store clock before writing —
+// LoadSnapshotBefore filters on created_at, so persisting the zero value
+// would hide the snapshot from all temporal queries (and diverge from the
+// postgres adapter's COALESCE(..., NOW()) fallback).
+func TestEventStore_SaveSnapshot_ZeroCreatedAtUsesClock(t *testing.T) {
+	store, mock := newTestStore(t)
+	snap := eventstore.Snapshot{
+		StreamID: "contract-1",
+		Version:  42,
+		State:    []byte(`{"status":"active"}`),
+		AsOf:     fixedTime,
+		// CreatedAt intentionally left zero.
 	}
 	mock.ExpectExec(`INSERT INTO snapshots`).
 		WithArgs("contract-1", 42, []byte(`{"status":"active"}`), fixedTime, fixedTime).

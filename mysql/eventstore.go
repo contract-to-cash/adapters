@@ -121,6 +121,12 @@ func (s *EventStore) Append(ctx context.Context, streamID string, events []event
 
 // appendOn performs the COUNT-based optimistic check and inserts on the given
 // Querier (either an ambient *sql.Tx or the store's own tx).
+//
+// The stored version is derived server-side as expectedVersion+i+1 (and the
+// stream id from the streamID argument), matching the postgres adapter. The
+// caller-populated Event.Version / Event.StreamID fields are ignored so a
+// stale or inconsistent caller value cannot diverge from the optimistic
+// concurrency baseline.
 func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, events []eventstore.Event, expectedVersion int) error {
 	var current int
 	if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE stream_id = ?", streamID).Scan(&current); err != nil {
@@ -137,8 +143,9 @@ func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, e
 		if err != nil {
 			return fmt.Errorf("event store: marshal metadata for event %s: %w", e.ID, err)
 		}
+		version := expectedVersion + i + 1
 		if _, err := q.ExecContext(ctx, insertEventSQL,
-			e.ID, e.StreamID, string(e.Type), e.Version, e.SchemaVersion,
+			e.ID, streamID, string(e.Type), version, e.SchemaVersion,
 			normalizeJSON(e.Data), meta, e.OccurredAt.UTC(), recordedAt,
 		); err != nil {
 			if isDuplicateKey(err) {
@@ -258,10 +265,18 @@ func (s *EventStore) pollLoop(ctx context.Context, pos int64, ch chan<- eventsto
 }
 
 // SaveSnapshot upserts an aggregate snapshot keyed by (stream_id, version).
+// A zero CreatedAt (caller did not stamp it) is filled from the store clock,
+// matching the postgres adapter's COALESCE(..., NOW()) fallback —
+// LoadSnapshotBefore filters on created_at, so a persisted zero value would
+// make the snapshot invisible to every temporal query.
 func (s *EventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snapshot) error {
+	createdAt := snapshot.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = s.clock.Now()
+	}
 	if _, err := s.q(ctx).ExecContext(ctx, upsertSnapshotSQL,
 		snapshot.StreamID, snapshot.Version, normalizeJSON(snapshot.State),
-		snapshot.AsOf.UTC(), snapshot.CreatedAt.UTC(),
+		snapshot.AsOf.UTC(), createdAt.UTC(),
 	); err != nil {
 		return fmt.Errorf("event store: save snapshot for stream %s: %w", snapshot.StreamID, err)
 	}
@@ -277,10 +292,11 @@ func (s *EventStore) LoadSnapshot(ctx context.Context, streamID string) (*events
 }
 
 // LoadSnapshotBefore loads the latest snapshot created before the given time,
-// or (nil, nil) if none.
+// or (nil, nil) if none. version DESC breaks ties between snapshots created
+// at the same instant deterministically (highest wins).
 func (s *EventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	row := s.q(ctx).QueryRowContext(ctx,
-		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 1",
+		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC, version DESC LIMIT 1",
 		streamID, before.UTC())
 	return scanSnapshot(row)
 }
