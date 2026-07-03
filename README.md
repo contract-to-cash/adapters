@@ -13,6 +13,7 @@ postgres/   PostgreSQL implementation of the full persistence stack
             (event store, all repositories, read-model projectors, tx manager)
 mysql/      MySQL 8.0 implementation of the same full persistence stack
 fincode/    fincode payment gateway adapter (port.PaymentGateway / webhooks)
+stripe/     Stripe payment gateway adapter (port.PaymentGateway / webhooks)
 ```
 
 ## Coverage
@@ -20,21 +21,21 @@ fincode/    fincode payment gateway adapter (port.PaymentGateway / webhooks)
 `postgres` and `mysql` implement the same set of core interfaces (see the
 Testing section for the difference in how each is verified).
 
-| Core interface | postgres | mysql | fincode |
-|---|---|---|---|
-| `eventstore.Store` | ✅ | ✅ | — |
-| `contract.Repository` | ✅ | ✅ | — |
-| `invoice.Repository` | ✅ | ✅ | — |
-| `invoice.CreditNoteRepository` | ✅ | ✅ | — |
-| `payment.Repository` | ✅ | ✅ | — |
-| `balance.Repository` | ✅ | ✅ | — |
-| `pricing.PriceRepository` | ✅ | ✅ | — |
-| `product.Repository` | ✅ | ✅ | — |
-| `usage.Repository` | ✅ | ✅ | — |
-| `tx.TxManager` | ✅ | ✅ | — |
-| `projection.Projector` (contract + invoice) | ✅ | ✅ | — |
-| `port.PaymentGateway` | — | — | ✅ (card / JPY only) |
-| `port.WebhookHandler` | — | — | ✅ |
+| Core interface | postgres | mysql | fincode | stripe |
+|---|---|---|---|---|
+| `eventstore.Store` | ✅ | ✅ | — | — |
+| `contract.Repository` | ✅ | ✅ | — | — |
+| `invoice.Repository` | ✅ | ✅ | — | — |
+| `invoice.CreditNoteRepository` | ✅ | ✅ | — | — |
+| `payment.Repository` | ✅ | ✅ | — | — |
+| `balance.Repository` | ✅ | ✅ | — | — |
+| `pricing.PriceRepository` | ✅ | ✅ | — | — |
+| `product.Repository` | ✅ | ✅ | — | — |
+| `usage.Repository` | ✅ | ✅ | — | — |
+| `tx.TxManager` | ✅ | ✅ | — | — |
+| `projection.Projector` (contract + invoice) | ✅ | ✅ | — | — |
+| `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card; JPY/USD/EUR) |
+| `port.WebhookHandler` | — | — | ✅ | ✅ |
 
 Event store semantics follow the core reference implementation
 (`infrastructure/inmemory/event_store.go`) in both SQL adapters:
@@ -112,6 +113,69 @@ server-side from `expectedVersion`.
     moved must retrieve the payment state (e.g. `GetTransaction` or their own
     payment records) and decide from context.
 
+### stripe scope and conventions
+
+Built on the official `github.com/stripe/stripe-go/v82` SDK. Unlike fincode,
+Stripe maps almost one-to-one onto `port.PaymentGateway` — every method is
+implemented; nothing is rejected as unsupported except by currency.
+
+- **Cards; JPY / USD / EUR.** `SupportedMethods()` reports `credit_card` and
+  `debit_card` (Stripe's single `card` PaymentMethod type). Only the
+  currencies defined in `domain/shared` are supported; any other currency is
+  rejected with a typed `port.GatewayError` (`currency_not_supported`). Extend
+  `currencyExponent` in `stripe/types.go` when core adds more currencies.
+- **Amounts**: Stripe amounts are integers in the currency's smallest unit
+  (cents for USD/EUR, whole yen for zero-decimal JPY). `shared.Money` is
+  converted using each currency's exponent; an amount that is not exactly
+  representable in minor units (e.g. `100.5` JPY), non-positive, or beyond
+  int64 range is rejected with a `*ValidationError` before any network call.
+- **IDs**: the port-level `TransactionID` and `AuthorizationID` are both the
+  Stripe **PaymentIntent** ID (`pi_...`) — Charge/Authorize create it,
+  Capture/Void/Cancel/GetTransaction operate on it by that single ID (no
+  separate access token). `RefundResponse.RefundID` is the Stripe refund ID
+  (`re_...`); the refund request's `TransactionID` is the PaymentIntent ID.
+  Payment method IDs are the flat Stripe PaymentMethod ID (`pm_...`).
+- **Charge / Authorize / Capture**: Charge creates a confirmed PaymentIntent
+  with automatic capture; Authorize uses manual capture (status
+  `requires_capture`) and Capture (optionally partial via `amount_to_capture`)
+  settles it. Void and Cancel both cancel the PaymentIntent (Stripe models an
+  auth reversal and a cancel the same way), differing only in the recorded
+  cancellation reason.
+- **3D Secure**: a required authentication surfaces as a **successful**
+  response with `TransactionStatusRequiresAction` and a
+  `ThreeDSecureResult.RedirectURL` (from the PaymentIntent's
+  `next_action.redirect_to_url`), not an error — the caller redirects the
+  customer and completes the flow.
+- **Payment methods**: `RegisterPaymentMethod` attaches an existing
+  Stripe PaymentMethod (created client-side with Stripe.js/Elements and passed
+  as `Token`) to the customer, optionally setting it as the customer's default
+  invoice payment method. Card storage/vaulting itself is done client-side;
+  the adapter never handles raw PANs.
+- **Idempotency**: `IdempotencyKey` on Charge/Authorize/Capture/Refund is
+  forwarded verbatim as Stripe's `Idempotency-Key` header. **Stripe expires
+  idempotency keys after 24h**, so a retry beyond that window is no longer
+  deduplicated by Stripe; permanent deduplication (as the core
+  `PaymentService` expects) must also be backed by the caller's own payment
+  records.
+- **Refunds**: full (`Amount == nil`) or partial (`Amount` set). Only
+  Stripe's accepted reasons (`duplicate` / `fraudulent` /
+  `requested_by_customer`) are forwarded; `RefundReasonOther` (and any other
+  value) is sent with no `reason` rather than a value Stripe would reject.
+- **Error mapping**: SDK `*stripe.Error`s are converted to
+  `*port.GatewayError` with the original error preserved via `RawError`
+  (recoverable with `errors.As`). Stripe error codes map to `port.ErrorCode`
+  (e.g. `card_declined`, `expired_card`, `insufficient_funds`); rate limits,
+  `api_error`s, and 5xx/timeout responses are marked `Retryable`.
+- **Webhooks**: `stripe.WebhookHandler` verifies the `Stripe-Signature` header
+  via the SDK's `webhook.ConstructEventWithOptions` (HMAC-SHA256 over
+  `"{timestamp}.{body}"`, constant-time). Timestamp/replay validation is
+  **delegated to the core `port.WebhookProcessor`** (which checks
+  `event.CreatedAt` against an injected `shared.Clock` and dedups on
+  `event.ID`), because the SDK's own tolerance check reads the wall clock and
+  would break this module's clock-injection convention. Known Stripe event
+  types map to `port.WebhookEventType` constants; unknown types pass through
+  with their raw Stripe name.
+
 ## Testing
 
 The interface coverage of `postgres` and `mysql` is identical, but the
@@ -129,6 +193,9 @@ verification level differs:
   MySQL (docker / testcontainers) are a recommended follow-up.
 - **fincode**: `httptest`-based unit tests against a fake fincode server
   (no live API calls).
+- **stripe**: `httptest`-based unit tests against a fake Stripe API, with the
+  SDK's backend URL pointed at the test server (`Config.APIBase`); no live API
+  calls. Webhook tests sign payloads with the same HMAC scheme the SDK verifies.
 
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other

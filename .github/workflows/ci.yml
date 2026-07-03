@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   unit:
-    name: lint + build + unit tests (mysql sqlmock / fincode httptest)
+    name: lint + build + unit tests (mysql sqlmock / fincode + stripe httptest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,8 +43,8 @@ jobs:
       # postgres tests need a live database; they are covered by the
       # integration job, and `go vet ./...` above already type-checks the
       # postgres package (tests included).
-      - name: Unit tests (mysql sqlmock, fincode httptest)
-        run: go test ./mysql/... ./fincode/... -race -count=1
+      - name: Unit tests (mysql sqlmock, fincode + stripe httptest)
+        run: go test ./mysql/... ./fincode/... ./stripe/... -race -count=1
 
   postgres-integration:
     name: postgres integration tests
