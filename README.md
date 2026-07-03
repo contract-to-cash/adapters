@@ -130,9 +130,10 @@ verification level differs:
 - **fincode**: `httptest`-based unit tests against a fake fincode server
   (no live API calls).
 
-CI (`.github/workflows/ci.yml`) checks out `contract-to-cash/core` best-effort
-and injects a local `replace`; building this module standalone requires the
-core repository to be available (it is not published to the Go module proxy).
+CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
+version pinned in `go.mod`, resolved from the Go module proxy like any other
+dependency. To develop against a local core checkout, add a `replace`
+directive to `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/path/to/core`).
 
 ## Migrations
 
