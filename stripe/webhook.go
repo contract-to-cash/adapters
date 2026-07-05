@@ -2,6 +2,7 @@ package stripe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/textproto"
@@ -94,11 +95,12 @@ func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequ
 		return nil, classifyWebhookError(err)
 	}
 
+	raw := rawEventData(&event)
 	return &port.WebhookEvent{
 		ID:        event.ID,
-		Type:      toWebhookEventType(string(event.Type)),
+		Type:      toWebhookEventType(string(event.Type), raw),
 		CreatedAt: time.Unix(event.Created, 0).UTC(),
-		Data:      rawEventData(&event),
+		Data:      raw,
 		RawData:   req.Body,
 	}, nil
 }
@@ -147,11 +149,19 @@ var stripeEventMap = map[string]port.WebhookEventType{
 	// customer-requested cancel) is not a failed payment, and mapping it there
 	// would trigger the core's dunning / past-due handling for a payment that
 	// was never even attempted. It passes through with its raw Stripe name.
+	//
+	// charge.refunded is mapped directly because for card refunds — the only
+	// payment method this adapter supports (see SupportedMethods) — it fires
+	// after the refund has been recorded on the charge. For asynchronous
+	// payment methods (e.g. bank transfers), charge.refunded can fire while
+	// the refund is still pending, so if this adapter ever supports non-card
+	// methods this event needs the same status inspection as the Refund-object
+	// events. Those events (refund.created / refund.updated /
+	// charge.refund.updated) are async and must be classified from their
+	// status — see refundEventTypes / classifyRefundEvent — so they are
+	// intentionally NOT listed here.
 	"charge.refunded":               port.WebhookEventRefundSucceeded,
-	"refund.created":                port.WebhookEventRefundSucceeded,
-	"refund.updated":                port.WebhookEventRefundSucceeded,
 	"refund.failed":                 port.WebhookEventRefundFailed,
-	"charge.refund.updated":         port.WebhookEventRefundSucceeded,
 	"charge.dispute.created":        port.WebhookEventChargebackCreated,
 	"charge.dispute.updated":        port.WebhookEventChargebackUpdated,
 	"charge.dispute.closed":         port.WebhookEventChargebackClosed,
@@ -162,14 +172,55 @@ var stripeEventMap = map[string]port.WebhookEventType{
 	"customer.subscription.deleted": port.WebhookEventSubscriptionCanceled,
 }
 
+// refundEventTypes are Stripe event types that carry a Refund object whose
+// status must be inspected before classification. Card refunds are
+// asynchronous: refund.created typically arrives with status "pending", and
+// refund.updated / charge.refund.updated also fire on transitions to
+// "failed"/"canceled". Mapping any of them unconditionally to RefundSucceeded
+// would let a refund that later fails be booked as a completed refund in the
+// consumer's ledger (issue #13).
+var refundEventTypes = map[string]struct{}{
+	"refund.created":        {},
+	"refund.updated":        {},
+	"charge.refund.updated": {},
+}
+
 // toWebhookEventType maps a Stripe event type to a port.WebhookEventType,
 // passing unknown types through unchanged (typed pass-through) so new Stripe
-// event kinds remain observable rather than rejected.
-func toWebhookEventType(stripeType string) port.WebhookEventType {
+// event kinds remain observable rather than rejected. Refund-object events are
+// classified from their status via classifyRefundEvent.
+func toWebhookEventType(stripeType string, data []byte) port.WebhookEventType {
+	if _, ok := refundEventTypes[stripeType]; ok {
+		return classifyRefundEvent(stripeType, data)
+	}
 	if t, ok := stripeEventMap[stripeType]; ok {
 		return t
 	}
 	return port.WebhookEventType(stripeType)
+}
+
+// classifyRefundEvent inspects the Refund object's status to classify an async
+// refund event. Only a settled "succeeded" refund becomes RefundSucceeded;
+// "failed"/"canceled" become RefundFailed. A "pending"/"requires_action"
+// (still in flight), empty, unknown, or unreadable status is NOT guessed — it
+// passes through with the raw Stripe name so a non-terminal refund is never
+// booked as a completed one. The eventual refund.failed / a later
+// refund.updated(succeeded) carries the terminal outcome.
+func classifyRefundEvent(stripeType string, data []byte) port.WebhookEventType {
+	var refund struct {
+		Status stripego.RefundStatus `json:"status"`
+	}
+	if err := json.Unmarshal(data, &refund); err != nil {
+		return port.WebhookEventType(stripeType)
+	}
+	switch refund.Status {
+	case stripego.RefundStatusSucceeded:
+		return port.WebhookEventRefundSucceeded
+	case stripego.RefundStatusFailed, stripego.RefundStatusCanceled:
+		return port.WebhookEventRefundFailed
+	default:
+		return port.WebhookEventType(stripeType)
+	}
 }
 
 // lookupHeader finds a header value case-insensitively; port.WebhookRequest
