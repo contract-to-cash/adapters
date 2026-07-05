@@ -44,6 +44,57 @@ func TestInvoiceProjector_Project_Created(t *testing.T) {
 	}
 }
 
+// core marshals Money as {"amount":"11000/1","currency":"JPY"}. The projector
+// must parse that shape (not a float64) so total is projected correctly instead
+// of silently falling back to 0. Currency is taken from the Money object when no
+// top-level currency field is present.
+func TestInvoiceProjector_Project_Created_MoneyObjectTotal(t *testing.T) {
+	proj, mock := newInvoiceProjector(t)
+
+	ev := eventstore.Event{
+		StreamID: "inv-1",
+		Type:     "invoice.created",
+		Version:  1,
+		Data:     []byte(`{"contract_id":"c-1","account_id":"acct-1","status":"draft","total":{"amount":"11000/1","currency":"JPY"}}`),
+	}
+
+	mock.ExpectExec(`INSERT INTO invoice_read_models`).
+		WithArgs("inv-1", "c-1", "acct-1", "draft", int64(11000), "JPY", sqlmock.AnyArg(), 1).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project created: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A fractional Money amount is truncated toward zero to fit the BIGINT column
+// (matching shared.Money.Int64); the untruncated value stays in the data JSON.
+func TestInvoiceProjector_Project_Created_MoneyFractionalTruncates(t *testing.T) {
+	proj, mock := newInvoiceProjector(t)
+
+	ev := eventstore.Event{
+		StreamID: "inv-2",
+		Type:     "invoice.issued",
+		Version:  2,
+		Data:     []byte(`{"contract_id":"c-2","account_id":"acct-2","status":"issued","currency":"USD","total":{"amount":"2599/100","currency":"USD"}}`),
+	}
+
+	// 2599/100 = 25.99 -> truncated to 25.
+	mock.ExpectExec(`INSERT INTO invoice_read_models`).
+		WithArgs("inv-2", "c-2", "acct-2", "issued", int64(25), "USD", sqlmock.AnyArg(), 2).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project issued: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestInvoiceProjector_Project_Paid(t *testing.T) {
 	proj, mock := newInvoiceProjector(t)
 
