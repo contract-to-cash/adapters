@@ -150,12 +150,16 @@ var stripeEventMap = map[string]port.WebhookEventType{
 	// would trigger the core's dunning / past-due handling for a payment that
 	// was never even attempted. It passes through with its raw Stripe name.
 	//
-	// charge.refunded fires on the Charge object once a refund has been applied
-	// to it (Stripe only emits it after the refund is recorded on the charge),
-	// so it is a settled refund and mapped directly. The Refund-object events
-	// (refund.created / refund.updated / charge.refund.updated) are async and
-	// must be classified from their status — see refundEventTypes /
-	// classifyRefundEvent — so they are intentionally NOT listed here.
+	// charge.refunded is mapped directly because for card refunds — the only
+	// payment method this adapter supports (see SupportedMethods) — it fires
+	// after the refund has been recorded on the charge. For asynchronous
+	// payment methods (e.g. bank transfers), charge.refunded can fire while
+	// the refund is still pending, so if this adapter ever supports non-card
+	// methods this event needs the same status inspection as the Refund-object
+	// events. Those events (refund.created / refund.updated /
+	// charge.refund.updated) are async and must be classified from their
+	// status — see refundEventTypes / classifyRefundEvent — so they are
+	// intentionally NOT listed here.
 	"charge.refunded":               port.WebhookEventRefundSucceeded,
 	"refund.failed":                 port.WebhookEventRefundFailed,
 	"charge.dispute.created":        port.WebhookEventChargebackCreated,

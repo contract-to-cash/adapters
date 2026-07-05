@@ -174,7 +174,16 @@ implemented; nothing is rejected as unsupported except by currency.
   `event.ID`), because the SDK's own tolerance check reads the wall clock and
   would break this module's clock-injection convention. Known Stripe event
   types map to `port.WebhookEventType` constants; unknown types pass through
-  with their raw Stripe name.
+  with their raw Stripe name. Refund-object events (`refund.created` /
+  `refund.updated` / `charge.refund.updated`) are classified from the refund's
+  `status` (`succeeded` → `refund.succeeded`, `failed`/`canceled` →
+  `refund.failed`, anything else passes through unclassified), because card
+  refunds are asynchronous and typically arrive as `pending` first.
+  `charge.refunded` maps directly to `refund.succeeded`, which is correct for
+  card refunds (the adapter's only supported method) — note that for
+  asynchronous payment methods (e.g. bank transfers) Stripe can fire
+  `charge.refunded` while the refund is still pending, so supporting non-card
+  methods would require the same status inspection there.
 
 ## Testing
 
