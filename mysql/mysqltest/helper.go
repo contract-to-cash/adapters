@@ -4,10 +4,8 @@ package mysqltest
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"testing"
 	"time"
 
@@ -15,15 +13,16 @@ import (
 	driver "github.com/go-sql-driver/mysql"
 )
 
-// defaultDSN targets the mysql:8 service container used in CI. multiStatements
-// is enabled so a migration file (multiple DDL statements) can be applied in a
-// single Exec; parseTime + loc=UTC keep DATETIME(6) round-trips in UTC.
-const defaultDSN = "adapters_test:adapters_test@tcp(localhost:3306)/adapters_test?parseTime=true&loc=UTC&multiStatements=true"
+// defaultDSN targets the mysql:8 service container used in CI. parseTime +
+// loc=UTC keep DATETIME(6) round-trips in UTC. Migrations are applied through
+// mysql.Migrate, which splits each file into single statements, so
+// multiStatements is not required.
+const defaultDSN = "adapters_test:adapters_test@tcp(localhost:3306)/adapters_test?parseTime=true&loc=UTC"
 
-// NewDB opens a *sql.DB for testing. It applies all migrations (ignoring
-// already-exists errors so a persistent CI database can be reused) and then
-// truncates every application table, so each test starts from a clean schema.
-// The DB is closed automatically when the test finishes.
+// NewDB opens a *sql.DB for testing. It applies all migrations through the
+// production mysql.Migrate runner and then truncates every application table, so
+// each test starts from a clean schema. The DB is closed automatically when the
+// test finishes.
 //
 // Database selection: ADAPTERS_TEST_MYSQL_DSN, falling back to defaultDSN. When
 // no database is reachable, the test is SKIPPED if the DSN was implicit (local
@@ -37,7 +36,7 @@ func NewDB(t *testing.T) *sql.DB {
 	if dsn == "" {
 		dsn = defaultDSN
 	} else {
-		dsn = ensureMultiStatements(dsn)
+		dsn = normalizeDSN(dsn)
 	}
 
 	db, err := sql.Open("mysql", dsn)
@@ -57,60 +56,27 @@ func NewDB(t *testing.T) *sql.DB {
 		t.Skipf("skipping mysql integration test: no database reachable at default DSN (%v); set ADAPTERS_TEST_MYSQL_DSN to run", err)
 	}
 
-	applyMigrations(t, db)
+	// Apply migrations through the production runner, which tracks applied
+	// files in schema_migrations and therefore no longer needs to swallow
+	// "already exists" errors on a persistent database: a re-run simply skips
+	// files it has already recorded.
+	if err := mysql.Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	truncateAll(t, db)
 
 	return db
 }
 
-// ensureMultiStatements appends multiStatements=true to a user-supplied DSN if
-// absent; applying a multi-statement migration file otherwise fails with error
-// 1064 under the MySQL driver's default (single-statement) mode.
-func ensureMultiStatements(dsn string) string {
+// normalizeDSN forces parseTime + loc=UTC on a user-supplied DSN so DATETIME(6)
+// round-trips stay deterministic in UTC, regardless of what the caller passed.
+func normalizeDSN(dsn string) string {
 	if cfg, err := driver.ParseDSN(dsn); err == nil {
-		cfg.MultiStatements = true
-		if cfg.Params == nil {
-			cfg.Params = map[string]string{}
-		}
-		// parseTime + UTC keep timestamp round-trips deterministic.
 		cfg.ParseTime = true
 		cfg.Loc = time.UTC
 		return cfg.FormatDSN()
 	}
 	return dsn
-}
-
-func applyMigrations(t *testing.T, db *sql.DB) {
-	t.Helper()
-
-	entries, err := mysql.Migrations.ReadDir("migrations")
-	if err != nil {
-		t.Fatalf("read migrations dir: %v", err)
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
-
-	ctx := context.Background()
-	for _, entry := range entries {
-		data, err := mysql.Migrations.ReadFile("migrations/" + entry.Name())
-		if err != nil {
-			t.Fatalf("read migration %s: %v", entry.Name(), err)
-		}
-		if _, err := db.ExecContext(ctx, string(data)); err != nil {
-			// Ignore "already exists" errors so tests can re-run against a
-			// persistent database:
-			//   1050 = table already exists
-			//   1061 = duplicate key/index name
-			//   1826 = duplicate foreign key constraint name
-			// Any other error is a real failure.
-			var me *driver.MySQLError
-			if errors.As(err, &me) && (me.Number == 1050 || me.Number == 1061 || me.Number == 1826) {
-				continue
-			}
-			t.Fatalf("apply migration %s: %v", entry.Name(), err)
-		}
-	}
 }
 
 // tables lists application tables in child-to-parent (FK) order. Truncation
