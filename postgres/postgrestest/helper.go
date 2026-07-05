@@ -3,14 +3,11 @@ package postgrestest
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"testing"
 
 	"github.com/contract-to-cash/adapters/postgres"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -50,41 +47,16 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 		t.Skipf("skipping postgres integration test: no database reachable at default DSN (%v); set ADAPTERS_TEST_DSN to run", err)
 	}
 
-	applyMigrations(t, pool)
+	// Apply migrations through the production runner, which tracks applied
+	// files in schema_migrations and therefore no longer needs to swallow
+	// "already exists" errors on a persistent database: a re-run simply skips
+	// files it has already recorded.
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	truncateAll(t, pool)
 
 	return pool
-}
-
-func applyMigrations(t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-
-	entries, err := postgres.Migrations.ReadDir("migrations")
-	if err != nil {
-		t.Fatalf("read migrations dir: %v", err)
-	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
-
-	ctx := context.Background()
-	for _, entry := range entries {
-		data, err := postgres.Migrations.ReadFile("migrations/" + entry.Name())
-		if err != nil {
-			t.Fatalf("read migration %s: %v", entry.Name(), err)
-		}
-		if _, err := pool.Exec(ctx, string(data)); err != nil {
-			// Ignore "already exists" errors (42P07=duplicate_table,
-			// 42710=duplicate_object) so tests can re-run against a
-			// persistent database. Any other error is a real failure.
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && (pgErr.Code == "42P07" || pgErr.Code == "42710") {
-				continue
-			}
-			t.Fatalf("apply migration %s: %v", entry.Name(), err)
-		}
-	}
 }
 
 // truncateAll removes all data from application tables in dependency order.
@@ -111,13 +83,11 @@ func truncateAll(t *testing.T, pool *pgxpool.Pool) {
 	}
 
 	for _, table := range tables {
-		if _, err := pool.Exec(ctx, fmt.Sprintf("TRUNCATE %s CASCADE", table)); err != nil {
-			// Table may not exist yet on first run; ignore.
-		}
+		// Best-effort: a table may not exist yet on the very first run.
+		_, _ = pool.Exec(ctx, fmt.Sprintf("TRUNCATE %s CASCADE", table))
 	}
 
 	// Reset the global_position sequence so tests see predictable values.
-	if _, err := pool.Exec(ctx, "ALTER SEQUENCE IF EXISTS events_global_position_seq RESTART WITH 1"); err != nil {
-		// Ignore if sequence doesn't exist.
-	}
+	// Best-effort: ignore if the sequence does not exist.
+	_, _ = pool.Exec(ctx, "ALTER SEQUENCE IF EXISTS events_global_position_seq RESTART WITH 1")
 }

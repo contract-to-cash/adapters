@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 )
 
 // CheckpointStore persists the last processed global_position for a named projector.
@@ -37,13 +36,18 @@ func (s *CheckpointStore) Load(ctx context.Context, projectorName string) (int64
 }
 
 func (s *CheckpointStore) Save(ctx context.Context, projectorName string, position int64) error {
+	// last_updated is stamped by the database clock (column DEFAULT NOW(6) on
+	// insert, NOW(6) on update) rather than a Go time.Now(), keeping this
+	// adapter free of direct wall-clock reads per the core shared.Clock
+	// convention. The checkpoint timestamp is bookkeeping only, so the DB clock
+	// is authoritative here.
 	_, err := s.q(ctx).ExecContext(ctx,
-		`INSERT INTO projection_checkpoints (projector_name, last_position, last_updated)
-		 VALUES (?, ?, ?)
+		`INSERT INTO projection_checkpoints (projector_name, last_position)
+		 VALUES (?, ?)
 		 ON DUPLICATE KEY UPDATE
 		   last_position = VALUES(last_position),
-		   last_updated  = VALUES(last_updated)`,
-		projectorName, position, time.Now())
+		   last_updated  = NOW(6)`,
+		projectorName, position)
 	if err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}

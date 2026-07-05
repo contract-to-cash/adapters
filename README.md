@@ -205,9 +205,47 @@ directive to `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/p
 ## Migrations
 
 Migration files live in `postgres/migrations/` and `mysql/migrations/`
-(001–005) and are applied in filename order. Applied migration files are
+(001–006) and are applied in filename order. Applied migration files are
 immutable: schema corrections ship as new numbered migrations, never as
 in-place edits of already-published files.
+
+### Running migrations
+
+Each SQL adapter ships a runner that applies the embedded files and tracks
+progress in a `schema_migrations` table (filename + status), so a file is
+applied exactly once and a re-run is a no-op:
+
+```go
+// postgres
+if err := postgres.Migrate(ctx, pool); err != nil { ... } // pool is *pgxpool.Pool
+
+// mysql
+if err := mysql.Migrate(ctx, db); err != nil { ... }      // db is *sql.DB
+```
+
+- **postgres** wraps each file (DDL + bookkeeping row) in one transaction, so a
+  failed file rolls back cleanly and is retried on the next run — PostgreSQL DDL
+  is transactional.
+- **mysql** cannot roll DDL back (it auto-commits), so the runner writes a
+  `pending` marker before a file and flips it to `applied` only after every
+  statement succeeds. A file that fails midway leaves a `pending` row; the next
+  `Migrate` call **stops with an error** naming that file so a half-applied
+  schema is reconciled by hand rather than silently skipped. Files are executed
+  one statement at a time on a single pinned connection (so session state such
+  as the `PREPARE`/`EXECUTE` guards in 005/006 survives).
+
+The runner does **not** swallow "already exists" errors. To bring an existing,
+untracked database under management, seed `schema_migrations` with the files it
+has already had applied (`INSERT INTO schema_migrations (filename, status) ...`).
+You may still use `golang-migrate` or apply the `.sql` files by hand instead;
+the runner is a convenience, not a requirement.
+
+**006_drop_projection_fks** removes the `invoices` / `credit_notes` /
+`usage_records` → `contract_read_models` foreign keys added by 003. Those keys
+pointed write-side tables at a **projection** table, so under the asynchronous
+projection mode core officially supports, a lagging projector could reject a
+legitimate write for a contract whose read model had not been built yet. See
+[Read-model foreign keys and projection mode](#read-model-foreign-keys-and-projection-mode).
 
 **005_event_store_index_fixes** corrects two indexes created by 001:
 
@@ -227,7 +265,7 @@ with an `information_schema` lookup executed through a prepared statement.
 
 ## MySQL schema & connection
 
-Apply the DDL in `mysql/migrations/` (001–005) before use; `mysql/schema.sql`
+Apply the DDL in `mysql/migrations/` (001–006) before use; `mysql/schema.sql`
 contains the standalone event-store tables. Configure the MySQL DSN with
 `loc=UTC` (and typically `parseTime=true`), e.g.
 `user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true`. All timestamps are stored
@@ -245,3 +283,63 @@ and returned in UTC; `DATETIME` columns are scanned correctly under either
   (replay-then-tail, honours `fromPosition`, back-pressures slow consumers).
 - Partial indexes are emulated as full indexes; `JSONB`→`JSON`,
   `BIGSERIAL`→`AUTO_INCREMENT`, `NOW()`→`NOW(6)`.
+
+## Operational semantics
+
+### `global_position` ordering and at-most-once tailing
+
+`global_position` is a `BIGSERIAL` / `AUTO_INCREMENT` column: the value is
+**assigned when a row is INSERTed** but only becomes **visible when the inserting
+transaction COMMITs**. Under concurrent appends those two moments can reorder.
+If transaction A grabs position `N` and transaction B grabs `N+1`, and B commits
+first, a reader polling `WHERE global_position > last_seen` can observe `N+1`,
+advance its cursor past it, and then **never see `N`** once A finally commits —
+`N` is now behind the cursor. This affects everything that tails by position:
+`EventStore.Subscribe` (both adapters) and any position-based projector driven
+off `LoadAll` / a `CheckpointStore`.
+
+Consequences and guidance:
+
+- **Position-based subscription/projection is at-most-once with respect to a
+  concurrent-commit gap.** It is not a durable-delivery guarantee. Do not use it
+  as the sole path for state that must never miss an event.
+- **For strict correctness, use synchronous projection** — project inside the
+  same transaction that appends the events (core's synchronous projection mode),
+  so the read model is updated atomically with the write and no position gap can
+  form. The `TxManager` in each adapter lets a projector run in the append
+  transaction.
+- If you must tail asynchronously, reduce the window by keeping append
+  transactions short, and reconcile periodically with a `Rebuild` (which scans
+  by `global_position` after the fact, when all rows are committed and visible).
+  This adapter does not add a `txid`/gap-detection guard; if you need one, gate
+  the cursor on the oldest in-flight transaction (e.g. `pg_snapshot_xmin`) in
+  your projector.
+
+`Subscribe` (postgres) additionally distinguishes a broken subscription from a
+clean shutdown. The core `eventstore.Store` interface returns only a channel
+that is closed on both, so register a callback to observe failures:
+
+```go
+es := postgres.NewEventStore(pool,
+    postgres.WithSubscriptionErrorHandler(func(err error) { log.Printf("subscribe: %v", err) }),
+    postgres.WithCatchUpBatchSize(1000), // bound replay/tail page size
+)
+```
+
+Context cancellation is treated as a normal shutdown and is **not** reported.
+
+### Read-model foreign keys and projection mode
+
+Historically `invoices`, `credit_notes`, and `usage_records` had a foreign key
+onto `contract_read_models` (a projection table). Migration
+**006_drop_projection_fks** removes them, because under **asynchronous**
+projection the read model lags the event log: a contract created and immediately
+invoiced in one request could fail the FK simply because its read model had not
+been projected yet. Referential integrity for contracts lives in the event log
+(the source of truth), not in a derived read model.
+
+If you have **not** applied 006 and run projections asynchronously, a write can
+fail with a foreign-key violation whenever the projector is behind. Either apply
+006 (recommended) or run projections **synchronously** (project in the append
+transaction) so the read-model row always exists before dependent rows are
+written.

@@ -1,0 +1,68 @@
+# Lint configuration for contract-to-cash/adapters.
+#
+# Mirrors the rule set of contract-to-cash/core for parity, minus the
+# core-internal `forbidigo` snapshot rule: these adapters ARE the persistence
+# layer that core's rule explicitly exempts, so they legitimately call the
+# ToSnapshot / FromSnapshot APIs.
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - exhaustive
+    - misspell
+    - nolintlint
+  settings:
+    errcheck:
+      check-type-assertions: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    govet:
+      enable:
+        - shadow
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    generated: lax
+    rules:
+      - linters: [govet]
+        text: 'shadow: declaration of "err" shadows declaration at'
+      # The Stripe SDK's package-level client methods (g.client.paymentIntents.*,
+      # etc.) are marked deprecated in favour of the newer stripe.Client surface.
+      # Migrating to it is tracked separately; the current calls are correct and
+      # tested. Scope the allowance to the stripe adapter so real deprecations
+      # elsewhere still fail.
+      - path: 'stripe/gateway\.go$'
+        linters: [staticcheck]
+        text: 'SA1019'
+      # mapStripeErrorCode intentionally handles only the Stripe error codes/types
+      # this adapter maps, cascading everything else to an HTTP-status fallback.
+      # Enumerating Stripe's hundreds of error codes would be noise, so exhaustive
+      # is waived for these two external-enum switches.
+      - path: 'stripe/gateway\.go$'
+        linters: [exhaustive]
+        text: 'missing cases in switch of type stripe\.Error(Code|Type)'
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5
