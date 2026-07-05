@@ -152,7 +152,6 @@ func TestContractProjector_Rebuild_CheckpointStopsAtUntil(t *testing.T) {
 	}
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`SET SESSION foreign_key_checks = 0`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM contract_read_models`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM projection_checkpoints`).WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -182,7 +181,6 @@ func TestContractProjector_Rebuild_CheckpointStopsAtUntil(t *testing.T) {
 		WithArgs(ContractProjectorName, int64(1)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	mock.ExpectExec(`SET SESSION foreign_key_checks = 1`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
 	if err := proj.Rebuild(context.Background(), until); err != nil {
@@ -206,14 +204,14 @@ func TestContractProjector_Project_IgnoresUnrelated(t *testing.T) {
 	}
 }
 
-// Rebuild must disable foreign key checks around the truncate/reload and
-// re-enable them afterwards (the MySQL stand-in for postgres SET CONSTRAINTS
-// ALL DEFERRED).
-func TestContractProjector_Rebuild_TogglesForeignKeyChecks(t *testing.T) {
+// Rebuild empties and repopulates contract_read_models inside a plain
+// transaction. Migration 008 removed every FK referencing contract_read_models,
+// so the rebuild no longer toggles foreign_key_checks (see issue #29): the mock
+// asserts no `SET SESSION foreign_key_checks` statement is issued.
+func TestContractProjector_Rebuild_NoForeignKeyToggle(t *testing.T) {
 	proj, mock := newContractProjector(t)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`SET SESSION foreign_key_checks = 0`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM contract_read_models`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM projection_checkpoints`).WillReturnResult(sqlmock.NewResult(0, 1))
 	// No events: LoadAll returns empty.
@@ -223,7 +221,6 @@ func TestContractProjector_Rebuild_TogglesForeignKeyChecks(t *testing.T) {
 			"id", "stream_id", "type", "version", "schema_version",
 			"data", "metadata", "occurred_at", "recorded_at", "global_position",
 		}))
-	mock.ExpectExec(`SET SESSION foreign_key_checks = 1`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
 	if err := proj.Rebuild(context.Background(), time.Now()); err != nil {

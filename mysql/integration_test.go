@@ -155,9 +155,17 @@ func TestIntegration_EventStore_SnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// Rebuild exercises the foreign_key_checks toggle/restore path against real
-// MySQL (the dedicated-connection code added for issue #17). It must succeed and
-// leave foreign_key_checks re-enabled on subsequent pooled connections.
+// Rebuild empties and repopulates contract_read_models. Migration 008 removed
+// every FK referencing contract_read_models, so Rebuild no longer suspends
+// foreign_key_checks (issue #29): the truncate/reload runs as an ordinary
+// transaction and needs no dedicated-connection restore dance. This test asserts
+// Rebuild succeeds, clears the projection, and — crucially — that it does NOT
+// leave foreign_key_checks disabled on pooled connections (a regression the old
+// toggle code guarded against). Because there is no longer an
+// invoices→contract_read_models FK, an orphan invoice is legitimately accepted
+// by design; the connection-poisoning regression is instead detected via a
+// self-referential FK on invoice_history (invoice_history.id → invoices.id),
+// which is untouched by 008 and must still be enforced afterwards.
 func TestIntegration_ContractProjector_Rebuild(t *testing.T) {
 	db := mysqltest.NewDB(t)
 	es := mysql.New(db, integrationClock)
@@ -180,13 +188,24 @@ func TestIntegration_ContractProjector_Rebuild(t *testing.T) {
 		t.Errorf("expected 0 read models after rebuild, got %d", count)
 	}
 
-	// foreign_key_checks must be back on for pooled connections: an FK violation
-	// should now be rejected rather than silently accepted.
-	_, err := db.ExecContext(ctx,
+	// Post-008 an orphan invoice (no matching contract_read_models row) is
+	// allowed: the write→projection FK was intentionally dropped so async
+	// projection lag cannot reject legitimate writes.
+	if _, err := db.ExecContext(ctx,
 		`INSERT INTO invoices (id, account_id, contract_id, status, subtotal, tax_amount, discount_amount, total, applied_balance, amount_due, paid_amount, balance, currency, void_reason, line_items, metadata)
-		 VALUES ('inv-orphan', 'acc-x', 'missing-contract', 'draft', 0,0,0,0,0,0,0,0,'JPY','', '[]','{}')`)
+		 VALUES ('inv-orphan', 'acc-x', 'missing-contract', 'draft', 0,0,0,0,0,0,0,0,'JPY','', '[]','{}')`); err != nil {
+		t.Errorf("orphan invoice insert should be allowed after migration 008 dropped the projection FK: %v", err)
+	}
+
+	// A still-live FK (invoice_history.id → invoices.id) must remain enforced on
+	// pooled connections: inserting a history row for a non-existent invoice must
+	// be rejected. If Rebuild had left foreign_key_checks disabled on a pooled
+	// connection, this violation would be silently accepted.
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO invoice_history (id, version, snapshot, valid_from)
+		 VALUES ('inv-missing', 1, '{}', NOW(6))`)
 	if err == nil {
-		t.Error("expected FK violation for orphan invoice (foreign_key_checks not restored)")
+		t.Error("expected FK violation for orphan invoice_history row (foreign_key_checks left disabled?)")
 	}
 }
 
