@@ -115,6 +115,51 @@ func TestInvoiceRepo_FindByID_Found(t *testing.T) {
 	}
 }
 
+// Issue #12: inside an ambient transaction FindByID must take a row lock so
+// concurrent core FinalizeInvoice calls serialize (loser reads the finalized
+// row and is rejected). Verify the FOR UPDATE clause is emitted only in a tx.
+func TestInvoiceRepo_FindByID_ForUpdateInTx(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+
+	mock.ExpectBegin()
+	sqlTx, err := repo.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ctx := ContextWithTx(context.Background(), sqlTx)
+
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE id = \? FOR UPDATE`).
+		WithArgs("inv-1").
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindByID(ctx, "inv-1")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if got.ToSnapshot().ID != "inv-1" {
+		t.Errorf("unexpected invoice: %+v", got.ToSnapshot())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Outside a transaction (pooled read) no row lock is taken: the query must end
+// at the id predicate with no trailing FOR UPDATE.
+func TestInvoiceRepo_FindByID_NoLockOutsideTx(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	mock.ExpectQuery(`WHERE id = \?$`).
+		WithArgs("inv-1").
+		WillReturnRows(invoiceFindRow(t))
+
+	if _, err := repo.FindByID(context.Background(), "inv-1"); err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestInvoiceRepo_FindByID_NotFound(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	mock.ExpectQuery(`SELECT .* FROM invoices WHERE id = \?`).

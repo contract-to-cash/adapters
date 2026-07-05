@@ -202,6 +202,26 @@ version pinned in `go.mod`, resolved from the Go module proxy like any other
 dependency. To develop against a local core checkout, add a `replace`
 directive to `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/path/to/core`).
 
+## Concurrency guarantees
+
+core's `BillingService.FinalizeInvoice` documents that the loser of a concurrent
+finalize "reads the finalized row and is rejected with `invalid_state_transition`",
+so `OnInvoiceIssuedHook` fires at most once per invoice. That guarantee only holds
+if the read-then-write is serialized by the storage layer — it does **not** hold
+under READ COMMITTED / REPEATABLE READ with an unconditional last-writer-wins
+upsert. This adapter supplies the missing serialization: **when `FindByID` runs
+inside an ambient transaction (detected via `QuerierFromContext`), it issues
+`SELECT ... FOR UPDATE`** (both postgres and mysql). core's `FinalizeInvoice`
+does its read → `Finalize()` → `Save` inside one `tx.Run`, so two concurrent
+finalizers contend on the same row: the winner finalizes and commits; the loser
+blocks on the row lock, then reads the already-finalized row and is rejected by
+`Finalize()` with `invalid_state_transition`, never reaching `Save`. The same row
+lock also serializes the `invoice_history` upsert, so the losing writer bails out
+before it can overwrite the winner's history row. Outside a transaction (pooled
+reads) no lock is taken, so ordinary lookups are unaffected. This addresses
+adapters issue #12 (and is cross-referenced by core#130, which pins the wording of
+the guarantee core relies on).
+
 ## Migrations
 
 Migration files live in `postgres/migrations/` and `mysql/migrations/`

@@ -145,7 +145,19 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 }
 
 func (r *PostgresInvoiceRepository) FindByID(ctx context.Context, id shared.InvoiceID) (*invoice.Invoice, error) {
-	row := r.q(ctx).QueryRow(ctx, selectInvoiceSQL+` WHERE id = $1`, string(id))
+	// When invoked inside an ambient transaction (e.g. core's
+	// BillingService.FinalizeInvoice, which reads -> Finalize -> Save within one
+	// tx), take a row lock with SELECT ... FOR UPDATE. This serializes concurrent
+	// finalizers on the same invoice: the loser blocks until the winner commits,
+	// then reads the already-finalized row and is rejected by Finalize() with
+	// invalid_state_transition. Without the lock, both readers would see the draft
+	// row and both would finalize, double-firing OnInvoiceIssuedHook. Outside a
+	// transaction (pooled read) no lock is taken.
+	query := selectInvoiceSQL + ` WHERE id = $1`
+	if _, inTx := TxFromContext(ctx); inTx {
+		query += ` FOR UPDATE`
+	}
+	row := r.q(ctx).QueryRow(ctx, query, string(id))
 	return scanInvoiceRow(row, id)
 }
 
