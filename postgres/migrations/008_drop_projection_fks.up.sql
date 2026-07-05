@@ -9,7 +9,7 @@
 -- (the source of truth), not to a derived read model, so these FKs are removed.
 --
 -- Guarded with IF EXISTS so the migration converges on databases created before
--- 006 (constraint present) and any that already dropped it by hand.
+-- 008 (constraint present) and any that already dropped it by hand.
 
 ALTER TABLE invoices      DROP CONSTRAINT IF EXISTS fk_invoices_contract;
 ALTER TABLE credit_notes  DROP CONSTRAINT IF EXISTS fk_credit_notes_contract;

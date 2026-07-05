@@ -1,5 +1,5 @@
 -- MySQL 8.0: drop the write-side -> projection-table foreign keys
--- (mirrors postgres/migrations/006_drop_projection_fks.up.sql).
+-- (mirrors postgres/migrations/008_drop_projection_fks.up.sql).
 --
 -- 003 pointed invoices / credit_notes / usage_records at contract_read_models
 -- (a PROJECTION table). Under the async projection mode that core officially
@@ -12,7 +12,7 @@
 -- MySQL 8.0 has no ALTER TABLE ... DROP FOREIGN KEY IF EXISTS, so each drop is
 -- guarded by an information_schema lookup executed through a prepared statement
 -- (a no-op 'SELECT 1' when the constraint is already gone). The final state
--- therefore converges on databases created before 006 and any that dropped the
+-- therefore converges on databases created before 008 and any that dropped the
 -- constraint by hand.
 
 SET @stmt := IF(

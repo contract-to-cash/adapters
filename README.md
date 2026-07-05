@@ -205,7 +205,7 @@ directive to `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/p
 ## Migrations
 
 Migration files live in `postgres/migrations/` and `mysql/migrations/`
-(001–006) and are applied in filename order. Applied migration files are
+and are applied in filename order. Applied migration files are
 immutable: schema corrections ship as new numbered migrations, never as
 in-place edits of already-published files.
 
@@ -232,7 +232,7 @@ if err := mysql.Migrate(ctx, db); err != nil { ... }      // db is *sql.DB
   `Migrate` call **stops with an error** naming that file so a half-applied
   schema is reconciled by hand rather than silently skipped. Files are executed
   one statement at a time on a single pinned connection (so session state such
-  as the `PREPARE`/`EXECUTE` guards in 005/006 survives).
+  as the `PREPARE`/`EXECUTE` guards in 005/008 survives).
 
 The runner does **not** swallow "already exists" errors. To bring an existing,
 untracked database under management, seed `schema_migrations` with the files it
@@ -240,7 +240,7 @@ has already had applied (`INSERT INTO schema_migrations (filename, status) ...`)
 You may still use `golang-migrate` or apply the `.sql` files by hand instead;
 the runner is a convenience, not a requirement.
 
-**006_drop_projection_fks** removes the `invoices` / `credit_notes` /
+**008_drop_projection_fks** removes the `invoices` / `credit_notes` /
 `usage_records` → `contract_read_models` foreign keys added by 003. Those keys
 pointed write-side tables at a **projection** table, so under the asynchronous
 projection mode core officially supports, a lagging projector could reject a
@@ -265,7 +265,7 @@ with an `information_schema` lookup executed through a prepared statement.
 
 ## MySQL schema & connection
 
-Apply the DDL in `mysql/migrations/` (001–006) before use; `mysql/schema.sql`
+Apply the DDL in `mysql/migrations/` before use; `mysql/schema.sql`
 contains the standalone event-store tables. Configure the MySQL DSN with
 `loc=UTC` (and typically `parseTime=true`), e.g.
 `user:pass@tcp(host:3306)/db?loc=UTC&parseTime=true`. All timestamps are stored
@@ -332,14 +332,14 @@ Context cancellation is treated as a normal shutdown and is **not** reported.
 
 Historically `invoices`, `credit_notes`, and `usage_records` had a foreign key
 onto `contract_read_models` (a projection table). Migration
-**006_drop_projection_fks** removes them, because under **asynchronous**
+**008_drop_projection_fks** removes them, because under **asynchronous**
 projection the read model lags the event log: a contract created and immediately
 invoiced in one request could fail the FK simply because its read model had not
 been projected yet. Referential integrity for contracts lives in the event log
 (the source of truth), not in a derived read model.
 
-If you have **not** applied 006 and run projections asynchronously, a write can
+If you have **not** applied 008 and run projections asynchronously, a write can
 fail with a foreign-key violation whenever the projector is behind. Either apply
-006 (recommended) or run projections **synchronously** (project in the append
+008 (recommended) or run projections **synchronously** (project in the append
 transaction) so the read-model row always exists before dependent rows are
 written.

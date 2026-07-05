@@ -46,7 +46,7 @@ func TestMigrate_Idempotent(t *testing.T) {
 	}
 }
 
-// TestMigrate_DropsProjectionFKs verifies migration 006 removed the write-side
+// TestMigrate_DropsProjectionFKs verifies migration 008 removed the write-side
 // foreign keys onto the contract_read_models projection table, so an invoice
 // can be written for a contract whose read model has not been projected yet.
 func TestMigrate_DropsProjectionFKs(t *testing.T) {
@@ -61,7 +61,7 @@ func TestMigrate_DropsProjectionFKs(t *testing.T) {
 			t.Fatalf("check constraint %s: %v", fk, err)
 		}
 		if exists {
-			t.Errorf("foreign key %s still present; migration 006 should have dropped it", fk)
+			t.Errorf("foreign key %s still present; migration 008 should have dropped it", fk)
 		}
 	}
 }
