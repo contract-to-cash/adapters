@@ -24,6 +24,17 @@ func jpy(amount int64) shared.Money {
 
 func strPtr(s string) *string { return &s }
 
+// mustNewClient builds a client for tests, panicking on a config error (all
+// test configs set an explicit BaseURL or Sandbox, so this never fires in
+// practice; it keeps call sites terse now that NewClient returns an error).
+func mustNewClient(cfg Config, opts ...ClientOption) *Client {
+	c, err := NewClient(cfg, opts...)
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
 // compile-time conformance check.
 var _ port.PaymentGateway = (*Gateway)(nil)
 
@@ -169,13 +180,13 @@ func setupGateway(t *testing.T) (*Gateway, *fakeFincode, func()) {
 	t.Helper()
 	fake := &fakeFincode{}
 	srv := httptest.NewServer(fake.handler())
-	client := NewClient(Config{APIKey: "sk_test_gw", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk_test_gw", BaseURL: srv.URL})
 	gw := NewGateway(client, WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
 	return gw, fake, srv.Close
 }
 
 func unreachableGateway() *Gateway {
-	client := NewClient(Config{APIKey: "sk", BaseURL: "http://unreachable.invalid"})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: "http://unreachable.invalid"})
 	return NewGateway(client, WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
 }
 
@@ -744,7 +755,7 @@ func TestGateway_Charge_PartialFailure_ThenCompleteCharge(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	gw := NewGateway(client, WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
 
 	req := &port.ChargeRequest{Amount: jpy(1000), Token: strPtr("tok_retry")}
@@ -790,7 +801,7 @@ func TestGateway_Charge_RegisterFailure_IsPlainGatewayError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	gw := NewGateway(client)
 
 	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
@@ -821,6 +832,8 @@ func TestGateway_Charge_RegisterFailure_IsPlainGatewayError(t *testing.T) {
 type registerFailFincode struct {
 	getStatus    PaymentStatus // "" → GET answers 404 (order does not exist)
 	getFailWith  int           // non-zero → GET answers this HTTP status (transient failure)
+	getAmount    int64         // 0 → defaults to 1000; the amount GET reports for the order
+	getJobCode   JobCode       // "" → GET omits job_code; otherwise the order's job code
 	getCalls     int
 	executeCalls int
 }
@@ -850,11 +863,16 @@ func (f *registerFailFincode) server() *httptest.Server {
 				})
 				return
 			}
+			amount := f.getAmount
+			if amount == 0 {
+				amount = 1000
+			}
 			_ = json.NewEncoder(w).Encode(PaymentResponse{
 				ID:       strings.TrimPrefix(r.URL.Path, "/v1/payments/"),
 				AccessID: "a_recover_001",
 				Status:   f.getStatus,
-				Amount:   1000, TotalAmount: 1000,
+				JobCode:  f.getJobCode,
+				Amount:   amount, TotalAmount: amount,
 			})
 		default:
 			f.executeCalls++
@@ -869,7 +887,7 @@ func (f *registerFailFincode) server() *httptest.Server {
 func recoveryGateway(t *testing.T, fake *registerFailFincode) (*Gateway, func()) {
 	t.Helper()
 	srv := fake.server()
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	return NewGateway(client, WithClock(shared.FixedClock{FixedTime: gwFixedTime})), srv.Close
 }
 
@@ -1042,6 +1060,84 @@ func TestGateway_Charge_RegisterFailure_NoKey_SkipsRetrieve(t *testing.T) {
 	}
 }
 
+// Reusing an IdempotencyKey for a DIFFERENT amount collides with the existing
+// order (same derived order ID) but must NOT replay the old amount's success.
+// It is rejected as a non-retryable processing error, like Stripe refusing
+// idempotency-key reuse with changed parameters.
+func TestGateway_Charge_RegisterDuplicate_AmountMismatch_IsRejected(t *testing.T) {
+	// Existing order was captured for 1000; this request asks for 500.
+	fake := &registerFailFincode{getStatus: StatusCaptured, getAmount: 1000}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(500), Token: strPtr("tok"), IdempotencyKey: "idem-reuse",
+	})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) {
+		t.Fatalf("expected *port.GatewayError, got %T: %v", err, err)
+	}
+	if ge.Code != port.ErrorCodeProcessingError {
+		t.Errorf("Code = %q, want %q", ge.Code, port.ErrorCodeProcessingError)
+	}
+	if ge.Retryable {
+		t.Error("idempotency-key reuse with a different amount must be non-retryable")
+	}
+	// Must not replay the old order as a success.
+	var pae *PartialAuthorizeError
+	if errors.As(err, &pae) {
+		t.Error("amount mismatch must not surface as a recoverable PartialAuthorizeError")
+	}
+	if fake.executeCalls != 0 {
+		t.Error("execute must NOT be called on an amount-mismatched replay")
+	}
+}
+
+// An amount mismatch on an order that is still incomplete (would otherwise be a
+// recoverable PartialAuthorizeError) is likewise rejected: replaying it through
+// CompleteCharge would execute the OLD order at the old amount.
+func TestGateway_Charge_RegisterDuplicate_AmountMismatch_Incomplete_IsRejected(t *testing.T) {
+	fake := &registerFailFincode{getStatus: StatusUnprocessed, getAmount: 1000}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(500), Token: strPtr("tok"), IdempotencyKey: "idem-reuse",
+	})
+	var pae *PartialAuthorizeError
+	if errors.As(err, &pae) {
+		t.Fatal("amount mismatch must not surface as a recoverable PartialAuthorizeError")
+	}
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) || ge.Code != port.ErrorCodeProcessingError {
+		t.Fatalf("expected non-retryable processing_error, got %T: %v", err, err)
+	}
+}
+
+// Reusing an IdempotencyKey with a matching amount but a different job code
+// (e.g. an AUTH order replayed under a CAPTURE charge) is also rejected.
+func TestGateway_Charge_RegisterDuplicate_JobCodeMismatch_IsRejected(t *testing.T) {
+	// Order was registered as AUTH; a Charge derives job_code CAPTURE.
+	fake := &registerFailFincode{getStatus: StatusAuthorized, getAmount: 1000, getJobCode: JobCodeAuth}
+	gw, cleanup := recoveryGateway(t, fake)
+	defer cleanup()
+
+	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), Token: strPtr("tok"), IdempotencyKey: "idem-reuse-job",
+	})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) {
+		t.Fatalf("expected *port.GatewayError, got %T: %v", err, err)
+	}
+	if ge.Code != port.ErrorCodeProcessingError || ge.Retryable {
+		t.Errorf("want non-retryable processing_error, got code=%q retryable=%v", ge.Code, ge.Retryable)
+	}
+	var pae *PartialAuthorizeError
+	if errors.As(err, &pae) {
+		t.Error("job-code mismatch must not surface as a recoverable PartialAuthorizeError")
+	}
+}
+
 // executeFailServer simulates a lost execute response: register succeeds,
 // execute always fails at the HTTP layer, and GET reports a configurable
 // (possibly already completed) state.
@@ -1073,7 +1169,7 @@ func executeFailServer(getStatus PaymentStatus) *httptest.Server {
 func TestGateway_Charge_ExecuteFailure_AlreadyCaptured_ReplaysSuccess(t *testing.T) {
 	srv := executeFailServer(StatusCaptured)
 	defer srv.Close()
-	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
+	gw := NewGateway(mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
 		WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
 
 	resp, err := gw.Charge(context.Background(), &port.ChargeRequest{
@@ -1093,7 +1189,7 @@ func TestGateway_Charge_ExecuteFailure_AlreadyCaptured_ReplaysSuccess(t *testing
 func TestGateway_Authorize_ExecuteFailure_AlreadyAuthorized_ReplaysSuccess(t *testing.T) {
 	srv := executeFailServer(StatusAuthorized)
 	defer srv.Close()
-	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
+	gw := NewGateway(mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
 		WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
 
 	resp, err := gw.Authorize(context.Background(), &port.AuthorizeRequest{
@@ -1114,7 +1210,7 @@ func TestGateway_Authorize_ExecuteFailure_AlreadyAuthorized_ReplaysSuccess(t *te
 func TestGateway_Charge_ExecuteFailure_Unprocessed_IsPartialAuthorizeError(t *testing.T) {
 	srv := executeFailServer(StatusUnprocessed)
 	defer srv.Close()
-	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
+	gw := NewGateway(mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL}),
 		WithClock(shared.FixedClock{FixedTime: gwFixedTime}))
 
 	_, err := gw.Charge(context.Background(), &port.ChargeRequest{
@@ -1217,6 +1313,29 @@ func TestGateway_Capture_PartialAmount_ChangesFirst(t *testing.T) {
 	}
 	if !fake.captureCalled {
 		t.Error("expected capture call after change")
+	}
+}
+
+// A capture amount above the authorized hold must be rejected before any
+// mutating call: fincode's /change would otherwise silently RAISE the hold and
+// over-charge. Mirrors the over-refund guard.
+func TestGateway_Capture_AmountExceedsAuthorized_IsRejected(t *testing.T) {
+	gw, fake, cleanup := setupGateway(t)
+	defer cleanup()
+	fake.currentStatus = StatusAuthorized
+	fake.currentTotal = 1000
+
+	amount := jpy(1500)
+	_, err := gw.Capture(context.Background(), &port.CaptureRequest{
+		AuthorizationID: "o_gw_order_001",
+		Amount:          &amount,
+	})
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+	if fake.changeCalled || fake.captureCalled {
+		t.Error("no mutating call (/change or /capture) should have been made on over-capture")
 	}
 }
 
@@ -1571,7 +1690,7 @@ func TestGateway_ErrorMapping_429IsRetryableRateLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}))
+	gw := NewGateway(mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL}))
 	_, err := gw.GetTransaction(context.Background(), "o1")
 	var ge *port.GatewayError
 	if !errors.As(err, &ge) {
@@ -1594,7 +1713,7 @@ func TestGateway_ErrorMapping_5xxIsRetryableUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	gw := NewGateway(NewClient(Config{APIKey: "sk", BaseURL: srv.URL}))
+	gw := NewGateway(mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL}))
 	_, err := gw.GetTransaction(context.Background(), "o1")
 	var ge *port.GatewayError
 	if !errors.As(err, &ge) {

@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -10,6 +11,11 @@ import (
 	"github.com/contract-to-cash/core/application/projection"
 	"github.com/contract-to-cash/core/domain/contract"
 	"github.com/contract-to-cash/core/eventstore"
+)
+
+const (
+	disableForeignKeyChecksSQL = `SET SESSION foreign_key_checks = 0`
+	enableForeignKeyChecksSQL  = `SET SESSION foreign_key_checks = 1`
 )
 
 // ContractProjectorName is the checkpoint key for the contract projector.
@@ -52,37 +58,94 @@ func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event)
 	return p.applyEvent(ctx, event)
 }
 
+// Rebuild truncates and repopulates the contract_read_models projection.
+//
+// MySQL has no deferrable constraints (postgres uses SET CONSTRAINTS ALL
+// DEFERRED here). The equivalent is to suspend foreign-key checks for the
+// truncate/reload so any FK referencing contract_read_models does not
+// transiently fail while the table is emptied and repopulated.
+//
+// foreign_key_checks is a SESSION variable and is NOT transactional: it must be
+// restored on the very same physical connection before that connection returns
+// to the pool, or every later write on that connection silently bypasses FK
+// enforcement. When Rebuild owns the connection (no ambient tx) it therefore
+// runs the whole rebuild on a dedicated *sql.Conn and, if the restore fails,
+// evicts that connection from the pool instead of handing it back poisoned.
 func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error {
-	if _, inTx := TxFromContext(ctx); !inTx {
-		sqlTx, err := p.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin rebuild tx: %w", err)
+	if _, inTx := TxFromContext(ctx); inTx {
+		// The caller owns the transaction and its connection; we cannot evict a
+		// connection we do not own, so restore on a best-effort basis. The
+		// restore is detached from ctx cancellation so a cancelled rebuild
+		// still attempts to re-enable checks.
+		q := querierFromContext(ctx, p.db)
+		if _, err := q.ExecContext(ctx, disableForeignKeyChecksSQL); err != nil {
+			return fmt.Errorf("disable fk checks: %w", err)
 		}
-		txCtx := ContextWithTx(ctx, sqlTx)
-		if err := p.rebuildInTx(txCtx, until); err != nil {
-			_ = sqlTx.Rollback()
-			return err
+		reloadErr := p.reloadReadModels(ctx, until)
+		if _, rErr := q.ExecContext(context.WithoutCancel(ctx), enableForeignKeyChecksSQL); rErr != nil && reloadErr == nil {
+			reloadErr = fmt.Errorf("restore fk checks: %w", rErr)
 		}
-		if err := sqlTx.Commit(); err != nil {
-			return fmt.Errorf("commit rebuild tx: %w", err)
-		}
-		return nil
+		return reloadErr
 	}
-	return p.rebuildInTx(ctx, until)
-}
 
-func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) error {
-	q := querierFromContext(ctx, p.db)
+	// Own the connection for the whole rebuild so the FK toggle and its restore
+	// happen on the same physical connection, and so a failed restore can evict
+	// the connection.
+	conn, err := p.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire rebuild conn: %w", err)
+	}
+	poisoned := false
+	defer func() {
+		if poisoned {
+			// The connection may still have foreign_key_checks = 0. Force the
+			// pool to discard it: returning driver.ErrBadConn from Raw marks the
+			// underlying connection bad so it is closed rather than reused.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}()
 
-	// MySQL has no deferrable constraints (postgres uses SET CONSTRAINTS ALL
-	// DEFERRED here). The equivalent is to suspend foreign-key checks for the
-	// truncate/reload so any FK referencing contract_read_models does not
-	// transiently fail while the table is emptied and repopulated. Scoped to
-	// this session (the rebuild tx) and restored immediately after.
-	if _, err := q.ExecContext(ctx, `SET SESSION foreign_key_checks = 0`); err != nil {
+	sqlTx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin rebuild tx: %w", err)
+	}
+
+	if _, err := sqlTx.ExecContext(ctx, disableForeignKeyChecksSQL); err != nil {
+		_ = sqlTx.Rollback()
 		return fmt.Errorf("disable fk checks: %w", err)
 	}
-	defer func() { _, _ = q.ExecContext(ctx, `SET SESSION foreign_key_checks = 1`) }()
+
+	reloadErr := p.reloadReadModels(ContextWithTx(ctx, sqlTx), until)
+
+	// Restore FK checks on the same connection before releasing it. Detach from
+	// ctx cancellation so a cancelled/timed-out rebuild still cleans up. If the
+	// restore itself fails the connection is unsafe to reuse, so mark it for
+	// eviction and roll back.
+	if _, rErr := sqlTx.ExecContext(context.WithoutCancel(ctx), enableForeignKeyChecksSQL); rErr != nil {
+		poisoned = true
+		_ = sqlTx.Rollback()
+		if reloadErr != nil {
+			return reloadErr
+		}
+		return fmt.Errorf("restore fk checks: %w", rErr)
+	}
+
+	if reloadErr != nil {
+		_ = sqlTx.Rollback()
+		return reloadErr
+	}
+	if err := sqlTx.Commit(); err != nil {
+		return fmt.Errorf("commit rebuild tx: %w", err)
+	}
+	return nil
+}
+
+// reloadReadModels empties contract_read_models and replays all events up to
+// until, rebuilding the projection. It assumes foreign-key checks have already
+// been suspended by the caller (see Rebuild) and runs on the ambient tx.
+func (p *ContractProjector) reloadReadModels(ctx context.Context, until time.Time) error {
+	q := querierFromContext(ctx, p.db)
 
 	if _, err := q.ExecContext(ctx, `DELETE FROM contract_read_models`); err != nil {
 		return fmt.Errorf("delete contract read models: %w", err)
@@ -94,6 +157,7 @@ func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) er
 	var fromPosition int64
 	var lastPosition int64
 	const batch = 1000
+scan:
 	for {
 		events, err := p.eventStore.LoadAll(ctx, fromPosition, batch)
 		if err != nil {
@@ -103,10 +167,21 @@ func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) er
 			break
 		}
 		for _, e := range events {
-			if !e.OccurredAt.After(until) {
-				if err := p.Project(ctx, e); err != nil {
-					return fmt.Errorf("project event %s: %w", e.ID, err)
-				}
+			// Stop the scan at the first event past `until`; the checkpoint
+			// stays at the last event actually projected. Continuing the scan
+			// while skipping would be unsafe when occurred_at and
+			// global_position disagree (clock skew / backdated events): a
+			// projected pre-`until` event at a higher position would advance
+			// the checkpoint past the skipped one, and the incremental
+			// Project (which resumes after the checkpoint) would never see it.
+			// Breaking is safe for the same reason — any pre-`until` events
+			// left unscanned are still after the checkpoint, so the next
+			// incremental run picks them up.
+			if e.OccurredAt.After(until) {
+				break scan
+			}
+			if err := p.Project(ctx, e); err != nil {
+				return fmt.Errorf("project event %s: %w", e.ID, err)
 			}
 			lastPosition = e.GlobalPosition
 		}
@@ -203,10 +278,18 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 		return err
 
 	case contract.EventTypeTrialEnded:
+		// The aggregate transitions to Active only when the trial converted;
+		// otherwise it is Cancelled (core domain/contract/aggregate.go). Reading
+		// the converted flag keeps the read model from showing "ghost active"
+		// rows for trials that lapsed without converting.
+		status := "cancelled"
+		if converted, _ := data["converted"].(bool); converted {
+			status = "active"
+		}
 		_, err := q.ExecContext(ctx,
 			`UPDATE contract_read_models
-			 SET status = 'active', trial_end_date = NULL, data = ?, version = ?, updated_at = NOW(6)
-			 WHERE id = ?`, raw, event.Version, contractID)
+			 SET status = ?, trial_end_date = NULL, data = ?, version = ?, updated_at = NOW(6)
+			 WHERE id = ?`, status, raw, event.Version, contractID)
 		return err
 
 	case contract.EventTypeContractRenewed:
@@ -221,6 +304,17 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 			 SET end_date = COALESCE(?, end_date), renewal_date = COALESCE(?, renewal_date),
 			     data = ?, version = ?, updated_at = NOW(6)
 			 WHERE id = ?`, newEnd, newEnd, raw, event.Version, contractID)
+		return err
+
+	case contract.EventTypePriceChanged:
+		// An immediate price change must move the read model's price_id to the
+		// new price so price-filtered queries stay accurate. NULLIF guards
+		// against clobbering the existing price_id with an empty payload value.
+		newPriceID, _ := data["new_price_id"].(string)
+		_, err := q.ExecContext(ctx,
+			`UPDATE contract_read_models
+			 SET price_id = COALESCE(NULLIF(?, ''), price_id), data = ?, version = ?, updated_at = NOW(6)
+			 WHERE id = ?`, newPriceID, raw, event.Version, contractID)
 		return err
 
 	default:

@@ -130,9 +130,18 @@ func (r *MySQLInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoice)
 		return fmt.Errorf("save invoice: %w", err)
 	}
 
+	// Close the current history row and open the new one at a single shared
+	// instant. MySQL's NOW(6) is evaluated per statement, so using it in both
+	// statements leaves a sub-microsecond gap in which the closed row's valid_to
+	// is already past but the new row's valid_from has not yet begun — a
+	// FindByIDAsOf at that instant would match neither. Binding one Go-computed
+	// timestamp to both closes the gap (postgres avoids it via a tx-stable
+	// NOW()).
+	histNow := time.Now().UTC()
+
 	if _, err := q.ExecContext(ctx,
-		`UPDATE invoice_history SET valid_to = NOW(6) WHERE id = ? AND valid_to IS NULL`,
-		string(s.ID)); err != nil {
+		`UPDATE invoice_history SET valid_to = ? WHERE id = ? AND valid_to IS NULL`,
+		histNow, string(s.ID)); err != nil {
 		return fmt.Errorf("close invoice history: %w", err)
 	}
 
@@ -143,16 +152,28 @@ func (r *MySQLInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoice)
 
 	if _, err := q.ExecContext(ctx,
 		`INSERT INTO invoice_history (id, version, snapshot, valid_from)
-		 VALUES (?, COALESCE((SELECT version FROM invoices WHERE id = ?), 1), ?, NOW(6))
-		 ON DUPLICATE KEY UPDATE snapshot = VALUES(snapshot), valid_from = NOW(6), valid_to = NULL`,
-		string(s.ID), string(s.ID), historySnapshot); err != nil {
+		 VALUES (?, COALESCE((SELECT version FROM invoices WHERE id = ?), 1), ?, ?)
+		 ON DUPLICATE KEY UPDATE snapshot = VALUES(snapshot), valid_from = VALUES(valid_from), valid_to = NULL`,
+		string(s.ID), string(s.ID), historySnapshot, histNow); err != nil {
 		return fmt.Errorf("insert invoice history: %w", err)
 	}
 	return nil
 }
 
 func (r *MySQLInvoiceRepository) FindByID(ctx context.Context, id shared.InvoiceID) (*invoice.Invoice, error) {
-	row := r.q(ctx).QueryRowContext(ctx, selectInvoiceSQL+` WHERE id = ?`, string(id))
+	// When invoked inside an ambient transaction (e.g. core's
+	// BillingService.FinalizeInvoice, which reads -> Finalize -> Save within one
+	// tx), take a row lock with SELECT ... FOR UPDATE. This serializes concurrent
+	// finalizers on the same invoice: the loser blocks until the winner commits,
+	// then reads the already-finalized row and is rejected by Finalize() with
+	// invalid_state_transition. Without the lock, both readers would see the draft
+	// row and both would finalize, double-firing OnInvoiceIssuedHook. Outside a
+	// transaction (pooled read) no lock is taken.
+	query := selectInvoiceSQL + ` WHERE id = ?`
+	if _, inTx := TxFromContext(ctx); inTx {
+		query += ` FOR UPDATE`
+	}
+	row := r.q(ctx).QueryRowContext(ctx, query, string(id))
 	return scanInvoiceRow(row, id)
 }
 
@@ -175,7 +196,11 @@ func (r *MySQLInvoiceRepository) FindByAccountID(ctx context.Context, accountID 
 }
 
 func (r *MySQLInvoiceRepository) FindOverdue(ctx context.Context) ([]*invoice.Invoice, error) {
-	rows, err := r.q(ctx).QueryContext(ctx, selectInvoiceSQL+` WHERE status = 'issued' AND due_date < NOW(6) ORDER BY due_date ASC`)
+	// Mirrors the core in-memory reference (infrastructure/inmemory/invoice_repository.go):
+	// (a) every invoice already marked 'overdue', regardless of due_date, and
+	// (b) 'issued' OR 'finalized' invoices whose due_date has passed.
+	rows, err := r.q(ctx).QueryContext(ctx,
+		selectInvoiceSQL+` WHERE status = 'overdue' OR (status IN ('issued', 'finalized') AND due_date < NOW(6)) ORDER BY due_date ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("find overdue invoices: %w", err)
 	}
@@ -238,7 +263,7 @@ func (r *MySQLInvoiceRepository) FindUnpaidByContract(ctx context.Context, contr
 	// MySQL has no NULLS LAST; emulate postgres' `due_date ASC NULLS LAST` with
 	// a leading `due_date IS NULL` sort key (NULLs collate last).
 	rows, err := r.q(ctx).QueryContext(ctx,
-		selectInvoiceSQL+` WHERE contract_id = ? AND status NOT IN ('paid', 'voided', 'cancelled') ORDER BY due_date IS NULL, due_date ASC`,
+		selectInvoiceSQL+` WHERE contract_id = ? AND status NOT IN ('paid', 'voided', 'refunded') ORDER BY due_date IS NULL, due_date ASC`,
 		string(contractID))
 	if err != nil {
 		return nil, fmt.Errorf("find unpaid invoices: %w", err)

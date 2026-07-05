@@ -30,6 +30,14 @@ func eventBody(id, eventType string) []byte {
 		id, eventType))
 }
 
+// refundEventBody builds an event whose data.object is a Refund with the given
+// status, mirroring the shape Stripe sends for refund.* / charge.refund.updated.
+func refundEventBody(id, eventType, status string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"id":%q,"object":"event","type":%q,"created":1700000000,"data":{"object":{"id":"re_1","object":"refund","status":%q}}}`,
+		id, eventType, status))
+}
+
 func newHandler(t *testing.T) *WebhookHandler {
 	t.Helper()
 	h, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret})
@@ -102,6 +110,44 @@ func TestWebhook_EventMapping(t *testing.T) {
 		if event.Type != want {
 			t.Errorf("%s → %q, want %q", stripeType, event.Type, want)
 		}
+	}
+}
+
+// TestWebhook_RefundStatusClassification verifies that async refund events are
+// classified from the embedded Refund object's status rather than being mapped
+// unconditionally to refund.succeeded (issue #13).
+func TestWebhook_RefundStatusClassification(t *testing.T) {
+	h := newHandler(t)
+	cases := []struct {
+		name      string
+		eventType string
+		status    string
+		want      port.WebhookEventType
+	}{
+		{"pending refund.created is not succeeded", "refund.created", "pending", port.WebhookEventType("refund.created")},
+		{"succeeded refund.created", "refund.created", "succeeded", port.WebhookEventRefundSucceeded},
+		{"failed refund.updated", "refund.updated", "failed", port.WebhookEventRefundFailed},
+		{"canceled refund.updated", "refund.updated", "canceled", port.WebhookEventRefundFailed},
+		{"succeeded refund.updated", "refund.updated", "succeeded", port.WebhookEventRefundSucceeded},
+		{"pending charge.refund.updated passthrough", "charge.refund.updated", "pending", port.WebhookEventType("charge.refund.updated")},
+		{"failed charge.refund.updated", "charge.refund.updated", "failed", port.WebhookEventRefundFailed},
+		{"requires_action refund.updated passthrough", "refund.updated", "requires_action", port.WebhookEventType("refund.updated")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := refundEventBody("evt_r", tc.eventType, tc.status)
+			sig := signStripe(testWebhookSecret, 1_700_000_000, body)
+			event, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+				Headers: map[string]string{"Stripe-Signature": sig},
+				Body:    body,
+			})
+			if err != nil {
+				t.Fatalf("ParseAndVerify: %v", err)
+			}
+			if event.Type != tc.want {
+				t.Errorf("%s/%s → %q, want %q", tc.eventType, tc.status, event.Type, tc.want)
+			}
+		})
 	}
 }
 

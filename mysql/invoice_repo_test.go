@@ -82,8 +82,10 @@ func TestInvoiceRepo_Save_Upsert(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(`UPDATE invoice_history SET valid_to = NOW\(6\) WHERE id = \? AND valid_to IS NULL`).
-		WithArgs("inv-1").
+	// Close and open the history rows at one shared timestamp (bound param),
+	// not two separate NOW(6) evaluations.
+	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
+		WithArgs(sqlmock.AnyArg(), "inv-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO invoice_history`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -115,6 +117,51 @@ func TestInvoiceRepo_FindByID_Found(t *testing.T) {
 	}
 }
 
+// Issue #12: inside an ambient transaction FindByID must take a row lock so
+// concurrent core FinalizeInvoice calls serialize (loser reads the finalized
+// row and is rejected). Verify the FOR UPDATE clause is emitted only in a tx.
+func TestInvoiceRepo_FindByID_ForUpdateInTx(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+
+	mock.ExpectBegin()
+	sqlTx, err := repo.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ctx := ContextWithTx(context.Background(), sqlTx)
+
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE id = \? FOR UPDATE`).
+		WithArgs("inv-1").
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindByID(ctx, "inv-1")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if got.ToSnapshot().ID != "inv-1" {
+		t.Errorf("unexpected invoice: %+v", got.ToSnapshot())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Outside a transaction (pooled read) no row lock is taken: the query must end
+// at the id predicate with no trailing FOR UPDATE.
+func TestInvoiceRepo_FindByID_NoLockOutsideTx(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	mock.ExpectQuery(`WHERE id = \?$`).
+		WithArgs("inv-1").
+		WillReturnRows(invoiceFindRow(t))
+
+	if _, err := repo.FindByID(context.Background(), "inv-1"); err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestInvoiceRepo_FindByID_NotFound(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	mock.ExpectQuery(`SELECT .* FROM invoices WHERE id = \?`).
@@ -140,6 +187,46 @@ func TestInvoiceRepo_FindByContractID(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ToSnapshot().ID != "inv-1" {
 		t.Fatalf("unexpected result: %+v", got)
+	}
+}
+
+// TestInvoiceRepo_FindOverdue asserts the query mirrors the core in-memory
+// reference predicate: overdue-marked invoices (any due_date) plus
+// issued/finalized invoices past their due date.
+func TestInvoiceRepo_FindOverdue(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE status = 'overdue' OR \(status IN \('issued', 'finalized'\) AND due_date < NOW\(6\)\) ORDER BY due_date ASC`).
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindOverdue(context.Background())
+	if err != nil {
+		t.Fatalf("FindOverdue: %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "inv-1" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestInvoiceRepo_FindUnpaidByContract asserts refunded invoices are excluded
+// from the unpaid set (parity with the core in-memory reference).
+func TestInvoiceRepo_FindUnpaidByContract(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE contract_id = \? AND status NOT IN \('paid', 'voided', 'refunded'\) ORDER BY due_date IS NULL, due_date ASC`).
+		WithArgs("contract-1").
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindUnpaidByContract(context.Background(), "contract-1")
+	if err != nil {
+		t.Fatalf("FindUnpaidByContract: %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "inv-1" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 

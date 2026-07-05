@@ -33,6 +33,14 @@ func (r *MySQLPriceRepository) q(ctx context.Context) Querier {
 	return querierFromContext(ctx, r.db)
 }
 
+// priceJSONState is the precise (big.Rat-backed) representation of a Price's
+// top-level amount. It is the source of truth on read; the amount BIGINT column
+// is written for query/indexing convenience only and is lossy (Money.Int64
+// truncates any fractional part). See issue #11.
+type priceJSONState struct {
+	Amount shared.Money `json:"amount"`
+}
+
 type pricingModelKind string
 
 const (
@@ -121,15 +129,20 @@ func (r *MySQLPriceRepository) Save(ctx context.Context, p *pricing.Price) error
 		return fmt.Errorf("marshal pricing model: %w", err)
 	}
 
+	jsonState, err := json.Marshal(priceJSONState{Amount: s.Amount})
+	if err != nil {
+		return fmt.Errorf("marshal price json state: %w", err)
+	}
+
 	_, err = r.q(ctx).ExecContext(ctx,
-		`INSERT INTO prices (id, product_id, amount, currency, billing_cycle, interval_data, pricing_model, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+		`INSERT INTO prices (id, product_id, amount, currency, billing_cycle, interval_data, pricing_model, status, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
 		 ON DUPLICATE KEY UPDATE
 		   amount = VALUES(amount), currency = VALUES(currency),
 		   interval_data = VALUES(interval_data), pricing_model = VALUES(pricing_model),
-		   status = VALUES(status), updated_at = NOW(6)`,
+		   status = VALUES(status), state = VALUES(state), updated_at = NOW(6)`,
 		string(s.ID), string(s.ProductID), s.Amount.Int64(), string(s.Currency),
-		"", intervalJSON, modelJSON, string(s.Status), s.CreatedAt.UTC())
+		"", intervalJSON, modelJSON, string(s.Status), jsonState, s.CreatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("save price: %w", err)
 	}
@@ -137,7 +150,7 @@ func (r *MySQLPriceRepository) Save(ctx context.Context, p *pricing.Price) error
 }
 
 const selectPriceSQL = `
-	SELECT id, product_id, amount, currency, interval_data, pricing_model, status, created_at
+	SELECT id, product_id, amount, currency, interval_data, pricing_model, status, created_at, state
 	FROM prices`
 
 func scanPriceRow(row *sql.Row, id shared.PriceID) (*pricing.Price, error) {
@@ -175,15 +188,26 @@ func scanPriceSnapshot(t scanTarget) (pricing.PriceSnapshot, error) {
 		currency, status              string
 		intervalJSON, pricingModelRaw json.RawMessage
 		createdAt                     utcTime
+		stateRaw                      []byte
 	)
-	if err := t.Scan(&id, &productID, &amount, &currency, &intervalJSON, &pricingModelRaw, &status, &createdAt); err != nil {
+	if err := t.Scan(&id, &productID, &amount, &currency, &intervalJSON, &pricingModelRaw, &status, &createdAt, &stateRaw); err != nil {
 		return pricing.PriceSnapshot{}, err
 	}
 
 	cur := shared.Currency(currency)
 	s.ID = shared.PriceID(id)
 	s.ProductID = shared.ProductID(productID)
-	s.Amount = moneyFromInt64(amount, cur)
+	// Prefer the precise state JSON; fall back to the lossy BIGINT column for
+	// rows written before the state column existed (issue #11).
+	if len(stateRaw) > 0 {
+		var js priceJSONState
+		if err := json.Unmarshal(stateRaw, &js); err != nil {
+			return pricing.PriceSnapshot{}, fmt.Errorf("unmarshal price json state: %w", err)
+		}
+		s.Amount = js.Amount
+	} else {
+		s.Amount = moneyFromInt64(amount, cur)
+	}
 	s.Currency = cur
 	s.Status = pricing.PriceStatus(status)
 	s.CreatedAt = createdAt.Time

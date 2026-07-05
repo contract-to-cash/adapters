@@ -209,6 +209,128 @@ func TestInvoiceRepo_FindByStatus(t *testing.T) {
 	}
 }
 
+// TestInvoiceRepo_FindOverdue verifies parity with the core in-memory
+// reference (infrastructure/inmemory/invoice_repository.go): overdue-marked
+// invoices are returned regardless of due_date, issued/finalized invoices past
+// their due date are returned, and everything else is excluded.
+func TestInvoiceRepo_FindOverdue(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	_, _ = pool.Exec(ctx, `INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-od', 'acc-od', 'active')`)
+
+	repo := postgres.NewInvoiceRepository(pool)
+
+	past := time.Now().Add(-48 * time.Hour)
+	future := time.Now().Add(48 * time.Hour)
+
+	saveInvoice := func(id string, status invoice.InvoiceStatus, due time.Time) {
+		t.Helper()
+		snap := invoice.InvoiceSnapshot{
+			ID: shared.InvoiceID(id), AccountID: "acc-od", ContractID: "c-od",
+			Status:   status,
+			Subtotal: jpy(0), TaxAmount: jpy(0), DiscountAmount: jpy(0),
+			Total: jpy(0), AppliedBalance: jpy(0), AmountDue: jpy(0),
+			PaidAmount: jpy(0), Balance: jpy(0),
+			DueDate: due,
+		}
+		inv, err := invoice.InvoiceFromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, inv); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	saveInvoice("od-issued-past", invoice.InvoiceStatusIssued, past)       // (b) included
+	saveInvoice("od-finalized-past", invoice.InvoiceStatusFinalized, past) // (b) included
+	saveInvoice("od-overdue-future", invoice.InvoiceStatusOverdue, future) // (a) included, due_date irrelevant
+	saveInvoice("od-issued-future", invoice.InvoiceStatusIssued, future)   // excluded: not yet due
+	saveInvoice("od-paid-past", invoice.InvoiceStatusPaid, past)           // excluded: paid
+	saveInvoice("od-draft-past", invoice.InvoiceStatusDraft, past)         // excluded: draft
+
+	got, err := repo.FindOverdue(ctx)
+	if err != nil {
+		t.Fatalf("FindOverdue: %v", err)
+	}
+
+	want := map[string]bool{
+		"od-issued-past":    true,
+		"od-finalized-past": true,
+		"od-overdue-future": true,
+	}
+	gotIDs := map[string]bool{}
+	for _, inv := range got {
+		gotIDs[string(inv.ToSnapshot().ID)] = true
+	}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("FindOverdue returned %v, want exactly %v", gotIDs, want)
+	}
+	for id := range want {
+		if !gotIDs[id] {
+			t.Errorf("FindOverdue missing expected invoice %s", id)
+		}
+	}
+}
+
+// TestInvoiceRepo_FindUnpaidByContract_ExcludesRefunded verifies refunded
+// invoices are not treated as unpaid (parity with the core in-memory
+// reference), while draft/finalized/issued/overdue/partial_paid are.
+func TestInvoiceRepo_FindUnpaidByContract_ExcludesRefunded(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	_, _ = pool.Exec(ctx, `INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-up', 'acc-up', 'active')`)
+
+	repo := postgres.NewInvoiceRepository(pool)
+
+	saveInvoice := func(id string, status invoice.InvoiceStatus) {
+		t.Helper()
+		snap := invoice.InvoiceSnapshot{
+			ID: shared.InvoiceID(id), AccountID: "acc-up", ContractID: "c-up",
+			Status:   status,
+			Subtotal: jpy(0), TaxAmount: jpy(0), DiscountAmount: jpy(0),
+			Total: jpy(0), AppliedBalance: jpy(0), AmountDue: jpy(0),
+			PaidAmount: jpy(0), Balance: jpy(0),
+		}
+		inv, err := invoice.InvoiceFromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, inv); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	saveInvoice("up-issued", invoice.InvoiceStatusIssued)       // unpaid -> included
+	saveInvoice("up-overdue", invoice.InvoiceStatusOverdue)     // unpaid -> included
+	saveInvoice("up-partial", invoice.InvoiceStatusPartialPaid) // unpaid -> included
+	saveInvoice("up-paid", invoice.InvoiceStatusPaid)           // excluded
+	saveInvoice("up-voided", invoice.InvoiceStatusVoided)       // excluded
+	saveInvoice("up-refunded", invoice.InvoiceStatusRefunded)   // excluded (the bug)
+
+	got, err := repo.FindUnpaidByContract(ctx, "c-up")
+	if err != nil {
+		t.Fatalf("FindUnpaidByContract: %v", err)
+	}
+
+	want := map[string]bool{"up-issued": true, "up-overdue": true, "up-partial": true}
+	gotIDs := map[string]bool{}
+	for _, inv := range got {
+		gotIDs[string(inv.ToSnapshot().ID)] = true
+	}
+	if gotIDs["up-refunded"] {
+		t.Errorf("FindUnpaidByContract returned refunded invoice up-refunded")
+	}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("FindUnpaidByContract returned %v, want exactly %v", gotIDs, want)
+	}
+	for id := range want {
+		if !gotIDs[id] {
+			t.Errorf("FindUnpaidByContract missing expected invoice %s", id)
+		}
+	}
+}
+
 // --- Payment Repository ---
 
 func TestPaymentRepo_SaveAndFindByID(t *testing.T) {

@@ -234,7 +234,7 @@ func (g *Gateway) registerAndExecute(ctx context.Context, jobCode JobCode, amoun
 		// reporting failure, so a payment that in fact succeeded is replayed
 		// as a success instead of being misreported as permanently failed.
 		if createReq.ID != "" {
-			if resp, resolveErr := g.resolveExistingOrder(ctx, createReq.ID, jobCode, err); resp != nil || resolveErr != nil {
+			if resp, resolveErr := g.resolveExistingOrder(ctx, createReq.ID, jobCode, amount, err); resp != nil || resolveErr != nil {
 				return resp, resolveErr
 			}
 		}
@@ -289,7 +289,16 @@ func successStatus(jobCode JobCode) PaymentStatus {
 //     be captured, so the outcome is unknown; reporting the original
 //     non-retryable register error here would misrecord a possibly-succeeded
 //     payment as permanently failed.
-func (g *Gateway) resolveExistingOrder(ctx context.Context, orderID string, jobCode JobCode, registerErr error) (*PaymentResponse, error) {
+//
+// amount is the amount of the CURRENT request. Because the order ID is derived
+// only from the idempotency key, reusing the same key for a different amount
+// (or a different job code) collides with a pre-existing order that was
+// registered for other parameters. Replaying that order would return the OLD
+// amount's outcome as a success (or execute the old order via CompleteCharge),
+// so a mismatch is rejected up front as a non-retryable processing error rather
+// than silently succeeding — matching Stripe, which refuses idempotency-key
+// reuse with different parameters.
+func (g *Gateway) resolveExistingOrder(ctx context.Context, orderID string, jobCode JobCode, amount int64, registerErr error) (*PaymentResponse, error) {
 	current, err := g.client.RetrievePayment(ctx, orderID, PayTypeCard)
 	if err != nil {
 		var he *HTTPError
@@ -301,6 +310,25 @@ func (g *Gateway) resolveExistingOrder(ctx context.Context, orderID string, jobC
 			Message:   fmt.Sprintf("fincode: payment state for order %s could not be verified after a duplicate-order register failure; retry to resolve", orderID),
 			Retryable: true,
 			RawError:  errors.Join(registerErr, err),
+		}
+	}
+	// Idempotency-key reuse guard: the derived order ID collided with an order
+	// registered for a different amount or job code. Neither replay nor
+	// recovery is safe, so fail non-retryably.
+	if existing := currentTotal(current); existing != amount {
+		return nil, &port.GatewayError{
+			Code:      port.ErrorCodeProcessingError,
+			Message:   fmt.Sprintf("fincode: idempotency key reused for order %s with a different amount (existing %d, requested %d)", orderID, existing, amount),
+			Retryable: false,
+			RawError:  registerErr,
+		}
+	}
+	if current.JobCode != "" && current.JobCode != jobCode {
+		return nil, &port.GatewayError{
+			Code:      port.ErrorCodeProcessingError,
+			Message:   fmt.Sprintf("fincode: idempotency key reused for order %s with a different job code (existing %s, requested %s)", orderID, current.JobCode, jobCode),
+			Retryable: false,
+			RawError:  registerErr,
 		}
 	}
 	if current.Status == successStatus(jobCode) {
@@ -370,7 +398,19 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 		if err != nil {
 			return nil, err
 		}
-		if amount != currentTotal(current) {
+		// Over-capture guard: fincode's /change endpoint would happily RAISE the
+		// authorized amount, so a caller bug passing an amount above the hold
+		// would silently increase it and over-charge. Reject it before mutating,
+		// mirroring the over-refund guard in Refund. A smaller amount is a valid
+		// partial capture and still routes through /change below.
+		authorized := currentTotal(current)
+		if amount > authorized {
+			return nil, &ValidationError{
+				Field:   "Amount",
+				Message: fmt.Sprintf("capture amount %d exceeds authorized total %d", amount, authorized),
+			}
+		}
+		if amount != authorized {
 			if _, err := g.client.ChangeAmount(ctx, req.AuthorizationID, &ChangeAmountRequest{
 				PayType:  PayTypeCard,
 				AccessID: current.AccessID,

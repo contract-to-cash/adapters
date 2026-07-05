@@ -148,7 +148,15 @@ func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, e
 			e.ID, streamID, string(e.Type), version, e.SchemaVersion,
 			normalizeJSON(e.Data), meta, e.OccurredAt.UTC(), recordedAt,
 		); err != nil {
-			if isDuplicateKey(err) {
+			// A 1062 duplicate-key can mean two very different things. Only a
+			// clash on uq_stream_version is a retryable optimistic-concurrency
+			// conflict; a clash on uq_event_id is a duplicate event ID (a
+			// caller/infra bug) and must NOT be reported as a version conflict,
+			// otherwise callers would retry an append that can never succeed.
+			if isDuplicateEventID(err) {
+				return duplicateEventID(e.ID, err)
+			}
+			if isStreamVersionConflict(err) {
 				return versionConflict(streamID, err)
 			}
 			return fmt.Errorf("event store: insert event %s: %w", e.ID, err)

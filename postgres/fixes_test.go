@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -313,5 +314,119 @@ func TestInvoiceProjector_RebuildAtomicOnFailure(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM invoice_read_models`).Scan(&count)
 	if count != 0 {
 		t.Errorf("expected 0 rows after rebuild, got %d", count)
+	}
+}
+
+// --- Issue #12: concurrent FinalizeInvoice must serialize via row lock ---
+//
+// Mirrors core's BillingService.FinalizeInvoice (read -> Finalize -> Save inside
+// one tx). Two transactions race to finalize the same draft invoice. Because
+// FindByID takes SELECT ... FOR UPDATE inside a tx, the loser blocks until the
+// winner commits, then reads the already-finalized row and is rejected by
+// Finalize() with invalid_state_transition. Exactly one may win — the substrate
+// guarantee that lets core fire OnInvoiceIssuedHook at most once per invoice.
+func TestInvoiceRepo_ConcurrentFinalize_OneLoserRejected(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-fin', 'acc-fin', 'active')`); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := postgres.NewInvoiceRepository(pool)
+	snap := invoice.InvoiceSnapshot{
+		ID: "inv-fin", InvoiceNumber: "INV-FIN",
+		AccountID: "acc-fin", ContractID: "c-fin",
+		Status:   invoice.InvoiceStatusDraft,
+		Subtotal: jpy(10000), TaxAmount: jpy(1000),
+		DiscountAmount: jpy(0), Total: jpy(11000),
+		AppliedBalance: jpy(0), AmountDue: jpy(11000),
+		PaidAmount: jpy(0), Balance: jpy(0),
+	}
+	draft, err := invoice.InvoiceFromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("InvoiceFromSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, draft); err != nil {
+		t.Fatalf("Save draft: %v", err)
+	}
+
+	// finalizeInTx reproduces FinalizeInvoice's tx body against the adapter.
+	// afterRead (if non-nil) runs after FindByID but before Finalize/Save, so
+	// the caller can hold an open transaction while the other racer reads.
+	finalizeInTx := func(afterRead func()) error {
+		pgxTx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		txCtx := postgres.ContextWithTx(ctx, pgxTx)
+		loaded, err := repo.FindByID(txCtx, "inv-fin") // SELECT ... FOR UPDATE
+		if err != nil {
+			_ = pgxTx.Rollback(ctx)
+			return err
+		}
+		if afterRead != nil {
+			afterRead()
+		}
+		if err := loaded.Finalize(); err != nil {
+			_ = pgxTx.Rollback(ctx)
+			return err
+		}
+		if err := repo.Save(txCtx, loaded); err != nil {
+			_ = pgxTx.Rollback(ctx)
+			return err
+		}
+		return pgxTx.Commit(ctx)
+	}
+
+	// Deterministically force the race: goroutine A reads (taking the row lock
+	// under the fix), signals aRead, then lingers before writing. Goroutine B
+	// waits for aRead, then runs its full tx. Under the FOR UPDATE fix, B's
+	// FindByID blocks until A commits and then sees the finalized row (rejected).
+	// Under the old last-writer-wins upsert, B reads the still-draft row
+	// concurrently and both would finalize — which this assertion catches.
+	var (
+		wg    sync.WaitGroup
+		aRead = make(chan struct{})
+		errs  [2]error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errs[0] = finalizeInTx(func() {
+			close(aRead)
+			time.Sleep(300 * time.Millisecond)
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		<-aRead
+		errs[1] = finalizeInTx(nil)
+	}()
+	wg.Wait()
+
+	successes, rejected := 0, 0
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			successes++
+		case isDomainError(e, shared.ErrCodeInvalidStateTransition):
+			rejected++
+		default:
+			t.Fatalf("unexpected finalize error: %v", e)
+		}
+	}
+	if successes != 1 || rejected != 1 {
+		t.Fatalf("expected exactly one success and one invalid_state_transition, got %d success / %d rejected", successes, rejected)
+	}
+
+	// The persisted invoice must be finalized exactly once.
+	final, err := repo.FindByID(ctx, "inv-fin")
+	if err != nil {
+		t.Fatalf("FindByID after race: %v", err)
+	}
+	if final.ToSnapshot().Status != invoice.InvoiceStatusFinalized {
+		t.Errorf("final status = %q, want finalized", final.ToSnapshot().Status)
 	}
 }
