@@ -10,9 +10,45 @@
 -- approximations. Existing rows have a NULL `state` and fall back to the BIGINT
 -- columns on read, so this change is backward compatible.
 --
--- Note: MySQL 8.0 does not support ADD COLUMN IF NOT EXISTS; apply this
--- migration exactly once (mirrors postgres/migrations/007_money_state.up.sql).
+-- MySQL 8.0 has no ADD COLUMN IF NOT EXISTS, so each add is guarded by an
+-- information_schema lookup executed through a prepared statement (a no-op
+-- 'SELECT 1' when the column already exists). This mirrors the guard style of
+-- migrations 005 and 008 and makes the file idempotent, so re-applying it (e.g.
+-- a test harness that reuses a database) converges instead of failing with
+-- ER_DUP_FIELDNAME (1060).
 
-ALTER TABLE balance_entries ADD COLUMN state JSON NULL;
-ALTER TABLE payments        ADD COLUMN state JSON NULL;
-ALTER TABLE prices          ADD COLUMN state JSON NULL;
+SET @stmt := IF(
+    NOT EXISTS(
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'balance_entries'
+          AND column_name = 'state'),
+    'ALTER TABLE balance_entries ADD COLUMN state JSON NULL',
+    'SELECT 1');
+PREPARE migration_stmt FROM @stmt;
+EXECUTE migration_stmt;
+DEALLOCATE PREPARE migration_stmt;
+
+SET @stmt := IF(
+    NOT EXISTS(
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'payments'
+          AND column_name = 'state'),
+    'ALTER TABLE payments ADD COLUMN state JSON NULL',
+    'SELECT 1');
+PREPARE migration_stmt FROM @stmt;
+EXECUTE migration_stmt;
+DEALLOCATE PREPARE migration_stmt;
+
+SET @stmt := IF(
+    NOT EXISTS(
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'prices'
+          AND column_name = 'state'),
+    'ALTER TABLE prices ADD COLUMN state JSON NULL',
+    'SELECT 1');
+PREPARE migration_stmt FROM @stmt;
+EXECUTE migration_stmt;
+DEALLOCATE PREPARE migration_stmt;
