@@ -130,9 +130,18 @@ func (r *MySQLInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoice)
 		return fmt.Errorf("save invoice: %w", err)
 	}
 
+	// Close the current history row and open the new one at a single shared
+	// instant. MySQL's NOW(6) is evaluated per statement, so using it in both
+	// statements leaves a sub-microsecond gap in which the closed row's valid_to
+	// is already past but the new row's valid_from has not yet begun — a
+	// FindByIDAsOf at that instant would match neither. Binding one Go-computed
+	// timestamp to both closes the gap (postgres avoids it via a tx-stable
+	// NOW()).
+	histNow := time.Now().UTC()
+
 	if _, err := q.ExecContext(ctx,
-		`UPDATE invoice_history SET valid_to = NOW(6) WHERE id = ? AND valid_to IS NULL`,
-		string(s.ID)); err != nil {
+		`UPDATE invoice_history SET valid_to = ? WHERE id = ? AND valid_to IS NULL`,
+		histNow, string(s.ID)); err != nil {
 		return fmt.Errorf("close invoice history: %w", err)
 	}
 
@@ -143,9 +152,9 @@ func (r *MySQLInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoice)
 
 	if _, err := q.ExecContext(ctx,
 		`INSERT INTO invoice_history (id, version, snapshot, valid_from)
-		 VALUES (?, COALESCE((SELECT version FROM invoices WHERE id = ?), 1), ?, NOW(6))
-		 ON DUPLICATE KEY UPDATE snapshot = VALUES(snapshot), valid_from = NOW(6), valid_to = NULL`,
-		string(s.ID), string(s.ID), historySnapshot); err != nil {
+		 VALUES (?, COALESCE((SELECT version FROM invoices WHERE id = ?), 1), ?, ?)
+		 ON DUPLICATE KEY UPDATE snapshot = VALUES(snapshot), valid_from = VALUES(valid_from), valid_to = NULL`,
+		string(s.ID), string(s.ID), historySnapshot, histNow); err != nil {
 		return fmt.Errorf("insert invoice history: %w", err)
 	}
 	return nil

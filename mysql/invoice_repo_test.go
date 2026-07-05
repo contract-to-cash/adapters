@@ -82,8 +82,10 @@ func TestInvoiceRepo_Save_Upsert(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(`UPDATE invoice_history SET valid_to = NOW\(6\) WHERE id = \? AND valid_to IS NULL`).
-		WithArgs("inv-1").
+	// Close and open the history rows at one shared timestamp (bound param),
+	// not two separate NOW(6) evaluations.
+	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
+		WithArgs(sqlmock.AnyArg(), "inv-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO invoice_history`).
 		WillReturnResult(sqlmock.NewResult(1, 1))

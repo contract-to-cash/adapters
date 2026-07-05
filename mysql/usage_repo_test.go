@@ -8,6 +8,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/domain/usage"
+	driver "github.com/go-sql-driver/mysql"
 )
 
 func newUsageRepo(t *testing.T) (*MySQLUsageRepository, sqlmock.Sqlmock) {
@@ -36,17 +37,57 @@ func sampleUsageRecord(t *testing.T) *usage.UsageRecord {
 	return rec
 }
 
-func TestUsageRepo_Record_Idempotent(t *testing.T) {
+func TestUsageRepo_Record(t *testing.T) {
 	repo, mock := newUsageRepo(t)
 	rec := sampleUsageRecord(t)
 
 	idem := "idem-ur-1"
-	mock.ExpectExec(`INSERT INTO usage_records .* ON DUPLICATE KEY UPDATE id = id`).
+	mock.ExpectExec(`INSERT INTO usage_records`).
 		WithArgs("ur-1", "contract-1", "api_calls", int64(100), fixedTime, &idem, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Record(context.Background(), rec); err != nil {
 		t.Fatalf("Record: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A duplicate idempotency_key is an idempotent no-op (mirrors postgres'
+// ON CONFLICT (idempotency_key) DO NOTHING): Record must swallow it.
+func TestUsageRepo_Record_DuplicateIdempotencyKeyIsNoOp(t *testing.T) {
+	repo, mock := newUsageRepo(t)
+	rec := sampleUsageRecord(t)
+
+	mock.ExpectExec(`INSERT INTO usage_records`).
+		WillReturnError(&driver.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry 'idem-ur-1' for key 'usage_records.idempotency_key'",
+		})
+
+	if err := repo.Record(context.Background(), rec); err != nil {
+		t.Fatalf("Record duplicate idempotency key should be a no-op, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A duplicate PRIMARY KEY (id) is NOT idempotent — it signals a real bug and
+// must surface rather than be silently swallowed.
+func TestUsageRepo_Record_DuplicateIDSurfaces(t *testing.T) {
+	repo, mock := newUsageRepo(t)
+	rec := sampleUsageRecord(t)
+
+	mock.ExpectExec(`INSERT INTO usage_records`).
+		WillReturnError(&driver.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry 'ur-1' for key 'usage_records.PRIMARY'",
+		})
+
+	if err := repo.Record(context.Background(), rec); err == nil {
+		t.Fatal("expected duplicate id to surface as an error, got nil")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

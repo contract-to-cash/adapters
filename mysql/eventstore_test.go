@@ -142,13 +142,53 @@ func TestEventStore_Append_DuplicateKeyMapsToVersionConflict(t *testing.T) {
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
 	// A concurrent append won the (stream_id, version) race: the INSERT trips
-	// the UNIQUE constraint with MySQL error 1062.
+	// the uq_stream_version UNIQUE constraint with MySQL error 1062. MySQL
+	// names the offending key in the message, which is how we classify it.
 	mock.ExpectExec(`INSERT INTO events`).
-		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry"})
+		WillReturnError(&driver.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry 'contract-1-1' for key 'events.uq_stream_version'",
+		})
 	mock.ExpectRollback()
 
 	err := store.Append(context.Background(), "contract-1", events, 0)
 	assertVersionConflict(t, err)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A 1062 on uq_event_id means the same event ID was written twice — an
+// infrastructure/caller bug, not a losable optimistic race. It must surface as
+// a non-retryable conflict, never as version_conflict (regression for the bug
+// where every 1062 was blindly mapped to version_conflict).
+func TestEventStore_Append_DuplicateEventIDIsNotVersionConflict(t *testing.T) {
+	store, mock := newTestStore(t)
+	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	mock.ExpectExec(`INSERT INTO events`).
+		WillReturnError(&driver.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry 'e1' for key 'events.uq_event_id'",
+		})
+	mock.ExpectRollback()
+
+	err := store.Append(context.Background(), "contract-1", events, 0)
+
+	var de *shared.DomainError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *shared.DomainError, got %v", err)
+	}
+	if de.Code == shared.ErrCodeVersionConflict {
+		t.Fatalf("duplicate event ID must not be version_conflict, got %v", err)
+	}
+	if de.Code != shared.ErrCodeConflict {
+		t.Fatalf("expected conflict DomainError, got code %q (%v)", de.Code, err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}

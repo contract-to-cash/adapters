@@ -188,9 +188,14 @@ verification level differs:
   CI, which runs a `postgres:16` service container).
 - **mysql**: unit tests with [`go-sqlmock`](https://github.com/DATA-DOG/go-sqlmock)
   so SQL, argument binding, transaction boundaries, and error mapping are verified
-  deterministically without a running database (`go test ./mysql/... -race`) —
-  but no real MySQL server is exercised. Integration tests against a real
-  MySQL (docker / testcontainers) are a recommended follow-up.
+  deterministically without a running database (`go test ./mysql/... -race`),
+  **plus** integration tests against a real MySQL 8 (migrations, event-store
+  append/load/version-conflict + duplicate-event-id semantics, projector rebuild,
+  and repository round-trips). Like postgres, the integration suite self-skips
+  without a reachable database; setting `ADAPTERS_TEST_MYSQL_DSN` makes an
+  unreachable database a hard failure (used in CI, which runs a `mysql:8` service
+  container). The DSN should enable `multiStatements=true` (to apply the
+  multi-statement migration files) and `parseTime=true&loc=UTC`.
 - **fincode**: `httptest`-based unit tests against a fake fincode server
   (no live API calls).
 - **stripe**: `httptest`-based unit tests against a fake Stripe API, with the

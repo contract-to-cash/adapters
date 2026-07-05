@@ -39,15 +39,23 @@ func (r *MySQLUsageRepository) Record(ctx context.Context, rec *usage.UsageRecor
 		idempotencyKey = &s.IdempotencyKey
 	}
 
-	// Idempotent insert: a duplicate idempotency_key is a no-op (the existing
-	// row wins), mirroring postgres' ON CONFLICT (idempotency_key) DO NOTHING.
+	// Idempotent insert scoped to idempotency_key only. A blanket
+	// `ON DUPLICATE KEY UPDATE id = id` would also swallow a PRIMARY KEY (id)
+	// collision, hiding a genuine bug (ULID ids never collide by chance). Like
+	// postgres' `ON CONFLICT (idempotency_key) DO NOTHING`, we want a duplicate
+	// idempotency_key to be a no-op but any other duplicate — notably a
+	// duplicate id — to surface. MySQL cannot scope ON DUPLICATE KEY to a single
+	// index, so we attempt a plain insert and treat only a 1062 on the
+	// idempotency_key index as the idempotent no-op.
 	_, err = r.q(ctx).ExecContext(ctx,
 		`INSERT INTO usage_records (id, contract_id, metric, quantity, timestamp, idempotency_key, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON DUPLICATE KEY UPDATE id = id`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		string(s.ID), string(s.ContractID), string(s.MetricName),
 		s.Quantity, s.Timestamp.UTC(), idempotencyKey, metadata)
 	if err != nil {
+		if dupEntryOnKey(err, "idempotency_key") {
+			return nil
+		}
 		return fmt.Errorf("record usage: %w", err)
 	}
 	return nil

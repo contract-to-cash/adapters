@@ -74,3 +74,37 @@ jobs:
 
       - name: Integration tests
         run: go test ./postgres/... -race -count=1
+
+  mysql-integration:
+    name: mysql integration tests
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_USER: adapters_test
+          MYSQL_PASSWORD: adapters_test
+          MYSQL_DATABASE: adapters_test
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # multiStatements lets the migration files (multiple DDL statements each)
+      # apply in a single Exec; parseTime + loc=UTC keep DATETIME(6) round-trips
+      # in UTC. When this DSN is set explicitly, mysqltest.NewDB hard-fails
+      # rather than skipping, so a broken database turns CI red.
+      ADAPTERS_TEST_MYSQL_DSN: adapters_test:adapters_test@tcp(127.0.0.1:3306)/adapters_test?parseTime=true&loc=UTC&multiStatements=true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Integration tests
+        run: go test ./mysql/... -race -count=1
