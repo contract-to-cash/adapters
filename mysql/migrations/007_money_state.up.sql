@@ -11,7 +11,7 @@
 -- columns on read, so this change is backward compatible.
 --
 -- Note: MySQL 8.0 does not support ADD COLUMN IF NOT EXISTS; apply this
--- migration exactly once (mirrors postgres/migrations/006_money_state.up.sql).
+-- migration exactly once (mirrors postgres/migrations/007_money_state.up.sql).
 
 ALTER TABLE balance_entries ADD COLUMN state JSON NULL;
 ALTER TABLE payments        ADD COLUMN state JSON NULL;
