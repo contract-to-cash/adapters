@@ -44,9 +44,9 @@ func samplePrice(t *testing.T) *pricing.Price {
 }
 
 func priceRow() *sqlmock.Rows {
-	return sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at"}).
+	return sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state"}).
 		AddRow("price-1", "prod-1", int64(1000), "JPY",
-			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"1000","currency":"JPY"}}}`), "active", fixedTime)
+			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"1000","currency":"JPY"}}}`), "active", fixedTime, nil)
 }
 
 func TestPriceRepo_Save_Upsert(t *testing.T) {
@@ -55,7 +55,7 @@ func TestPriceRepo_Save_Upsert(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO prices .* ON DUPLICATE KEY UPDATE`).
 		WithArgs("price-1", "prod-1", int64(1000), "JPY", "",
-			sqlmock.AnyArg(), sqlmock.AnyArg(), "active", fixedTime).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), "active", sqlmock.AnyArg(), fixedTime).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), p); err != nil {

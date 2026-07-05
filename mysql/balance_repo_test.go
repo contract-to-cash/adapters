@@ -50,10 +50,10 @@ func loadedBalanceEntry(t *testing.T, version int) *balance.BalanceEntry {
 func balanceFindRow() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "original_amount", "remaining_amount", "currency",
-		"reason", "source_type", "source_id", "description", "expires_at", "version", "created_at",
+		"reason", "source_type", "source_id", "description", "expires_at", "version", "created_at", "state",
 	}).AddRow(
 		"bal-1", "acct-1", int64(1000), int64(1000), "JPY",
-		"proration", "", "", "", nil, 0, fixedTime,
+		"proration", "", "", "", nil, 0, fixedTime, nil,
 	)
 }
 
@@ -64,7 +64,7 @@ func TestBalanceRepo_Save_Insert(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO balance_entries`).
 		WithArgs(string(s.ID), "acct-1", int64(1000), int64(1000), "JPY",
-			"proration", "", "", "", nil, s.Version, fixedTime).
+			"proration", "", "", "", nil, s.Version, fixedTime, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), e); err != nil {
@@ -82,7 +82,7 @@ func TestBalanceRepo_Save_Update(t *testing.T) {
 
 	mock.ExpectExec(`UPDATE balance_entries SET .* WHERE id = \? AND version = \?`).
 		WithArgs(int64(1000), int64(1000), "JPY", "proration", "", "", "", nil,
-			s.Version, "bal-1", 3).
+			s.Version, sqlmock.AnyArg(), "bal-1", 3).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := repo.Save(context.Background(), e); err != nil {
@@ -141,7 +141,7 @@ func TestBalanceRepo_FindByID_NotFound(t *testing.T) {
 
 func TestBalanceRepo_FindAvailable(t *testing.T) {
 	repo, mock := newBalanceRepo(t)
-	mock.ExpectQuery(`SELECT .* FROM balance_entries WHERE account_id = \? AND currency = \? AND remaining_amount > 0 AND \(expires_at IS NULL OR expires_at > NOW\(6\)\) ORDER BY created_at ASC`).
+	mock.ExpectQuery(`SELECT .* FROM balance_entries WHERE account_id = \? AND currency = \? AND \(expires_at IS NULL OR expires_at > NOW\(6\)\) ORDER BY created_at ASC`).
 		WithArgs("acct-1", "JPY").
 		WillReturnRows(balanceFindRow())
 
