@@ -137,8 +137,11 @@ func TestContractProjector_Project_PriceChanged(t *testing.T) {
 }
 
 // Rebuild(until) must checkpoint at the position of the last event it actually
-// projected, not the last event it scanned. Events after `until` are skipped and
-// must stay behind the checkpoint so a later incremental Project reprocesses them.
+// projected and stop scanning at the first event past `until`. Skipped events
+// must stay behind the checkpoint so a later incremental Project reprocesses
+// them; scanning past the first skip would be unsafe under clock skew (a
+// projected pre-`until` event at a higher position would advance the checkpoint
+// past the skipped one, losing it forever).
 func TestContractProjector_Rebuild_CheckpointStopsAtUntil(t *testing.T) {
 	proj, mock := newContractProjector(t)
 
@@ -153,27 +156,28 @@ func TestContractProjector_Rebuild_CheckpointStopsAtUntil(t *testing.T) {
 	mock.ExpectExec(`DELETE FROM contract_read_models`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM projection_checkpoints`).WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// Batch 1: event at gp=1 is on/before `until` (projected); event at gp=2 is
-	// after `until` (skipped).
+	// Single batch: gp=1 is on/before `until` (projected); gp=2 is after `until`
+	// and stops the scan; gp=3 is a backdated pre-`until` event (clock skew)
+	// that must NOT be projected now — it stays after the checkpoint for the
+	// next incremental run.
 	rows := sqlmock.NewRows(cols).
 		AddRow("evt-1", "contract-1", "contract.created", 1, 1,
 			[]byte(`{"account_id":"a","price_id":"p","created_at":"2026-06-01T00:00:00Z"}`),
 			[]byte(``), until.Add(-time.Hour), until.Add(-time.Hour), int64(1)).
 		AddRow("evt-2", "contract-1", "contract.suspended", 2, 1,
-			[]byte(`{}`), []byte(``), until.Add(time.Hour), until.Add(time.Hour), int64(2))
+			[]byte(`{}`), []byte(``), until.Add(time.Hour), until.Add(time.Hour), int64(2)).
+		AddRow("evt-3", "contract-1", "contract.resumed", 3, 1,
+			[]byte(`{}`), []byte(``), until.Add(-time.Minute), until.Add(-time.Minute), int64(3))
 	mock.ExpectQuery(`SELECT .* FROM events WHERE global_position > \?`).
 		WithArgs(int64(0), 1000).WillReturnRows(rows)
 
-	// Only the projected event (created) hits the read model.
+	// Only the projected event (created) hits the read model. The scan breaks
+	// at evt-2, so no further LoadAll batch is issued and evt-3 is not applied.
 	mock.ExpectExec(`INSERT INTO contract_read_models`).
 		WithArgs("contract-1", "a", sqlmock.AnyArg(), "p", sqlmock.AnyArg(), 1).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	// Batch 2: no more events past gp=2.
-	mock.ExpectQuery(`SELECT .* FROM events WHERE global_position > \?`).
-		WithArgs(int64(2), 1000).WillReturnRows(sqlmock.NewRows(cols))
-
-	// Checkpoint saved at gp=1 (the last projected event), NOT gp=2 (scanned/skipped).
+	// Checkpoint saved at gp=1 (the last projected event), NOT gp=2 or gp=3.
 	mock.ExpectExec(`INSERT INTO projection_checkpoints`).
 		WithArgs(ContractProjectorName, int64(1), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))

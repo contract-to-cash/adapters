@@ -68,6 +68,7 @@ func (p *InvoiceProjector) rebuildInTx(ctx context.Context, until time.Time) err
 	var fromPosition int64
 	var lastPosition int64
 	const batch = 1000
+scan:
 	for {
 		events, err := p.eventStore.LoadAll(ctx, fromPosition, batch)
 		if err != nil {
@@ -77,17 +78,23 @@ func (p *InvoiceProjector) rebuildInTx(ctx context.Context, until time.Time) err
 			break
 		}
 		for _, e := range events {
-			if !e.OccurredAt.After(until) {
-				if err := p.Project(ctx, e); err != nil {
-					return fmt.Errorf("project event %s: %w", e.ID, err)
-				}
-				// Only advance the checkpoint for events actually projected.
-				// Events after `until` are skipped here and must remain
-				// unprocessed so a later incremental Project (resuming from this
-				// checkpoint) picks them up. Tracking the last *scanned* position
-				// instead would leave those skipped events permanently unprojected.
-				lastPosition = e.GlobalPosition
+			// Stop the scan at the first event past `until`; the checkpoint
+			// stays at the last event actually projected. Continuing the scan
+			// while skipping would be unsafe when occurred_at and
+			// global_position disagree (clock skew / backdated events): a
+			// projected pre-`until` event at a higher position would advance
+			// the checkpoint past the skipped one, and the incremental
+			// Project (which resumes after the checkpoint) would never see it.
+			// Breaking is safe for the same reason — any pre-`until` events
+			// left unscanned are still after the checkpoint, so the next
+			// incremental run picks them up.
+			if e.OccurredAt.After(until) {
+				break scan
 			}
+			if err := p.Project(ctx, e); err != nil {
+				return fmt.Errorf("project event %s: %w", e.ID, err)
+			}
+			lastPosition = e.GlobalPosition
 		}
 		newPos := events[len(events)-1].GlobalPosition
 		if newPos == fromPosition {
