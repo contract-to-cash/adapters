@@ -40,13 +40,16 @@ func samplePayment(t *testing.T) *payment.Payment {
 	return p
 }
 
+// paymentColumns is the SELECT column set (order matters for sqlmock rows).
+var paymentColumns = []string{
+	"id", "invoice_id", "idempotency_key", "amount", "refunded_amount", "currency",
+	"status", "method", "gateway_transaction_id", "failure_reason", "processed_at", "metadata", "state",
+}
+
 func paymentFindRow() *sqlmock.Rows {
-	return sqlmock.NewRows([]string{
-		"id", "invoice_id", "idempotency_key", "amount", "refunded_amount", "currency",
-		"status", "method", "gateway_transaction_id", "failure_reason", "processed_at", "metadata",
-	}).AddRow(
+	return sqlmock.NewRows(paymentColumns).AddRow(
 		"pay-1", "inv-1", "idem-pay-1", int64(1100), int64(0), "JPY",
-		"completed", "credit_card", "txn-1", "", fixedTime, []byte(`{}`),
+		"completed", "credit_card", "txn-1", "", fixedTime, []byte(`{}`), nil,
 	)
 }
 
@@ -57,7 +60,7 @@ func TestPaymentRepo_Save_Upsert(t *testing.T) {
 	idem := "idem-pay-1"
 	mock.ExpectExec(`INSERT INTO payments .* ON DUPLICATE KEY UPDATE`).
 		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
-			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), p); err != nil {

@@ -2,9 +2,9 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"time"
 
 	"github.com/contract-to-cash/core/application/tx"
@@ -13,6 +13,16 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// balanceEntryJSONState is the precise (big.Rat-backed) representation of a
+// BalanceEntry's monetary fields. It is the source of truth on read; the
+// original_amount / remaining_amount BIGINT columns are written for
+// query/indexing convenience only and are lossy (Money.Int64 truncates any
+// fractional part). See issue #11.
+type balanceEntryJSONState struct {
+	OriginalAmount  shared.Money `json:"original_amount"`
+	RemainingAmount shared.Money `json:"remaining_amount"`
+}
 
 type PostgresBalanceRepository struct {
 	pool *pgxpool.Pool
@@ -33,16 +43,24 @@ func (r *PostgresBalanceRepository) Save(ctx context.Context, entry *balance.Bal
 	loaded := entry.LoadedVersion()
 	q := r.q(ctx)
 
+	jsonState, err := json.Marshal(balanceEntryJSONState{
+		OriginalAmount:  s.OriginalAmount,
+		RemainingAmount: s.RemainingAmount,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal balance entry json state: %w", err)
+	}
+
 	if loaded == 0 {
 		_, err := q.Exec(ctx,
 			`INSERT INTO balance_entries (id, account_id, original_amount, remaining_amount, currency,
-				reason, source_type, source_id, description, expires_at, version, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+				reason, source_type, source_id, description, expires_at, version, created_at, state)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 			string(s.ID), string(s.AccountID),
 			s.OriginalAmount.Int64(), s.RemainingAmount.Int64(),
 			string(s.OriginalAmount.Currency()),
 			string(s.Reason), string(s.SourceType), s.SourceID, s.Description,
-			s.ExpiresAt, s.Version, s.CreatedAt)
+			s.ExpiresAt, s.Version, s.CreatedAt, jsonState)
 		if err != nil {
 			return fmt.Errorf("insert balance entry: %w", err)
 		}
@@ -54,13 +72,13 @@ func (r *PostgresBalanceRepository) Save(ctx context.Context, entry *balance.Bal
 		`UPDATE balance_entries SET
 			original_amount = $2, remaining_amount = $3, currency = $4,
 			reason = $5, source_type = $6, source_id = $7,
-			description = $8, expires_at = $9, version = $10
-		 WHERE id = $1 AND version = $11`,
+			description = $8, expires_at = $9, version = $10, state = $11
+		 WHERE id = $1 AND version = $12`,
 		string(s.ID),
 		s.OriginalAmount.Int64(), s.RemainingAmount.Int64(),
 		string(s.OriginalAmount.Currency()),
 		string(s.Reason), string(s.SourceType), s.SourceID, s.Description,
-		s.ExpiresAt, s.Version, loaded)
+		s.ExpiresAt, s.Version, jsonState, loaded)
 	if err != nil {
 		return fmt.Errorf("update balance entry: %w", err)
 	}
@@ -85,9 +103,13 @@ func (r *PostgresBalanceRepository) FindByID(ctx context.Context, id shared.Bala
 }
 
 func (r *PostgresBalanceRepository) FindAvailable(ctx context.Context, accountID shared.AccountID, currency shared.Currency) ([]*balance.BalanceEntry, error) {
+	// Availability is decided on the precise remaining amount (from the state
+	// JSON), not the lossy BIGINT column: a sub-unit remainder (e.g. 0.75)
+	// must still be considered available. The BIGINT remaining_amount is
+	// write-only and no longer filtered on here. See issue #11.
 	rows, err := r.q(ctx).Query(ctx,
 		selectBalanceEntrySQL+`
-		 WHERE account_id = $1 AND currency = $2 AND remaining_amount > 0
+		 WHERE account_id = $1 AND currency = $2
 		   AND (expires_at IS NULL OR expires_at > NOW())
 		 ORDER BY created_at ASC`,
 		string(accountID), string(currency))
@@ -95,20 +117,31 @@ func (r *PostgresBalanceRepository) FindAvailable(ctx context.Context, accountID
 		return nil, fmt.Errorf("find available balance: %w", err)
 	}
 	defer rows.Close()
-	return scanBalanceEntries(rows)
+	entries, err := scanBalanceEntries(rows)
+	if err != nil {
+		return nil, err
+	}
+	return filterAvailableBalance(entries), nil
 }
 
 func (r *PostgresBalanceRepository) GetBalance(ctx context.Context, accountID shared.AccountID, currency shared.Currency) (shared.Money, error) {
-	var total int64
-	err := r.q(ctx).QueryRow(ctx,
-		`SELECT COALESCE(SUM(remaining_amount), 0) FROM balance_entries
+	// Sum the precise remaining amounts (state JSON) rather than the lossy
+	// BIGINT column, so fractional credits are not silently truncated. See
+	// issue #11.
+	rows, err := r.q(ctx).Query(ctx,
+		selectBalanceEntrySQL+`
 		 WHERE account_id = $1 AND currency = $2
 		   AND (expires_at IS NULL OR expires_at > NOW())`,
-		string(accountID), string(currency)).Scan(&total)
+		string(accountID), string(currency))
 	if err != nil {
 		return shared.Money{}, fmt.Errorf("get balance: %w", err)
 	}
-	return shared.NewMoney(new(big.Rat).SetInt64(total), currency), nil
+	defer rows.Close()
+	entries, err := scanBalanceEntries(rows)
+	if err != nil {
+		return shared.Money{}, err
+	}
+	return sumRemaining(entries, currency)
 }
 
 func (r *PostgresBalanceRepository) SaveApplication(ctx context.Context, app *balance.BalanceApplication) error {
@@ -179,7 +212,7 @@ func (r *PostgresBalanceRepository) FindByAccountID(ctx context.Context, account
 
 const selectBalanceEntrySQL = `
 	SELECT id, account_id, original_amount, remaining_amount, currency,
-	       reason, source_type, source_id, description, expires_at, version, created_at
+	       reason, source_type, source_id, description, expires_at, version, created_at, state
 	FROM balance_entries`
 
 func scanBalanceEntries(rows pgx.Rows) ([]*balance.BalanceEntry, error) {
@@ -208,10 +241,11 @@ func scanBalanceEntrySnapshot(t scanTarget) (balance.BalanceEntrySnapshot, error
 		expiresAt                    *time.Time
 		version                      int
 		createdAt                    time.Time
+		stateRaw                     []byte
 	)
 	if err := t.Scan(
 		&id, &accountID, &original, &remaining, &currency,
-		&reason, &sourceType, &sourceID, &description, &expiresAt, &version, &createdAt,
+		&reason, &sourceType, &sourceID, &description, &expiresAt, &version, &createdAt, &stateRaw,
 	); err != nil {
 		return balance.BalanceEntrySnapshot{}, err
 	}
@@ -219,8 +253,19 @@ func scanBalanceEntrySnapshot(t scanTarget) (balance.BalanceEntrySnapshot, error
 	cur := shared.Currency(currency)
 	s.ID = shared.BalanceEntryID(id)
 	s.AccountID = shared.AccountID(accountID)
-	s.OriginalAmount = moneyFromInt64(original, cur)
-	s.RemainingAmount = moneyFromInt64(remaining, cur)
+	// Prefer the precise state JSON; fall back to the lossy BIGINT columns for
+	// rows written before the state column existed (issue #11).
+	if len(stateRaw) > 0 {
+		var js balanceEntryJSONState
+		if err := json.Unmarshal(stateRaw, &js); err != nil {
+			return balance.BalanceEntrySnapshot{}, fmt.Errorf("unmarshal balance entry json state: %w", err)
+		}
+		s.OriginalAmount = js.OriginalAmount
+		s.RemainingAmount = js.RemainingAmount
+	} else {
+		s.OriginalAmount = moneyFromInt64(original, cur)
+		s.RemainingAmount = moneyFromInt64(remaining, cur)
+	}
 	s.Reason = balance.BalanceReason(reason)
 	s.SourceType = balance.BalanceSourceType(sourceType)
 	s.SourceID = sourceID

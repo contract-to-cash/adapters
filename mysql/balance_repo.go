@@ -3,15 +3,25 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"time"
 
 	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/balance"
 	"github.com/contract-to-cash/core/domain/shared"
 )
+
+// balanceEntryJSONState is the precise (big.Rat-backed) representation of a
+// BalanceEntry's monetary fields. It is the source of truth on read; the
+// original_amount / remaining_amount BIGINT columns are written for
+// query/indexing convenience only and are lossy (Money.Int64 truncates any
+// fractional part). See issue #11.
+type balanceEntryJSONState struct {
+	OriginalAmount  shared.Money `json:"original_amount"`
+	RemainingAmount shared.Money `json:"remaining_amount"`
+}
 
 // MySQLBalanceRepository is a MySQL-backed balance.Repository with optimistic locking.
 type MySQLBalanceRepository struct {
@@ -40,16 +50,24 @@ func (r *MySQLBalanceRepository) Save(ctx context.Context, entry *balance.Balanc
 		expiresAt = &t
 	}
 
+	jsonState, err := json.Marshal(balanceEntryJSONState{
+		OriginalAmount:  s.OriginalAmount,
+		RemainingAmount: s.RemainingAmount,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal balance entry json state: %w", err)
+	}
+
 	if loaded == 0 {
 		_, err := q.ExecContext(ctx,
 			`INSERT INTO balance_entries (id, account_id, original_amount, remaining_amount, currency,
-				reason, source_type, source_id, description, expires_at, version, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				reason, source_type, source_id, description, expires_at, version, created_at, state)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			string(s.ID), string(s.AccountID),
 			s.OriginalAmount.Int64(), s.RemainingAmount.Int64(),
 			string(s.OriginalAmount.Currency()),
 			string(s.Reason), string(s.SourceType), s.SourceID, s.Description,
-			expiresAt, s.Version, s.CreatedAt.UTC())
+			expiresAt, s.Version, s.CreatedAt.UTC(), jsonState)
 		if err != nil {
 			return fmt.Errorf("insert balance entry: %w", err)
 		}
@@ -61,12 +79,12 @@ func (r *MySQLBalanceRepository) Save(ctx context.Context, entry *balance.Balanc
 		`UPDATE balance_entries SET
 			original_amount = ?, remaining_amount = ?, currency = ?,
 			reason = ?, source_type = ?, source_id = ?,
-			description = ?, expires_at = ?, version = ?
+			description = ?, expires_at = ?, version = ?, state = ?
 		 WHERE id = ? AND version = ?`,
 		s.OriginalAmount.Int64(), s.RemainingAmount.Int64(),
 		string(s.OriginalAmount.Currency()),
 		string(s.Reason), string(s.SourceType), s.SourceID, s.Description,
-		expiresAt, s.Version, string(s.ID), loaded)
+		expiresAt, s.Version, jsonState, string(s.ID), loaded)
 	if err != nil {
 		return fmt.Errorf("update balance entry: %w", err)
 	}
@@ -95,9 +113,13 @@ func (r *MySQLBalanceRepository) FindByID(ctx context.Context, id shared.Balance
 }
 
 func (r *MySQLBalanceRepository) FindAvailable(ctx context.Context, accountID shared.AccountID, currency shared.Currency) ([]*balance.BalanceEntry, error) {
+	// Availability is decided on the precise remaining amount (from the state
+	// JSON), not the lossy BIGINT column: a sub-unit remainder (e.g. 0.75)
+	// must still be considered available. The BIGINT remaining_amount is
+	// write-only and no longer filtered on here. See issue #11.
 	rows, err := r.q(ctx).QueryContext(ctx,
 		selectBalanceEntrySQL+`
-		 WHERE account_id = ? AND currency = ? AND remaining_amount > 0
+		 WHERE account_id = ? AND currency = ?
 		   AND (expires_at IS NULL OR expires_at > NOW(6))
 		 ORDER BY created_at ASC`,
 		string(accountID), string(currency))
@@ -105,20 +127,31 @@ func (r *MySQLBalanceRepository) FindAvailable(ctx context.Context, accountID sh
 		return nil, fmt.Errorf("find available balance: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	return scanBalanceEntries(rows)
+	entries, err := scanBalanceEntries(rows)
+	if err != nil {
+		return nil, err
+	}
+	return filterAvailableBalance(entries), nil
 }
 
 func (r *MySQLBalanceRepository) GetBalance(ctx context.Context, accountID shared.AccountID, currency shared.Currency) (shared.Money, error) {
-	var total int64
-	err := r.q(ctx).QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(remaining_amount), 0) FROM balance_entries
+	// Sum the precise remaining amounts (state JSON) rather than the lossy
+	// BIGINT column, so fractional credits are not silently truncated. See
+	// issue #11.
+	rows, err := r.q(ctx).QueryContext(ctx,
+		selectBalanceEntrySQL+`
 		 WHERE account_id = ? AND currency = ?
 		   AND (expires_at IS NULL OR expires_at > NOW(6))`,
-		string(accountID), string(currency)).Scan(&total)
+		string(accountID), string(currency))
 	if err != nil {
 		return shared.Money{}, fmt.Errorf("get balance: %w", err)
 	}
-	return shared.NewMoney(new(big.Rat).SetInt64(total), currency), nil
+	defer func() { _ = rows.Close() }()
+	entries, err := scanBalanceEntries(rows)
+	if err != nil {
+		return shared.Money{}, err
+	}
+	return sumRemaining(entries, currency)
 }
 
 func (r *MySQLBalanceRepository) SaveApplication(ctx context.Context, app *balance.BalanceApplication) error {
@@ -189,7 +222,7 @@ func (r *MySQLBalanceRepository) FindByAccountID(ctx context.Context, accountID 
 
 const selectBalanceEntrySQL = `
 	SELECT id, account_id, original_amount, remaining_amount, currency,
-	       reason, source_type, source_id, description, expires_at, version, created_at
+	       reason, source_type, source_id, description, expires_at, version, created_at, state
 	FROM balance_entries`
 
 func scanBalanceEntries(rows *sql.Rows) ([]*balance.BalanceEntry, error) {
@@ -218,10 +251,11 @@ func scanBalanceEntrySnapshot(t scanTarget) (balance.BalanceEntrySnapshot, error
 		expiresAt                    sql.NullTime
 		version                      int
 		createdAt                    utcTime
+		stateRaw                     []byte
 	)
 	if err := t.Scan(
 		&id, &accountID, &original, &remaining, &currency,
-		&reason, &sourceType, &sourceID, &description, &expiresAt, &version, &createdAt,
+		&reason, &sourceType, &sourceID, &description, &expiresAt, &version, &createdAt, &stateRaw,
 	); err != nil {
 		return balance.BalanceEntrySnapshot{}, err
 	}
@@ -229,8 +263,19 @@ func scanBalanceEntrySnapshot(t scanTarget) (balance.BalanceEntrySnapshot, error
 	cur := shared.Currency(currency)
 	s.ID = shared.BalanceEntryID(id)
 	s.AccountID = shared.AccountID(accountID)
-	s.OriginalAmount = moneyFromInt64(original, cur)
-	s.RemainingAmount = moneyFromInt64(remaining, cur)
+	// Prefer the precise state JSON; fall back to the lossy BIGINT columns for
+	// rows written before the state column existed (issue #11).
+	if len(stateRaw) > 0 {
+		var js balanceEntryJSONState
+		if err := json.Unmarshal(stateRaw, &js); err != nil {
+			return balance.BalanceEntrySnapshot{}, fmt.Errorf("unmarshal balance entry json state: %w", err)
+		}
+		s.OriginalAmount = js.OriginalAmount
+		s.RemainingAmount = js.RemainingAmount
+	} else {
+		s.OriginalAmount = moneyFromInt64(original, cur)
+		s.RemainingAmount = moneyFromInt64(remaining, cur)
+	}
 	s.Reason = balance.BalanceReason(reason)
 	s.SourceType = balance.BalanceSourceType(sourceType)
 	s.SourceID = sourceID

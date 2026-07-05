@@ -19,6 +19,15 @@ type PostgresPaymentRepository struct {
 
 var _ payment.Repository = (*PostgresPaymentRepository)(nil)
 
+// paymentJSONState is the precise (big.Rat-backed) representation of a Payment's
+// monetary fields. It is the source of truth on read; the amount /
+// refunded_amount BIGINT columns are written for query/indexing convenience
+// only and are lossy (Money.Int64 truncates any fractional part). See issue #11.
+type paymentJSONState struct {
+	Amount         shared.Money `json:"amount"`
+	RefundedAmount shared.Money `json:"refunded_amount"`
+}
+
 func NewPaymentRepository(pool *pgxpool.Pool) *PostgresPaymentRepository {
 	return &PostgresPaymentRepository{pool: pool}
 }
@@ -33,6 +42,14 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 	metadata, err := json.Marshal(s.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal payment metadata: %w", err)
+	}
+
+	jsonState, err := json.Marshal(paymentJSONState{
+		Amount:         s.Amount,
+		RefundedAmount: s.RefundedAmount,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal payment json state: %w", err)
 	}
 
 	var idempotencyKey *string
@@ -53,18 +70,18 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 
 	_, err = r.q(ctx).Exec(ctx,
 		`INSERT INTO payments (id, invoice_id, idempotency_key, amount, refunded_amount,
-			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
 		 ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status, amount = EXCLUDED.amount,
 			refunded_amount = EXCLUDED.refunded_amount, currency = EXCLUDED.currency,
 			method = EXCLUDED.method, gateway_transaction_id = EXCLUDED.gateway_transaction_id,
 			failure_reason = EXCLUDED.failure_reason, processed_at = EXCLUDED.processed_at,
-			metadata = EXCLUDED.metadata, updated_at = NOW()`,
+			metadata = EXCLUDED.metadata, state = EXCLUDED.state, updated_at = NOW()`,
 		string(s.ID), string(s.InvoiceID), idempotencyKey,
 		s.Amount.Int64(), s.RefundedAmount.Int64(),
 		string(s.Amount.Currency()), string(s.Status), string(s.Method),
-		s.GatewayTransactionID, failureReason, processedAt, metadata)
+		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState)
 	if err != nil {
 		return fmt.Errorf("save payment: %w", err)
 	}
@@ -126,7 +143,7 @@ func scanPaymentRows(rows pgx.Rows) ([]*payment.Payment, error) {
 
 const selectPaymentSQL = `
 	SELECT id, invoice_id, idempotency_key, amount, refunded_amount, currency,
-	       status, method, gateway_transaction_id, failure_reason, processed_at, metadata
+	       status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state
 	FROM payments`
 
 func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
@@ -139,10 +156,11 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 		gatewayTransactionID, failureReason string
 		processedAt                         *time.Time
 		metadata                            json.RawMessage
+		stateRaw                            []byte
 	)
 	if err := t.Scan(
 		&id, &invoiceID, &idempotencyKey, &amount, &refundedAmount, &currency,
-		&status, &method, &gatewayTransactionID, &failureReason, &processedAt, &metadata,
+		&status, &method, &gatewayTransactionID, &failureReason, &processedAt, &metadata, &stateRaw,
 	); err != nil {
 		return payment.PaymentSnapshot{}, err
 	}
@@ -153,8 +171,19 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 	if idempotencyKey != nil {
 		s.IdempotencyKey = *idempotencyKey
 	}
-	s.Amount = moneyFromInt64(amount, cur)
-	s.RefundedAmount = moneyFromInt64(refundedAmount, cur)
+	// Prefer the precise state JSON; fall back to the lossy BIGINT columns for
+	// rows written before the state column existed (issue #11).
+	if len(stateRaw) > 0 {
+		var js paymentJSONState
+		if err := json.Unmarshal(stateRaw, &js); err != nil {
+			return payment.PaymentSnapshot{}, fmt.Errorf("unmarshal payment json state: %w", err)
+		}
+		s.Amount = js.Amount
+		s.RefundedAmount = js.RefundedAmount
+	} else {
+		s.Amount = moneyFromInt64(amount, cur)
+		s.RefundedAmount = moneyFromInt64(refundedAmount, cur)
+	}
 	s.Method = payment.PaymentMethod(method)
 	s.Status = payment.PaymentStatus(status)
 	s.GatewayTransactionID = gatewayTransactionID
