@@ -73,9 +73,11 @@ func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error 
 func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) error {
 	q := QuerierFromContext(ctx, p.pool)
 
-	if _, err := q.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-		return fmt.Errorf("defer constraints: %w", err)
-	}
+	// No foreign key references contract_read_models anymore: migration 008
+	// dropped the write→projection FKs (invoices/credit_notes/usage_records →
+	// contract_read_models) that 003 had added as DEFERRABLE INITIALLY IMMEDIATE.
+	// The DELETE + replay below can no longer transiently violate a constraint,
+	// so the former `SET CONSTRAINTS ALL DEFERRED` is unnecessary. See issue #29.
 	if _, err := q.Exec(ctx, `DELETE FROM contract_read_models`); err != nil {
 		return fmt.Errorf("delete contract read models: %w", err)
 	}
