@@ -66,6 +66,7 @@ func (p *InvoiceProjector) rebuildInTx(ctx context.Context, until time.Time) err
 	var fromPosition int64
 	var lastPosition int64
 	const batch = 1000
+scan:
 	for {
 		events, err := p.eventStore.LoadAll(ctx, fromPosition, batch)
 		if err != nil {
@@ -75,10 +76,21 @@ func (p *InvoiceProjector) rebuildInTx(ctx context.Context, until time.Time) err
 			break
 		}
 		for _, e := range events {
-			if !e.OccurredAt.After(until) {
-				if err := p.Project(ctx, e); err != nil {
-					return fmt.Errorf("project event %s: %w", e.ID, err)
-				}
+			// Stop the scan at the first event past `until`; the checkpoint
+			// stays at the last event actually projected. Continuing the scan
+			// while skipping would be unsafe when occurred_at and
+			// global_position disagree (clock skew / backdated events): a
+			// projected pre-`until` event at a higher position would advance
+			// the checkpoint past the skipped one, and the incremental
+			// Project (which resumes after the checkpoint) would never see it.
+			// Breaking is safe for the same reason — any pre-`until` events
+			// left unscanned are still after the checkpoint, so the next
+			// incremental run picks them up.
+			if e.OccurredAt.After(until) {
+				break scan
+			}
+			if err := p.Project(ctx, e); err != nil {
+				return fmt.Errorf("project event %s: %w", e.ID, err)
 			}
 			lastPosition = e.GlobalPosition
 		}
@@ -122,9 +134,18 @@ func (p *InvoiceProjector) applyEvent(ctx context.Context, event eventstore.Even
 		if c, ok := data["currency"].(string); ok && c != "" {
 			currency = c
 		}
+		// core marshals the total as a shared.Money object
+		// ({"amount":"11000/1","currency":"JPY"}), so a float64 assertion always
+		// failed and silently projected total=0. Parse the Money payload instead;
+		// its embedded currency wins when the top-level currency is absent.
 		var total int64
-		if v, ok := data["total"].(float64); ok {
-			total = int64(v)
+		if v, ok := data["total"]; ok {
+			if amt, cur, parsed := parseMoneyPayload(v); parsed {
+				total = amt
+				if cur != "" {
+					currency = cur
+				}
+			}
 		}
 		_, err := q.Exec(ctx,
 			`INSERT INTO invoice_read_models (id, contract_id, account_id, status, total, currency, data, version, updated_at)

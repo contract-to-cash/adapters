@@ -268,6 +268,54 @@ func TestGateway_Charge_RequiresAction3DS(t *testing.T) {
 	if f.lastForm.Get("return_url") != "https://app/return" {
 		t.Errorf("return_url = %q", f.lastForm.Get("return_url"))
 	}
+	// Required:true must request a 3DS challenge rather than being silently ignored.
+	if got := f.lastForm.Get("payment_method_options[card][request_three_d_secure]"); got != "any" {
+		t.Errorf("request_three_d_secure = %q, want any", got)
+	}
+}
+
+// TestGateway_Charge_ThreeDSNotRequested verifies that when the caller does not
+// force 3DS, no request_three_d_secure param is sent (Stripe applies its own
+// default challenge policy).
+func TestGateway_Charge_ThreeDSNotRequested(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	_, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), PaymentMethodID: &pmID,
+		ThreeDSecure: &port.ThreeDSecureRequest{Required: false, ReturnURL: "https://app/return"},
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if _, ok := f.lastForm["payment_method_options[card][request_three_d_secure]"]; ok {
+		t.Errorf("request_three_d_secure should be omitted when Required is false")
+	}
+	if f.lastForm.Get("return_url") != "https://app/return" {
+		t.Errorf("return_url = %q", f.lastForm.Get("return_url"))
+	}
+}
+
+// TestGateway_Authorize_ThreeDSRequested verifies the 3DS request flag is also
+// applied on the Authorize path.
+func TestGateway_Authorize_ThreeDSRequested(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/payment_intents", piJSON("pi_auth", "requires_capture", 5000, "jpy"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	_, err := g.Authorize(context.Background(), &port.AuthorizeRequest{
+		Amount: jpy(5000), PaymentMethodID: &pmID,
+		ThreeDSecure: &port.ThreeDSecureRequest{Required: true},
+	})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if got := f.lastForm.Get("payment_method_options[card][request_three_d_secure]"); got != "any" {
+		t.Errorf("request_three_d_secure = %q, want any", got)
+	}
 }
 
 func TestGateway_Charge_CardDeclined(t *testing.T) {
@@ -562,6 +610,144 @@ func TestGateway_Charge_DebitCardType(t *testing.T) {
 	}
 	if resp.PaymentMethodType != port.PaymentMethodTypeDebitCard {
 		t.Errorf("PaymentMethodType = %q, want debit_card", resp.PaymentMethodType)
+	}
+}
+
+// TestGateway_Charge_UnknownResponseCurrency verifies that a Stripe response in
+// a currency the adapter cannot decode is rejected loudly instead of being
+// silently read at a zero exponent (which would misreport the amount by 100x).
+func TestGateway_Charge_UnknownResponseCurrency(t *testing.T) {
+	f := newFakeStripe(t)
+	// Request in a supported currency; response comes back in GBP (unsupported).
+	f.on("POST /v1/payment_intents", piJSON("pi_gbp", "succeeded", 2599, "gbp"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	_, err := g.Charge(context.Background(), &port.ChargeRequest{Amount: jpy(1000), PaymentMethodID: &pmID})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) || ge.Code != port.ErrorCodeCurrencyNotSupported {
+		t.Fatalf("want currency_not_supported GatewayError, got %v", err)
+	}
+}
+
+// TestGateway_Refund_UnknownResponseCurrency covers the refund response path
+// through fromMinorUnits.
+func TestGateway_Refund_UnknownResponseCurrency(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/refunds", `{"id":"re_x","object":"refund","amount":2599,"currency":"gbp","status":"succeeded","created":1700000600}`)
+	g := f.gateway(WithClock(fixedClock))
+
+	amt := jpy(1000)
+	_, err := g.Refund(context.Background(), &port.RefundRequest{TransactionID: "pi_1", Amount: &amt})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) || ge.Code != port.ErrorCodeCurrencyNotSupported {
+		t.Fatalf("want currency_not_supported GatewayError, got %v", err)
+	}
+}
+
+// TestGateway_Capture_ProcessingNotOverReported verifies that a capture still
+// processing (amount_received == 0, status != succeeded) reports the received
+// amount (0) rather than over-reporting the full authorization as captured.
+func TestGateway_Capture_ProcessingNotOverReported(t *testing.T) {
+	f := newFakeStripe(t)
+	obj := map[string]any{
+		"id": "pi_p", "object": "payment_intent", "amount": 5000,
+		"amount_received": 0, "currency": "jpy", "status": "processing", "created": 1_700_000_000,
+	}
+	b, _ := json.Marshal(obj)
+	f.on("POST /v1/payment_intents/pi_p/capture", string(b))
+	g := f.gateway(WithClock(fixedClock))
+
+	cap, err := g.Capture(context.Background(), &port.CaptureRequest{AuthorizationID: "pi_p"})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if got := cap.Amount.Amount(); got.Sign() != 0 {
+		t.Errorf("captured Amount = %s, want 0 while processing", got.RatString())
+	}
+	if cap.Status != port.TransactionStatusPending {
+		t.Errorf("Status = %q, want pending", cap.Status)
+	}
+}
+
+// TestGateway_Capture_SucceededZeroReceivedFallsBack verifies the full-amount
+// fallback still applies when the capture succeeded but the SDK left
+// amount_received unset.
+func TestGateway_Capture_SucceededZeroReceivedFallsBack(t *testing.T) {
+	f := newFakeStripe(t)
+	obj := map[string]any{
+		"id": "pi_s", "object": "payment_intent", "amount": 5000,
+		"amount_received": 0, "currency": "jpy", "status": "succeeded", "created": 1_700_000_000,
+	}
+	b, _ := json.Marshal(obj)
+	f.on("POST /v1/payment_intents/pi_s/capture", string(b))
+	g := f.gateway(WithClock(fixedClock))
+
+	cap, err := g.Capture(context.Background(), &port.CaptureRequest{AuthorizationID: "pi_s"})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if got := cap.Amount.Amount(); got.Cmp(big.NewRat(5000, 1)) != 0 {
+		t.Errorf("captured Amount = %s, want 5000", got.RatString())
+	}
+}
+
+// TestGateway_NilRequestGuards verifies the request-taking methods reject a nil
+// request with a ValidationError instead of panicking.
+func TestGateway_NilRequestGuards(t *testing.T) {
+	g := (&fakeStripe{}).gatewayNoServer(t)
+	ctx := context.Background()
+
+	if _, err := g.Charge(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("Charge(nil): want ValidationError, got %v", err)
+	}
+	if _, err := g.Authorize(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("Authorize(nil): want ValidationError, got %v", err)
+	}
+	if _, err := g.Capture(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("Capture(nil): want ValidationError, got %v", err)
+	}
+	if _, err := g.Void(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("Void(nil): want ValidationError, got %v", err)
+	}
+	if _, err := g.Cancel(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("Cancel(nil): want ValidationError, got %v", err)
+	}
+	if _, err := g.Refund(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("Refund(nil): want ValidationError, got %v", err)
+	}
+	if _, err := g.RegisterPaymentMethod(ctx, nil); !errors.Is(err, ErrValidation) {
+		t.Errorf("RegisterPaymentMethod(nil): want ValidationError, got %v", err)
+	}
+}
+
+// TestGateway_ErrorCodeMapping checks the newly mapped Stripe error codes.
+func TestGateway_ErrorCodeMapping(t *testing.T) {
+	cases := []struct {
+		code string
+		want port.ErrorCode
+	}{
+		{"amount_too_small", port.ErrorCodeAmountTooSmall},
+		{"amount_too_large", port.ErrorCodeAmountTooLarge},
+		{"authentication_required", port.ErrorCodeAuthenticationRequired},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			f := newFakeStripe(t)
+			f.onStatus("POST /v1/payment_intents", http.StatusPaymentRequired,
+				`{"error":{"type":"card_error","code":"`+tc.code+`","message":"x"}}`)
+			g := f.gateway()
+
+			pmID := "pm_card"
+			_, err := g.Charge(context.Background(), &port.ChargeRequest{Amount: jpy(1000), PaymentMethodID: &pmID})
+			var ge *port.GatewayError
+			if !errors.As(err, &ge) {
+				t.Fatalf("want GatewayError, got %v", err)
+			}
+			if ge.Code != tc.want {
+				t.Errorf("Code = %q, want %q", ge.Code, tc.want)
+			}
+		})
 	}
 }
 

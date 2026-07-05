@@ -145,7 +145,19 @@ func (r *PostgresInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoi
 }
 
 func (r *PostgresInvoiceRepository) FindByID(ctx context.Context, id shared.InvoiceID) (*invoice.Invoice, error) {
-	row := r.q(ctx).QueryRow(ctx, selectInvoiceSQL+` WHERE id = $1`, string(id))
+	// When invoked inside an ambient transaction (e.g. core's
+	// BillingService.FinalizeInvoice, which reads -> Finalize -> Save within one
+	// tx), take a row lock with SELECT ... FOR UPDATE. This serializes concurrent
+	// finalizers on the same invoice: the loser blocks until the winner commits,
+	// then reads the already-finalized row and is rejected by Finalize() with
+	// invalid_state_transition. Without the lock, both readers would see the draft
+	// row and both would finalize, double-firing OnInvoiceIssuedHook. Outside a
+	// transaction (pooled read) no lock is taken.
+	query := selectInvoiceSQL + ` WHERE id = $1`
+	if _, inTx := TxFromContext(ctx); inTx {
+		query += ` FOR UPDATE`
+	}
+	row := r.q(ctx).QueryRow(ctx, query, string(id))
 	return scanInvoiceRow(row, id)
 }
 
@@ -168,7 +180,11 @@ func (r *PostgresInvoiceRepository) FindByAccountID(ctx context.Context, account
 }
 
 func (r *PostgresInvoiceRepository) FindOverdue(ctx context.Context) ([]*invoice.Invoice, error) {
-	rows, err := r.q(ctx).Query(ctx, selectInvoiceSQL+` WHERE status = 'issued' AND due_date < NOW() ORDER BY due_date ASC`)
+	// Mirrors the core in-memory reference (infrastructure/inmemory/invoice_repository.go):
+	// (a) every invoice already marked 'overdue', regardless of due_date, and
+	// (b) 'issued' OR 'finalized' invoices whose due_date has passed.
+	rows, err := r.q(ctx).Query(ctx,
+		selectInvoiceSQL+` WHERE status = 'overdue' OR (status IN ('issued', 'finalized') AND due_date < NOW()) ORDER BY due_date ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("find overdue invoices: %w", err)
 	}
@@ -229,7 +245,7 @@ func (r *PostgresInvoiceRepository) FindByContractAndPeriod(ctx context.Context,
 
 func (r *PostgresInvoiceRepository) FindUnpaidByContract(ctx context.Context, contractID shared.ContractID) ([]*invoice.Invoice, error) {
 	rows, err := r.q(ctx).Query(ctx,
-		selectInvoiceSQL+` WHERE contract_id = $1 AND status NOT IN ('paid', 'voided', 'cancelled') ORDER BY due_date ASC NULLS LAST`,
+		selectInvoiceSQL+` WHERE contract_id = $1 AND status NOT IN ('paid', 'voided', 'refunded') ORDER BY due_date ASC NULLS LAST`,
 		string(contractID))
 	if err != nil {
 		return nil, fmt.Errorf("find unpaid invoices: %w", err)

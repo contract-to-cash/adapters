@@ -59,7 +59,12 @@ server-side from `expectedVersion`.
   `idempotent_key` header window (the header is still sent as well). On such
   a duplicate rejection the adapter retrieves the existing order and replays
   its outcome (success if already completed, `*PartialAuthorizeError` if
-  registered but not executed). Void/Cancel/Refund forward their
+  registered but not executed) — but only when the request's amount and job
+  code match the existing order. Reusing the same `IdempotencyKey` for a
+  **different amount or job code** is rejected with a non-retryable
+  `port.GatewayError` (`processing_error`) instead of silently replaying the
+  original amount's outcome (matching Stripe, which refuses idempotency-key
+  reuse with changed parameters). Void/Cancel/Refund forward their
   `IdempotencyKey` as the `idempotent_key` header verbatim; Capture, which
   can issue `/change` + `/capture` from one request, forwards a distinct
   per-operation key derived from it for each call.
@@ -79,6 +84,23 @@ server-side from `expectedVersion`.
   payment's current state first, so a lost execute *response* (payment
   actually captured/authorized) is converted into a success instead of a
   failed re-execute.
+- **Capture**: a partial capture below the authorized hold is applied via
+  `/change` then `/capture`. A capture amount **above** the authorized hold is
+  rejected with a `*ValidationError` before any mutating call — fincode's
+  `/change` would otherwise silently raise the hold and over-charge (Stripe's
+  API rejects over-capture server-side; fincode does not).
+- **Configuration / `BaseURL`**: `Config.BaseURL` must be set explicitly
+  (`fincode.ProductionBaseURL` or `fincode.SandboxBaseURL`). An empty `BaseURL`
+  **no longer** silently defaults to the sandbox; `NewClient` returns an error
+  instead, so a forgotten production endpoint fails at construction rather than
+  routing every "successful" payment to the test environment unnoticed. To use
+  the sandbox, either set `BaseURL: fincode.SandboxBaseURL` or set
+  `Config.Sandbox: true` (an explicit opt-in; ignored when `BaseURL` is set).
+
+  > **Migration (breaking change)**: `NewClient(Config)` now returns
+  > `(*Client, error)`. Update call sites to handle the error, and set
+  > `BaseURL` (or `Sandbox: true`) explicitly — code that relied on the empty
+  > `BaseURL` → sandbox default must now opt in via `Sandbox: true`.
 - **Webhooks**: `fincode.WebhookHandler` verifies a configurable signature
   header (default `"signature"`, constant-time comparison) in one of two
   **explicitly selected** modes — there is **no default**, because fincode's
@@ -129,6 +151,10 @@ implemented; nothing is rejected as unsupported except by currency.
   converted using each currency's exponent; an amount that is not exactly
   representable in minor units (e.g. `100.5` JPY), non-positive, or beyond
   int64 range is rejected with a `*ValidationError` before any network call.
+  On the response side, a Stripe amount reported in a currency outside
+  `currencyExponent` is rejected with a `port.GatewayError`
+  (`currency_not_supported`) rather than decoded at a guessed zero exponent —
+  guessing whole units would misreport a two-decimal amount by 100x.
 - **IDs**: the port-level `TransactionID` and `AuthorizationID` are both the
   Stripe **PaymentIntent** ID (`pi_...`) — Charge/Authorize create it,
   Capture/Void/Cancel/GetTransaction operate on it by that single ID (no
@@ -141,11 +167,14 @@ implemented; nothing is rejected as unsupported except by currency.
   settles it. Void and Cancel both cancel the PaymentIntent (Stripe models an
   auth reversal and a cancel the same way), differing only in the recorded
   cancellation reason.
-- **3D Secure**: a required authentication surfaces as a **successful**
-  response with `TransactionStatusRequiresAction` and a
-  `ThreeDSecureResult.RedirectURL` (from the PaymentIntent's
-  `next_action.redirect_to_url`), not an error — the caller redirects the
-  customer and completes the flow.
+- **3D Secure**: `ThreeDSecureRequest.Required = true` forces a challenge by
+  sending `payment_method_options[card][request_three_d_secure] = "any"` (so a
+  caller demanding strong authentication is never charged without it);
+  `ReturnURL` is forwarded as the PaymentIntent's `return_url`. A required
+  authentication then surfaces as a **successful** response with
+  `TransactionStatusRequiresAction` and a `ThreeDSecureResult.RedirectURL`
+  (from the PaymentIntent's `next_action.redirect_to_url`), not an error — the
+  caller redirects the customer and completes the flow.
 - **Payment methods**: `RegisterPaymentMethod` attaches an existing
   Stripe PaymentMethod (created client-side with Stripe.js/Elements and passed
   as `Token`) to the customer, optionally setting it as the customer's default
@@ -153,10 +182,14 @@ implemented; nothing is rejected as unsupported except by currency.
   the adapter never handles raw PANs.
 - **Idempotency**: `IdempotencyKey` on Charge/Authorize/Capture/Refund is
   forwarded verbatim as Stripe's `Idempotency-Key` header. **Stripe expires
-  idempotency keys after 24h**, so a retry beyond that window is no longer
-  deduplicated by Stripe; permanent deduplication (as the core
-  `PaymentService` expects) must also be backed by the caller's own payment
-  records.
+  idempotency keys after ~24h**, so a retry beyond that window is no longer
+  deduplicated by Stripe and can double-charge. Unlike the fincode adapter
+  (which derives a deterministic order ID and so dedups permanently), this
+  adapter only satisfies the core `PaymentService`'s "gateway deduplicates on
+  `IdempotencyKey`" contract within that 24h window. For durable
+  deduplication — e.g. a payment retried days later by a dunning batch — pair
+  the gateway with the core `port.IdempotencyStore` (recommended), so the
+  recorded outcome, not Stripe's window, gates the replay.
 - **Refunds**: full (`Amount == nil`) or partial (`Amount` set). Only
   Stripe's accepted reasons (`duplicate` / `fraudulent` /
   `requested_by_customer`) are forwarded; `RefundReasonOther` (and any other
@@ -174,7 +207,16 @@ implemented; nothing is rejected as unsupported except by currency.
   `event.ID`), because the SDK's own tolerance check reads the wall clock and
   would break this module's clock-injection convention. Known Stripe event
   types map to `port.WebhookEventType` constants; unknown types pass through
-  with their raw Stripe name.
+  with their raw Stripe name. Refund-object events (`refund.created` /
+  `refund.updated` / `charge.refund.updated`) are classified from the refund's
+  `status` (`succeeded` → `refund.succeeded`, `failed`/`canceled` →
+  `refund.failed`, anything else passes through unclassified), because card
+  refunds are asynchronous and typically arrive as `pending` first.
+  `charge.refunded` maps directly to `refund.succeeded`, which is correct for
+  card refunds (the adapter's only supported method) — note that for
+  asynchronous payment methods (e.g. bank transfers) Stripe can fire
+  `charge.refunded` while the refund is still pending, so supporting non-card
+  methods would require the same status inspection there.
 
 ## Testing
 
@@ -201,6 +243,26 @@ CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
 dependency. To develop against a local core checkout, add a `replace`
 directive to `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/path/to/core`).
+
+## Concurrency guarantees
+
+core's `BillingService.FinalizeInvoice` documents that the loser of a concurrent
+finalize "reads the finalized row and is rejected with `invalid_state_transition`",
+so `OnInvoiceIssuedHook` fires at most once per invoice. That guarantee only holds
+if the read-then-write is serialized by the storage layer — it does **not** hold
+under READ COMMITTED / REPEATABLE READ with an unconditional last-writer-wins
+upsert. This adapter supplies the missing serialization: **when `FindByID` runs
+inside an ambient transaction (detected via `QuerierFromContext`), it issues
+`SELECT ... FOR UPDATE`** (both postgres and mysql). core's `FinalizeInvoice`
+does its read → `Finalize()` → `Save` inside one `tx.Run`, so two concurrent
+finalizers contend on the same row: the winner finalizes and commits; the loser
+blocks on the row lock, then reads the already-finalized row and is rejected by
+`Finalize()` with `invalid_state_transition`, never reaching `Save`. The same row
+lock also serializes the `invoice_history` upsert, so the losing writer bails out
+before it can overwrite the winner's history row. Outside a transaction (pooled
+reads) no lock is taken, so ordinary lookups are unaffected. This addresses
+adapters issue #12 (and is cross-referenced by core#130, which pins the wording of
+the guarantee core relies on).
 
 ## Migrations
 

@@ -51,7 +51,7 @@ func TestClient_CreatePayment(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk_test_123", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk_test_123", BaseURL: srv.URL})
 	resp, err := client.CreatePayment(context.Background(), &CreatePaymentRequest{
 		PayType: PayTypeCard,
 		JobCode: JobCodeCapture,
@@ -78,7 +78,7 @@ func TestClient_CreatePayment_ForwardsIdempotencyKey(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	_, err := client.CreatePayment(context.Background(), &CreatePaymentRequest{
 		PayType: PayTypeCard, JobCode: JobCodeCapture, Amount: "100",
 	}, "uuid-v4-abc-123")
@@ -101,7 +101,7 @@ func TestClient_CreatePayment_NoIdempotencyKeyWhenEmpty(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	_, _ = client.CreatePayment(context.Background(), &CreatePaymentRequest{
 		PayType: PayTypeCard, JobCode: JobCodeCapture, Amount: "100",
 	}, "")
@@ -136,7 +136,7 @@ func TestClient_ExecutePayment(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk_test_123", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk_test_123", BaseURL: srv.URL})
 	resp, err := client.ExecutePayment(context.Background(), "o_test_001", &ExecutePaymentRequest{
 		PayType:    PayTypeCard,
 		AccessID:   "a_test_001",
@@ -163,7 +163,7 @@ func TestClient_CapturePayment(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	resp, err := client.CapturePayment(context.Background(), "o_test_001", &CapturePaymentRequest{
 		PayType: PayTypeCard, AccessID: "a_test_001",
 	})
@@ -187,7 +187,7 @@ func TestClient_CancelPayment(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	resp, err := client.CancelPayment(context.Background(), "o_test_001", &CancelPaymentRequest{
 		PayType: PayTypeCard, AccessID: "a_test_001",
 	})
@@ -218,7 +218,7 @@ func TestClient_ChangeAmount(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	resp, err := client.ChangeAmount(context.Background(), "o_test_001", &ChangeAmountRequest{
 		PayType: PayTypeCard, AccessID: "a_test_001",
 		JobCode: JobCodeCapture, Amount: "700",
@@ -252,7 +252,7 @@ func TestClient_RetrievePayment(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	resp, err := client.RetrievePayment(context.Background(), "o_test_001", PayTypeCard)
 	if err != nil {
 		t.Fatalf("RetrievePayment: %v", err)
@@ -273,7 +273,7 @@ func TestClient_HTTPError_4xx_JSONBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	_, err := client.CreatePayment(context.Background(), &CreatePaymentRequest{
 		PayType: PayTypeCard, JobCode: JobCodeCapture, Amount: "1000",
 	}, "")
@@ -312,7 +312,7 @@ func TestClient_HTTPError_Preserves429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	_, err := client.CancelPayment(context.Background(), "o1", &CancelPaymentRequest{
 		PayType: PayTypeCard, AccessID: "a1",
 	})
@@ -334,7 +334,7 @@ func TestClient_HTTPError_NonJSONBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	_, err := client.CancelPayment(context.Background(), "o1", &CancelPaymentRequest{
 		PayType: PayTypeCard, AccessID: "a1",
 	})
@@ -376,16 +376,50 @@ func contains(s, sub string) bool {
 	return false
 }
 
-func TestClient_DefaultSandboxURL(t *testing.T) {
-	client := NewClient(Config{APIKey: "sk_test"})
+// Sandbox: true opts in to the fincode test endpoint when BaseURL is empty.
+func TestClient_SandboxOptIn(t *testing.T) {
+	client, err := NewClient(Config{APIKey: "sk_test", Sandbox: true})
+	if err != nil {
+		t.Fatalf("NewClient(Sandbox): %v", err)
+	}
 	if client.baseURL != SandboxBaseURL {
 		t.Errorf("baseURL = %q, want %q", client.baseURL, SandboxBaseURL)
 	}
 }
 
+// An empty BaseURL without Sandbox is a hard error: no silent sandbox fallback
+// that would route production traffic to the test environment.
+func TestClient_MissingBaseURL_IsError(t *testing.T) {
+	client, err := NewClient(Config{APIKey: "sk"})
+	if err == nil {
+		t.Fatal("expected an error when BaseURL is empty and Sandbox is false")
+	}
+	if client != nil {
+		t.Errorf("client should be nil on error, got %+v", client)
+	}
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+	if ve.Field != "BaseURL" {
+		t.Errorf("Field = %q, want BaseURL", ve.Field)
+	}
+}
+
+// An explicit BaseURL takes precedence over Sandbox.
+func TestClient_BaseURLOverridesSandbox(t *testing.T) {
+	client, err := NewClient(Config{APIKey: "sk", BaseURL: ProductionBaseURL, Sandbox: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if client.baseURL != ProductionBaseURL {
+		t.Errorf("baseURL = %q, want %q", client.baseURL, ProductionBaseURL)
+	}
+}
+
 // M1: default http.Client has a timeout set.
 func TestClient_DefaultTimeout(t *testing.T) {
-	client := NewClient(Config{APIKey: "sk"})
+	client := mustNewClient(Config{APIKey: "sk", Sandbox: true})
 	if client.httpClient == nil {
 		t.Fatal("httpClient must be non-nil")
 	}
@@ -396,7 +430,7 @@ func TestClient_DefaultTimeout(t *testing.T) {
 
 func TestClient_CustomHTTPClient(t *testing.T) {
 	custom := &http.Client{Timeout: 5 * time.Second}
-	client := NewClient(Config{APIKey: "sk"}, WithHTTPClient(custom))
+	client := mustNewClient(Config{APIKey: "sk", Sandbox: true}, WithHTTPClient(custom))
 	if client.httpClient != custom {
 		t.Error("expected custom http client")
 	}
@@ -415,7 +449,7 @@ func TestClient_PathEscape(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
 	// orderID with a slash — must be escaped, not path-routed.
 	_, _ = client.CapturePayment(context.Background(), "a/b", &CapturePaymentRequest{
 		PayType: PayTypeCard, AccessID: "a1",
@@ -441,7 +475,7 @@ func TestClient_PathEscape(t *testing.T) {
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
 		}, nil
 	})
-	c2 := NewClient(Config{APIKey: "sk", BaseURL: "http://example.test"},
+	c2 := mustNewClient(Config{APIKey: "sk", BaseURL: "http://example.test"},
 		WithHTTPClient(&http.Client{Transport: rt}))
 	_, _ = c2.CapturePayment(context.Background(), "a/b", &CapturePaymentRequest{
 		PayType: PayTypeCard, AccessID: "a",

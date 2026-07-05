@@ -86,6 +86,7 @@ func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) er
 	var fromPosition int64
 	var lastPosition int64
 	const batch = 1000
+scan:
 	for {
 		events, err := p.eventStore.LoadAll(ctx, fromPosition, batch)
 		if err != nil {
@@ -95,10 +96,21 @@ func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) er
 			break
 		}
 		for _, e := range events {
-			if !e.OccurredAt.After(until) {
-				if err := p.Project(ctx, e); err != nil {
-					return fmt.Errorf("project event %s: %w", e.ID, err)
-				}
+			// Stop the scan at the first event past `until`; the checkpoint
+			// stays at the last event actually projected. Continuing the scan
+			// while skipping would be unsafe when occurred_at and
+			// global_position disagree (clock skew / backdated events): a
+			// projected pre-`until` event at a higher position would advance
+			// the checkpoint past the skipped one, and the incremental
+			// Project (which resumes after the checkpoint) would never see it.
+			// Breaking is safe for the same reason — any pre-`until` events
+			// left unscanned are still after the checkpoint, so the next
+			// incremental run picks them up.
+			if e.OccurredAt.After(until) {
+				break scan
+			}
+			if err := p.Project(ctx, e); err != nil {
+				return fmt.Errorf("project event %s: %w", e.ID, err)
 			}
 			lastPosition = e.GlobalPosition
 		}
@@ -195,10 +207,18 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 		return err
 
 	case contract.EventTypeTrialEnded:
+		// The aggregate transitions to Active only when the trial converted;
+		// otherwise it is Cancelled (core domain/contract/aggregate.go). Reading
+		// the converted flag keeps the read model from showing "ghost active"
+		// rows for trials that lapsed without converting.
+		status := "cancelled"
+		if converted, _ := data["converted"].(bool); converted {
+			status = "active"
+		}
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models
-			 SET status = 'active', trial_end_date = NULL, data = $1, version = $2, updated_at = NOW()
-			 WHERE id = $3`, raw, event.Version, contractID)
+			 SET status = $1, trial_end_date = NULL, data = $2, version = $3, updated_at = NOW()
+			 WHERE id = $4`, status, raw, event.Version, contractID)
 		return err
 
 	case contract.EventTypeContractRenewed:
@@ -213,6 +233,17 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 			 SET end_date = COALESCE($1, end_date), renewal_date = COALESCE($1, renewal_date),
 			     data = $2, version = $3, updated_at = NOW()
 			 WHERE id = $4`, newEnd, raw, event.Version, contractID)
+		return err
+
+	case contract.EventTypePriceChanged:
+		// An immediate price change must move the read model's price_id to the
+		// new price so price-filtered queries stay accurate. NULLIF guards
+		// against clobbering the existing price_id with an empty payload value.
+		newPriceID, _ := data["new_price_id"].(string)
+		_, err := q.Exec(ctx,
+			`UPDATE contract_read_models
+			 SET price_id = COALESCE(NULLIF($1, ''), price_id), data = $2, version = $3, updated_at = NOW()
+			 WHERE id = $4`, newPriceID, raw, event.Version, contractID)
 		return err
 
 	default:
