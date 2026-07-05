@@ -187,7 +187,11 @@ func (r *MySQLInvoiceRepository) FindByAccountID(ctx context.Context, accountID 
 }
 
 func (r *MySQLInvoiceRepository) FindOverdue(ctx context.Context) ([]*invoice.Invoice, error) {
-	rows, err := r.q(ctx).QueryContext(ctx, selectInvoiceSQL+` WHERE status = 'issued' AND due_date < NOW(6) ORDER BY due_date ASC`)
+	// Mirrors the core in-memory reference (infrastructure/inmemory/invoice_repository.go):
+	// (a) every invoice already marked 'overdue', regardless of due_date, and
+	// (b) 'issued' OR 'finalized' invoices whose due_date has passed.
+	rows, err := r.q(ctx).QueryContext(ctx,
+		selectInvoiceSQL+` WHERE status = 'overdue' OR (status IN ('issued', 'finalized') AND due_date < NOW(6)) ORDER BY due_date ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("find overdue invoices: %w", err)
 	}
@@ -250,7 +254,7 @@ func (r *MySQLInvoiceRepository) FindUnpaidByContract(ctx context.Context, contr
 	// MySQL has no NULLS LAST; emulate postgres' `due_date ASC NULLS LAST` with
 	// a leading `due_date IS NULL` sort key (NULLs collate last).
 	rows, err := r.q(ctx).QueryContext(ctx,
-		selectInvoiceSQL+` WHERE contract_id = ? AND status NOT IN ('paid', 'voided', 'cancelled') ORDER BY due_date IS NULL, due_date ASC`,
+		selectInvoiceSQL+` WHERE contract_id = ? AND status NOT IN ('paid', 'voided', 'refunded') ORDER BY due_date IS NULL, due_date ASC`,
 		string(contractID))
 	if err != nil {
 		return nil, fmt.Errorf("find unpaid invoices: %w", err)

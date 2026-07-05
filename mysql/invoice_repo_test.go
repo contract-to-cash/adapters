@@ -188,6 +188,46 @@ func TestInvoiceRepo_FindByContractID(t *testing.T) {
 	}
 }
 
+// TestInvoiceRepo_FindOverdue asserts the query mirrors the core in-memory
+// reference predicate: overdue-marked invoices (any due_date) plus
+// issued/finalized invoices past their due date.
+func TestInvoiceRepo_FindOverdue(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE status = 'overdue' OR \(status IN \('issued', 'finalized'\) AND due_date < NOW\(6\)\) ORDER BY due_date ASC`).
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindOverdue(context.Background())
+	if err != nil {
+		t.Fatalf("FindOverdue: %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "inv-1" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestInvoiceRepo_FindUnpaidByContract asserts refunded invoices are excluded
+// from the unpaid set (parity with the core in-memory reference).
+func TestInvoiceRepo_FindUnpaidByContract(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE contract_id = \? AND status NOT IN \('paid', 'voided', 'refunded'\) ORDER BY due_date IS NULL, due_date ASC`).
+		WithArgs("contract-1").
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindUnpaidByContract(context.Background(), "contract-1")
+	if err != nil {
+		t.Fatalf("FindUnpaidByContract: %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "inv-1" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestInvoiceRepo_FindByIDAsOf(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	snap, err := json.Marshal(sampleInvoice(t).ToSnapshot())

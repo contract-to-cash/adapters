@@ -180,7 +180,11 @@ func (r *PostgresInvoiceRepository) FindByAccountID(ctx context.Context, account
 }
 
 func (r *PostgresInvoiceRepository) FindOverdue(ctx context.Context) ([]*invoice.Invoice, error) {
-	rows, err := r.q(ctx).Query(ctx, selectInvoiceSQL+` WHERE status = 'issued' AND due_date < NOW() ORDER BY due_date ASC`)
+	// Mirrors the core in-memory reference (infrastructure/inmemory/invoice_repository.go):
+	// (a) every invoice already marked 'overdue', regardless of due_date, and
+	// (b) 'issued' OR 'finalized' invoices whose due_date has passed.
+	rows, err := r.q(ctx).Query(ctx,
+		selectInvoiceSQL+` WHERE status = 'overdue' OR (status IN ('issued', 'finalized') AND due_date < NOW()) ORDER BY due_date ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("find overdue invoices: %w", err)
 	}
@@ -241,7 +245,7 @@ func (r *PostgresInvoiceRepository) FindByContractAndPeriod(ctx context.Context,
 
 func (r *PostgresInvoiceRepository) FindUnpaidByContract(ctx context.Context, contractID shared.ContractID) ([]*invoice.Invoice, error) {
 	rows, err := r.q(ctx).Query(ctx,
-		selectInvoiceSQL+` WHERE contract_id = $1 AND status NOT IN ('paid', 'voided', 'cancelled') ORDER BY due_date ASC NULLS LAST`,
+		selectInvoiceSQL+` WHERE contract_id = $1 AND status NOT IN ('paid', 'voided', 'refunded') ORDER BY due_date ASC NULLS LAST`,
 		string(contractID))
 	if err != nil {
 		return nil, fmt.Errorf("find unpaid invoices: %w", err)
