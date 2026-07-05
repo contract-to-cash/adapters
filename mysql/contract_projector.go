@@ -3,7 +3,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -11,11 +10,6 @@ import (
 	"github.com/contract-to-cash/core/application/projection"
 	"github.com/contract-to-cash/core/domain/contract"
 	"github.com/contract-to-cash/core/eventstore"
-)
-
-const (
-	disableForeignKeyChecksSQL = `SET SESSION foreign_key_checks = 0`
-	enableForeignKeyChecksSQL  = `SET SESSION foreign_key_checks = 1`
 )
 
 // ContractProjectorName is the checkpoint key for the contract projector.
@@ -60,80 +54,26 @@ func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event)
 
 // Rebuild truncates and repopulates the contract_read_models projection.
 //
-// MySQL has no deferrable constraints (postgres uses SET CONSTRAINTS ALL
-// DEFERRED here). The equivalent is to suspend foreign-key checks for the
-// truncate/reload so any FK referencing contract_read_models does not
-// transiently fail while the table is emptied and repopulated.
-//
-// foreign_key_checks is a SESSION variable and is NOT transactional: it must be
-// restored on the very same physical connection before that connection returns
-// to the pool, or every later write on that connection silently bypasses FK
-// enforcement. When Rebuild owns the connection (no ambient tx) it therefore
-// runs the whole rebuild on a dedicated *sql.Conn and, if the restore fails,
-// evicts that connection from the pool instead of handing it back poisoned.
+// No foreign key references contract_read_models: migration 008 dropped the
+// write→projection FKs (invoices/credit_notes/usage_records → contract_read_models)
+// that 003 had added, and contract_read_models has no outgoing FKs of its own.
+// Emptying and repopulating it therefore needs no foreign_key_checks juggling —
+// the rebuild runs as an ordinary transaction. (Previously this suspended
+// foreign_key_checks on a dedicated connection, mirroring postgres SET
+// CONSTRAINTS ALL DEFERRED; that is no longer necessary. See issue #29.)
 func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error {
 	if _, inTx := TxFromContext(ctx); inTx {
-		// The caller owns the transaction and its connection; we cannot evict a
-		// connection we do not own, so restore on a best-effort basis. The
-		// restore is detached from ctx cancellation so a cancelled rebuild
-		// still attempts to re-enable checks.
-		q := querierFromContext(ctx, p.db)
-		if _, err := q.ExecContext(ctx, disableForeignKeyChecksSQL); err != nil {
-			return fmt.Errorf("disable fk checks: %w", err)
-		}
-		reloadErr := p.reloadReadModels(ctx, until)
-		if _, rErr := q.ExecContext(context.WithoutCancel(ctx), enableForeignKeyChecksSQL); rErr != nil && reloadErr == nil {
-			reloadErr = fmt.Errorf("restore fk checks: %w", rErr)
-		}
-		return reloadErr
+		// The caller owns the transaction; run within it.
+		return p.reloadReadModels(ctx, until)
 	}
 
-	// Own the connection for the whole rebuild so the FK toggle and its restore
-	// happen on the same physical connection, and so a failed restore can evict
-	// the connection.
-	conn, err := p.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire rebuild conn: %w", err)
-	}
-	poisoned := false
-	defer func() {
-		if poisoned {
-			// The connection may still have foreign_key_checks = 0. Force the
-			// pool to discard it: returning driver.ErrBadConn from Raw marks the
-			// underlying connection bad so it is closed rather than reused.
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
-		_ = conn.Close()
-	}()
-
-	sqlTx, err := conn.BeginTx(ctx, nil)
+	sqlTx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin rebuild tx: %w", err)
 	}
-
-	if _, err := sqlTx.ExecContext(ctx, disableForeignKeyChecksSQL); err != nil {
+	if err := p.reloadReadModels(ContextWithTx(ctx, sqlTx), until); err != nil {
 		_ = sqlTx.Rollback()
-		return fmt.Errorf("disable fk checks: %w", err)
-	}
-
-	reloadErr := p.reloadReadModels(ContextWithTx(ctx, sqlTx), until)
-
-	// Restore FK checks on the same connection before releasing it. Detach from
-	// ctx cancellation so a cancelled/timed-out rebuild still cleans up. If the
-	// restore itself fails the connection is unsafe to reuse, so mark it for
-	// eviction and roll back.
-	if _, rErr := sqlTx.ExecContext(context.WithoutCancel(ctx), enableForeignKeyChecksSQL); rErr != nil {
-		poisoned = true
-		_ = sqlTx.Rollback()
-		if reloadErr != nil {
-			return reloadErr
-		}
-		return fmt.Errorf("restore fk checks: %w", rErr)
-	}
-
-	if reloadErr != nil {
-		_ = sqlTx.Rollback()
-		return reloadErr
+		return err
 	}
 	if err := sqlTx.Commit(); err != nil {
 		return fmt.Errorf("commit rebuild tx: %w", err)
@@ -142,8 +82,7 @@ func (p *ContractProjector) Rebuild(ctx context.Context, until time.Time) error 
 }
 
 // reloadReadModels empties contract_read_models and replays all events up to
-// until, rebuilding the projection. It assumes foreign-key checks have already
-// been suspended by the caller (see Rebuild) and runs on the ambient tx.
+// until, rebuilding the projection. It runs on the ambient tx.
 func (p *ContractProjector) reloadReadModels(ctx context.Context, until time.Time) error {
 	q := querierFromContext(ctx, p.db)
 
