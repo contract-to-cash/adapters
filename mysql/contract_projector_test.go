@@ -179,7 +179,7 @@ func TestContractProjector_Rebuild_CheckpointStopsAtUntil(t *testing.T) {
 
 	// Checkpoint saved at gp=1 (the last projected event), NOT gp=2 or gp=3.
 	mock.ExpectExec(`INSERT INTO projection_checkpoints`).
-		WithArgs(ContractProjectorName, int64(1), sqlmock.AnyArg()).
+		WithArgs(ContractProjectorName, int64(1)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mock.ExpectExec(`SET SESSION foreign_key_checks = 1`).WillReturnResult(sqlmock.NewResult(0, 0))

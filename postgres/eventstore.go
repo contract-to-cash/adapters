@@ -15,20 +15,59 @@ import (
 )
 
 const (
-	eventsChannel     = "events_inserted"
-	subscriberBuffer  = 100
-	pgUniqueViolation = "23505"
+	eventsChannel       = "events_inserted"
+	subscriberBuffer    = 100
+	pgUniqueViolation   = "23505"
+	defaultCatchUpBatch = 1000
 )
 
 // PostgresEventStore implements eventstore.Store.
 type PostgresEventStore struct {
 	pool *pgxpool.Pool
+
+	// onSubErr, when set, is invoked once if a Subscribe goroutine terminates
+	// because of an error rather than context cancellation. The core
+	// eventstore.Store interface cannot signal this (Subscribe returns a bare
+	// channel that is closed on both success and failure), so this optional
+	// callback lets integrators distinguish a clean shutdown from a broken
+	// subscription. It is called from the subscription goroutine; keep it
+	// non-blocking (e.g. log, increment a metric, push to a buffered channel).
+	onSubErr func(error)
+
+	// catchUpBatch bounds the LoadAll page size used while replaying/tailing so
+	// a large backlog is streamed in chunks instead of loaded unbounded.
+	catchUpBatch int
 }
 
 var _ eventstore.Store = (*PostgresEventStore)(nil)
 
-func NewEventStore(pool *pgxpool.Pool) *PostgresEventStore {
-	return &PostgresEventStore{pool: pool}
+// EventStoreOption configures a PostgresEventStore.
+type EventStoreOption func(*PostgresEventStore)
+
+// WithSubscriptionErrorHandler registers a callback invoked when a Subscribe
+// goroutine ends abnormally (acquire/LISTEN/catch-up failure), before its
+// channel is closed. Context cancellation is a normal shutdown and does not
+// trigger it.
+func WithSubscriptionErrorHandler(fn func(error)) EventStoreOption {
+	return func(s *PostgresEventStore) { s.onSubErr = fn }
+}
+
+// WithCatchUpBatchSize sets the LoadAll page size used by Subscribe's
+// replay/tail loop (default 1000). Values <= 0 are ignored.
+func WithCatchUpBatchSize(n int) EventStoreOption {
+	return func(s *PostgresEventStore) {
+		if n > 0 {
+			s.catchUpBatch = n
+		}
+	}
+}
+
+func NewEventStore(pool *pgxpool.Pool, opts ...EventStoreOption) *PostgresEventStore {
+	s := &PostgresEventStore{pool: pool, catchUpBatch: defaultCatchUpBatch}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *PostgresEventStore) q(ctx context.Context) Querier {
@@ -208,6 +247,7 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
+		s.reportSubErr(fmt.Errorf("subscribe: acquire connection: %w", err))
 		return
 	}
 	defer func() {
@@ -216,11 +256,13 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 	}()
 
 	if _, err := conn.Exec(ctx, fmt.Sprintf("LISTEN %s", eventsChannel)); err != nil {
+		s.reportSubErr(fmt.Errorf("subscribe: LISTEN: %w", err))
 		return
 	}
 
 	position := fromPosition
 	if err := s.catchUp(ctx, &position, ch); err != nil {
+		s.reportSubErr(fmt.Errorf("subscribe: initial catch-up: %w", err))
 		return
 	}
 
@@ -240,25 +282,45 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 			continue
 		}
 		if err := s.catchUp(ctx, &position, ch); err != nil {
+			s.reportSubErr(fmt.Errorf("subscribe: catch-up: %w", err))
 			return
 		}
 	}
 }
 
-func (s *PostgresEventStore) catchUp(ctx context.Context, position *int64, ch chan<- eventstore.Event) error {
-	events, err := s.LoadAll(ctx, *position, 0)
-	if err != nil {
-		return err
+// reportSubErr forwards an abnormal subscription termination to the registered
+// handler. Context cancellation/deadline is a normal shutdown and is dropped so
+// integrators are not paged for a graceful close.
+func (s *PostgresEventStore) reportSubErr(err error) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
 	}
-	for _, evt := range events {
-		select {
-		case ch <- evt:
-			*position = evt.GlobalPosition
-		case <-ctx.Done():
-			return ctx.Err()
+	if s.onSubErr != nil {
+		s.onSubErr(err)
+	}
+}
+
+// catchUp streams every event after *position to ch in bounded pages. A large
+// backlog is drained catchUpBatch events at a time (rather than one unbounded
+// LoadAll) so replay memory stays proportional to the batch, not the log.
+func (s *PostgresEventStore) catchUp(ctx context.Context, position *int64, ch chan<- eventstore.Event) error {
+	for {
+		events, err := s.LoadAll(ctx, *position, s.catchUpBatch)
+		if err != nil {
+			return err
+		}
+		for _, evt := range events {
+			select {
+			case ch <- evt:
+				*position = evt.GlobalPosition
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if len(events) < s.catchUpBatch {
+			return nil
 		}
 	}
-	return nil
 }
 
 func (s *PostgresEventStore) SaveSnapshot(ctx context.Context, snapshot eventstore.Snapshot) error {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,13 +37,18 @@ func (s *CheckpointStore) Load(ctx context.Context, projectorName string) (int64
 }
 
 func (s *CheckpointStore) Save(ctx context.Context, projectorName string, position int64) error {
+	// last_updated is stamped by the database clock (column DEFAULT NOW() on
+	// insert, NOW() on update) rather than a Go time.Now(), keeping this
+	// adapter free of direct wall-clock reads per the core shared.Clock
+	// convention. The checkpoint timestamp is bookkeeping only, so the DB clock
+	// is authoritative here.
 	_, err := s.q(ctx).Exec(ctx,
-		`INSERT INTO projection_checkpoints (projector_name, last_position, last_updated)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO projection_checkpoints (projector_name, last_position)
+		 VALUES ($1, $2)
 		 ON CONFLICT (projector_name) DO UPDATE SET
 		   last_position = EXCLUDED.last_position,
-		   last_updated  = EXCLUDED.last_updated`,
-		projectorName, position, time.Now())
+		   last_updated  = NOW()`,
+		projectorName, position)
 	if err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}

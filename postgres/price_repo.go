@@ -206,9 +206,14 @@ func scanPriceSnapshot(t scanTarget) (pricing.PriceSnapshot, error) {
 	s.Status = pricing.PriceStatus(status)
 	s.CreatedAt = createdAt
 	if len(intervalJSON) > 0 {
-		_ = json.Unmarshal(intervalJSON, &s.Interval)
+		if err := json.Unmarshal(intervalJSON, &s.Interval); err != nil {
+			return pricing.PriceSnapshot{}, fmt.Errorf("unmarshal price interval for %s: %w", id, err)
+		}
 	}
-	model, _ := unmarshalPricingModel(pricingModelRaw)
+	model, err := unmarshalPricingModel(pricingModelRaw)
+	if err != nil {
+		return pricing.PriceSnapshot{}, fmt.Errorf("unmarshal pricing model for %s: %w", id, err)
+	}
 	s.PricingModel = model
 	return s, nil
 }
