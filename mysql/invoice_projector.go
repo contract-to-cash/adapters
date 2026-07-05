@@ -81,8 +81,13 @@ func (p *InvoiceProjector) rebuildInTx(ctx context.Context, until time.Time) err
 				if err := p.Project(ctx, e); err != nil {
 					return fmt.Errorf("project event %s: %w", e.ID, err)
 				}
+				// Only advance the checkpoint for events actually projected.
+				// Events after `until` are skipped here and must remain
+				// unprocessed so a later incremental Project (resuming from this
+				// checkpoint) picks them up. Tracking the last *scanned* position
+				// instead would leave those skipped events permanently unprojected.
+				lastPosition = e.GlobalPosition
 			}
-			lastPosition = e.GlobalPosition
 		}
 		newPos := events[len(events)-1].GlobalPosition
 		if newPos == fromPosition {
@@ -124,9 +129,18 @@ func (p *InvoiceProjector) applyEvent(ctx context.Context, event eventstore.Even
 		if c, ok := data["currency"].(string); ok && c != "" {
 			currency = c
 		}
+		// core marshals the total as a shared.Money object
+		// ({"amount":"11000/1","currency":"JPY"}), so a float64 assertion always
+		// failed and silently projected total=0. Parse the Money payload instead;
+		// its embedded currency wins when the top-level currency is absent.
 		var total int64
-		if v, ok := data["total"].(float64); ok {
-			total = int64(v)
+		if v, ok := data["total"]; ok {
+			if amt, cur, parsed := parseMoneyPayload(v); parsed {
+				total = amt
+				if cur != "" {
+					currency = cur
+				}
+			}
 		}
 		_, err := q.ExecContext(ctx,
 			`INSERT INTO invoice_read_models (id, contract_id, account_id, status, total, currency, data, version, updated_at)

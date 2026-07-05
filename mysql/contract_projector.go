@@ -107,8 +107,13 @@ func (p *ContractProjector) rebuildInTx(ctx context.Context, until time.Time) er
 				if err := p.Project(ctx, e); err != nil {
 					return fmt.Errorf("project event %s: %w", e.ID, err)
 				}
+				// Only advance the checkpoint for events actually projected.
+				// Events after `until` are skipped here and must remain
+				// unprocessed so a later incremental Project (resuming from this
+				// checkpoint) picks them up. Tracking the last *scanned* position
+				// instead would leave those skipped events permanently unprojected.
+				lastPosition = e.GlobalPosition
 			}
-			lastPosition = e.GlobalPosition
 		}
 		newPos := events[len(events)-1].GlobalPosition
 		if newPos == fromPosition {
@@ -203,10 +208,18 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 		return err
 
 	case contract.EventTypeTrialEnded:
+		// The aggregate transitions to Active only when the trial converted;
+		// otherwise it is Cancelled (core domain/contract/aggregate.go). Reading
+		// the converted flag keeps the read model from showing "ghost active"
+		// rows for trials that lapsed without converting.
+		status := "cancelled"
+		if converted, _ := data["converted"].(bool); converted {
+			status = "active"
+		}
 		_, err := q.ExecContext(ctx,
 			`UPDATE contract_read_models
-			 SET status = 'active', trial_end_date = NULL, data = ?, version = ?, updated_at = NOW(6)
-			 WHERE id = ?`, raw, event.Version, contractID)
+			 SET status = ?, trial_end_date = NULL, data = ?, version = ?, updated_at = NOW(6)
+			 WHERE id = ?`, status, raw, event.Version, contractID)
 		return err
 
 	case contract.EventTypeContractRenewed:
@@ -221,6 +234,17 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 			 SET end_date = COALESCE(?, end_date), renewal_date = COALESCE(?, renewal_date),
 			     data = ?, version = ?, updated_at = NOW(6)
 			 WHERE id = ?`, newEnd, newEnd, raw, event.Version, contractID)
+		return err
+
+	case contract.EventTypePriceChanged:
+		// An immediate price change must move the read model's price_id to the
+		// new price so price-filtered queries stay accurate. NULLIF guards
+		// against clobbering the existing price_id with an empty payload value.
+		newPriceID, _ := data["new_price_id"].(string)
+		_, err := q.ExecContext(ctx,
+			`UPDATE contract_read_models
+			 SET price_id = COALESCE(NULLIF(?, ''), price_id), data = ?, version = ?, updated_at = NOW(6)
+			 WHERE id = ?`, newPriceID, raw, event.Version, contractID)
 		return err
 
 	default:
