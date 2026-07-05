@@ -68,6 +68,9 @@ func (g *Gateway) SupportedMethods() []port.PaymentMethodType {
 // TransactionStatusRequiresAction and a ThreeDSecure redirect URL rather than
 // an error.
 func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.ChargeResponse, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	amount, currency, err := toMinorUnits("amount", req.Amount)
 	if err != nil {
 		return nil, err
@@ -99,7 +102,7 @@ func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.Ch
 	if err != nil {
 		return nil, g.wrapGatewayError("charge", err)
 	}
-	return g.toChargeResponse(pi), nil
+	return g.toChargeResponse(pi)
 }
 
 // Authorize places a hold on funds without capturing, by creating and
@@ -107,6 +110,9 @@ func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.Ch
 // AuthorizationID (and TransactionID) is the PaymentIntent ID; pass it to
 // Capture or Void.
 func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*port.AuthorizeResponse, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	amount, currency, err := toMinorUnits("amount", req.Amount)
 	if err != nil {
 		return nil, err
@@ -135,13 +141,16 @@ func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*p
 	if err != nil {
 		return nil, g.wrapGatewayError("authorize", err)
 	}
-	return g.toAuthorizeResponse(pi), nil
+	return g.toAuthorizeResponse(pi)
 }
 
 // Capture captures a previously authorized PaymentIntent. A nil Amount
 // captures the full authorized amount; a smaller Amount performs a partial
 // capture.
 func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.CaptureResponse, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	if req.AuthorizationID == "" {
 		return nil, &ValidationError{Field: "AuthorizationID", Message: "must not be empty"}
 	}
@@ -161,9 +170,18 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 	if err != nil {
 		return nil, g.wrapGatewayError("capture", err)
 	}
-	captured := fromMinorUnits(pi.AmountReceived, pi.Currency)
-	if pi.AmountReceived == 0 {
-		captured = fromMinorUnits(pi.Amount, pi.Currency)
+	// AmountReceived is the amount Stripe has actually settled. Fall back to
+	// the intent's Amount only when the capture has fully succeeded but the
+	// SDK left AmountReceived unset; while the capture is still processing
+	// (AmountReceived == 0, status != succeeded) report the received amount
+	// rather than over-reporting the full authorization as captured.
+	capturedMinor := pi.AmountReceived
+	if capturedMinor == 0 && pi.Status == stripego.PaymentIntentStatusSucceeded {
+		capturedMinor = pi.Amount
+	}
+	captured, err := fromMinorUnits(capturedMinor, pi.Currency)
+	if err != nil {
+		return nil, err
 	}
 	return &port.CaptureResponse{
 		TransactionID:   pi.ID,
@@ -177,6 +195,9 @@ func (g *Gateway) Capture(ctx context.Context, req *port.CaptureRequest) (*port.
 // Void cancels a previously authorized PaymentIntent before capture (an auth
 // reversal; no funds move).
 func (g *Gateway) Void(ctx context.Context, req *port.VoidRequest) (*port.VoidResponse, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	if req.AuthorizationID == "" {
 		return nil, &ValidationError{Field: "AuthorizationID", Message: "must not be empty"}
 	}
@@ -201,6 +222,9 @@ func (g *Gateway) Void(ctx context.Context, req *port.VoidRequest) (*port.VoidRe
 // both void and cancel through PaymentIntent cancellation; Cancel uses a
 // generic "requested_by_customer" reason.
 func (g *Gateway) Cancel(ctx context.Context, req *port.CancelRequest) (*port.CancelResponse, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	if req.TransactionID == "" {
 		return nil, &ValidationError{Field: "TransactionID", Message: "must not be empty"}
 	}
@@ -224,6 +248,9 @@ func (g *Gateway) Cancel(ctx context.Context, req *port.CancelRequest) (*port.Ca
 // Refund refunds a captured or charged PaymentIntent. A nil Amount issues a
 // full refund; a smaller Amount a partial one.
 func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.RefundResponse, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	if req.TransactionID == "" {
 		return nil, &ValidationError{Field: "TransactionID", Message: "must not be empty"}
 	}
@@ -248,11 +275,15 @@ func (g *Gateway) Refund(ctx context.Context, req *port.RefundRequest) (*port.Re
 	if err != nil {
 		return nil, g.wrapGatewayError("refund", err)
 	}
+	refunded, err := fromMinorUnits(r.Amount, r.Currency)
+	if err != nil {
+		return nil, err
+	}
 	return &port.RefundResponse{
 		RefundID:      r.ID,
 		TransactionID: req.TransactionID,
 		Status:        mapRefundStatus(r.Status),
-		Amount:        fromMinorUnits(r.Amount, r.Currency),
+		Amount:        refunded,
 		Reason:        req.Reason,
 		RefundedAt:    g.timeOrNow(r.Created),
 	}, nil
@@ -270,7 +301,7 @@ func (g *Gateway) GetTransaction(ctx context.Context, transactionID string) (*po
 	if err != nil {
 		return nil, g.wrapGatewayError("get transaction", err)
 	}
-	return g.toTransaction(pi), nil
+	return g.toTransaction(pi)
 }
 
 // --- Payment methods ---
@@ -287,6 +318,9 @@ func (g *Gateway) GetTransaction(ctx context.Context, transactionID string) (*po
 // no-op on Stripe's side — so callers should retry the whole call rather than
 // treat the error as "nothing happened".
 func (g *Gateway) RegisterPaymentMethod(ctx context.Context, req *port.RegisterPaymentMethodRequest) (*port.PaymentMethodDetail, error) {
+	if req == nil {
+		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
+	}
 	if req.CustomerID == "" {
 		return nil, &ValidationError{Field: "CustomerID", Message: "must not be empty"}
 	}
@@ -412,38 +446,50 @@ func (g *Gateway) defaultPaymentMethodID(ctx context.Context, customerID string)
 
 // --- Response mapping ---
 
-func (g *Gateway) toChargeResponse(pi *stripego.PaymentIntent) *port.ChargeResponse {
+func (g *Gateway) toChargeResponse(pi *stripego.PaymentIntent) (*port.ChargeResponse, error) {
+	amount, err := fromMinorUnits(pi.Amount, pi.Currency)
+	if err != nil {
+		return nil, err
+	}
 	return &port.ChargeResponse{
 		TransactionID:     pi.ID,
 		Status:            mapIntentStatus(pi.Status),
-		Amount:            fromMinorUnits(pi.Amount, pi.Currency),
+		Amount:            amount,
 		PaymentMethodID:   intentPaymentMethodID(pi),
 		PaymentMethodType: intentPaymentMethodType(pi),
 		CreatedAt:         unixTime(pi.Created),
 		Metadata:          pi.Metadata,
 		ThreeDSecure:      threeDSResult(pi),
-	}
+	}, nil
 }
 
-func (g *Gateway) toAuthorizeResponse(pi *stripego.PaymentIntent) *port.AuthorizeResponse {
+func (g *Gateway) toAuthorizeResponse(pi *stripego.PaymentIntent) (*port.AuthorizeResponse, error) {
+	amount, err := fromMinorUnits(pi.Amount, pi.Currency)
+	if err != nil {
+		return nil, err
+	}
 	return &port.AuthorizeResponse{
 		AuthorizationID: pi.ID,
 		TransactionID:   pi.ID,
 		Status:          mapIntentStatus(pi.Status),
-		Amount:          fromMinorUnits(pi.Amount, pi.Currency),
+		Amount:          amount,
 		CreatedAt:       unixTime(pi.Created),
 		Metadata:        pi.Metadata,
 		ThreeDSecure:    threeDSResult(pi),
-	}
+	}, nil
 }
 
-func (g *Gateway) toTransaction(pi *stripego.PaymentIntent) *port.Transaction {
+func (g *Gateway) toTransaction(pi *stripego.PaymentIntent) (*port.Transaction, error) {
+	amount, err := fromMinorUnits(pi.Amount, pi.Currency)
+	if err != nil {
+		return nil, err
+	}
 	t := &port.Transaction{
 		ID:              pi.ID,
 		GatewayID:       GatewayID,
 		Type:            port.TransactionTypeCharge,
 		Status:          mapIntentStatus(pi.Status),
-		Amount:          fromMinorUnits(pi.Amount, pi.Currency),
+		Amount:          amount,
 		Description:     pi.Description,
 		PaymentMethodID: intentPaymentMethodID(pi),
 		Metadata:        pi.Metadata,
@@ -458,7 +504,7 @@ func (g *Gateway) toTransaction(pi *stripego.PaymentIntent) *port.Transaction {
 		aid := pi.ID
 		t.AuthorizationID = &aid
 	}
-	return t
+	return t, nil
 }
 
 func toPaymentMethodDetail(pm *stripego.PaymentMethod, isDefault bool) *port.PaymentMethodDetail {
@@ -504,9 +550,30 @@ func resolvePaymentMethod(paymentMethodID, token *string) (string, error) {
 	}
 }
 
+// applyThreeDS threads the port 3D Secure request onto the PaymentIntent
+// params. ReturnURL, when set, is where Stripe redirects the customer back to
+// after the challenge. Required=true asks Stripe to force a 3DS challenge by
+// setting payment_method_options[card][request_three_d_secure]="any" (rather
+// than Stripe's default of only challenging when the issuer/network requires
+// it), so a caller that demands strong authentication is not silently charged
+// without it.
 func applyThreeDS(params *stripego.PaymentIntentParams, tds *port.ThreeDSecureRequest) {
-	if tds != nil && tds.ReturnURL != "" {
+	if tds == nil {
+		return
+	}
+	if tds.ReturnURL != "" {
 		params.ReturnURL = stripego.String(tds.ReturnURL)
+	}
+	if tds.Required {
+		if params.PaymentMethodOptions == nil {
+			params.PaymentMethodOptions = &stripego.PaymentIntentPaymentMethodOptionsParams{}
+		}
+		if params.PaymentMethodOptions.Card == nil {
+			params.PaymentMethodOptions.Card = &stripego.PaymentIntentPaymentMethodOptionsCardParams{}
+		}
+		params.PaymentMethodOptions.Card.RequestThreeDSecure = stripego.String(
+			string(stripego.PaymentIntentPaymentMethodOptionsCardRequestThreeDSecureAny),
+		)
 	}
 }
 
@@ -688,6 +755,12 @@ func mapStripeErrorCode(se *stripego.Error) port.ErrorCode {
 		return port.ErrorCodeProcessingError
 	case stripego.ErrorCodeRateLimit:
 		return port.ErrorCodeRateLimitExceeded
+	case stripego.ErrorCodeAmountTooSmall:
+		return port.ErrorCodeAmountTooSmall
+	case stripego.ErrorCodeAmountTooLarge:
+		return port.ErrorCodeAmountTooLarge
+	case stripego.ErrorCodeAuthenticationRequired:
+		return port.ErrorCodeAuthenticationRequired
 	}
 
 	// Fall back to the error type / HTTP status when there is no specific

@@ -24,7 +24,20 @@
 // rejects amounts that are not exactly representable, non-positive, or out of
 // int64 range with a typed error. Only the currencies defined in
 // domain/shared (JPY, USD, EUR) are supported; extend currencyExponent when
-// core adds more.
+// core adds more. A Stripe response reporting an amount in any other currency
+// is rejected rather than decoded at a guessed exponent.
+//
+// # Idempotency (24h window)
+//
+// An IdempotencyKey set on Charge, Authorize, Capture or Refund is forwarded
+// verbatim as Stripe's Idempotency-Key header. Stripe only retains an
+// idempotency key for about 24 hours, after which the same key is treated as a
+// fresh request — so a retry beyond that window is NOT deduplicated by Stripe
+// and can double-charge. This adapter therefore satisfies the core
+// PaymentService's "gateway deduplicates on IdempotencyKey" contract only
+// within 24h. For durable deduplication (e.g. a payment retried days later by
+// a dunning batch), pair the gateway with the core port.IdempotencyStore so
+// the outcome is remembered independently of Stripe's window.
 package stripe
 
 import (
@@ -91,14 +104,27 @@ func toMinorUnits(field string, m shared.Money) (int64, string, error) {
 }
 
 // fromMinorUnits builds a shared.Money from a Stripe integer amount and its
-// currency code (Stripe returns lowercase ISO codes). Unknown currencies fall
-// back to a zero exponent (whole-unit) rather than failing, so response
-// mapping never loses data even for a currency not in currencyExponent.
-func fromMinorUnits(amount int64, cur stripego.Currency) shared.Money {
+// currency code (Stripe returns lowercase ISO codes). A currency absent from
+// currencyExponent is rejected with a *port.GatewayError rather than being
+// silently decoded at a zero exponent: guessing whole units would misreport a
+// two-decimal amount by 100x (e.g. GBP 2599 minor units read back as 2599
+// instead of 25.99). Callers propagate the error so a response in an
+// unexpected currency surfaces loudly instead of corrupting the recorded
+// amount.
+func fromMinorUnits(amount int64, cur stripego.Currency) (shared.Money, error) {
 	currency := shared.Currency(strings.ToUpper(string(cur)))
-	exp := currencyExponent[currency] // 0 when unknown
+	exp, ok := currencyExponent[currency]
+	if !ok {
+		return shared.Money{}, &port.GatewayError{
+			Code: port.ErrorCodeCurrencyNotSupported,
+			Message: fmt.Sprintf(
+				"stripe: cannot convert %d minor units: response currency %q is not one of %v",
+				amount, cur, supportedCurrencies(),
+			),
+		}
+	}
 	r := new(big.Rat).SetFrac(big.NewInt(amount), pow10(exp))
-	return shared.NewMoney(r, currency)
+	return shared.NewMoney(r, currency), nil
 }
 
 func supportedCurrencies() []shared.Currency {

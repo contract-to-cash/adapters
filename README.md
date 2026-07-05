@@ -129,6 +129,10 @@ implemented; nothing is rejected as unsupported except by currency.
   converted using each currency's exponent; an amount that is not exactly
   representable in minor units (e.g. `100.5` JPY), non-positive, or beyond
   int64 range is rejected with a `*ValidationError` before any network call.
+  On the response side, a Stripe amount reported in a currency outside
+  `currencyExponent` is rejected with a `port.GatewayError`
+  (`currency_not_supported`) rather than decoded at a guessed zero exponent —
+  guessing whole units would misreport a two-decimal amount by 100x.
 - **IDs**: the port-level `TransactionID` and `AuthorizationID` are both the
   Stripe **PaymentIntent** ID (`pi_...`) — Charge/Authorize create it,
   Capture/Void/Cancel/GetTransaction operate on it by that single ID (no
@@ -141,11 +145,14 @@ implemented; nothing is rejected as unsupported except by currency.
   settles it. Void and Cancel both cancel the PaymentIntent (Stripe models an
   auth reversal and a cancel the same way), differing only in the recorded
   cancellation reason.
-- **3D Secure**: a required authentication surfaces as a **successful**
-  response with `TransactionStatusRequiresAction` and a
-  `ThreeDSecureResult.RedirectURL` (from the PaymentIntent's
-  `next_action.redirect_to_url`), not an error — the caller redirects the
-  customer and completes the flow.
+- **3D Secure**: `ThreeDSecureRequest.Required = true` forces a challenge by
+  sending `payment_method_options[card][request_three_d_secure] = "any"` (so a
+  caller demanding strong authentication is never charged without it);
+  `ReturnURL` is forwarded as the PaymentIntent's `return_url`. A required
+  authentication then surfaces as a **successful** response with
+  `TransactionStatusRequiresAction` and a `ThreeDSecureResult.RedirectURL`
+  (from the PaymentIntent's `next_action.redirect_to_url`), not an error — the
+  caller redirects the customer and completes the flow.
 - **Payment methods**: `RegisterPaymentMethod` attaches an existing
   Stripe PaymentMethod (created client-side with Stripe.js/Elements and passed
   as `Token`) to the customer, optionally setting it as the customer's default
@@ -153,10 +160,14 @@ implemented; nothing is rejected as unsupported except by currency.
   the adapter never handles raw PANs.
 - **Idempotency**: `IdempotencyKey` on Charge/Authorize/Capture/Refund is
   forwarded verbatim as Stripe's `Idempotency-Key` header. **Stripe expires
-  idempotency keys after 24h**, so a retry beyond that window is no longer
-  deduplicated by Stripe; permanent deduplication (as the core
-  `PaymentService` expects) must also be backed by the caller's own payment
-  records.
+  idempotency keys after ~24h**, so a retry beyond that window is no longer
+  deduplicated by Stripe and can double-charge. Unlike the fincode adapter
+  (which derives a deterministic order ID and so dedups permanently), this
+  adapter only satisfies the core `PaymentService`'s "gateway deduplicates on
+  `IdempotencyKey`" contract within that 24h window. For durable
+  deduplication — e.g. a payment retried days later by a dunning batch — pair
+  the gateway with the core `port.IdempotencyStore` (recommended), so the
+  recorded outcome, not Stripe's window, gates the replay.
 - **Refunds**: full (`Amount == nil`) or partial (`Amount` set). Only
   Stripe's accepted reasons (`duplicate` / `fraudulent` /
   `requested_by_customer`) are forwarded; `RefundReasonOther` (and any other
