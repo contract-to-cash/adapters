@@ -24,15 +24,39 @@ const (
 
 // Config holds fincode client configuration.
 type Config struct {
-	APIKey  string
-	BaseURL string // defaults to SandboxBaseURL if empty
+	APIKey string
+
+	// BaseURL is the fincode API endpoint. It must be set explicitly (e.g.
+	// ProductionBaseURL or SandboxBaseURL) unless Sandbox is true. An empty
+	// BaseURL no longer silently falls back to the sandbox: a forgotten
+	// production BaseURL used to route every "successful" payment to the test
+	// environment with no error, and that failure mode stayed invisible.
+	BaseURL string
+
+	// Sandbox opts in to the fincode test endpoint (SandboxBaseURL) when
+	// BaseURL is empty. It is ignored when BaseURL is set. This makes the
+	// sandbox an explicit choice rather than a silent default for a
+	// misconfigured client.
+	Sandbox bool
 }
 
-func (c Config) baseURL() string {
+// resolveBaseURL returns the effective base URL, or an error when none can be
+// determined. BaseURL takes precedence; an empty BaseURL resolves to the
+// sandbox only when Sandbox is true, and is otherwise a hard error so a
+// misconfigured production deployment fails loudly instead of silently
+// charging against the test environment.
+func (c Config) resolveBaseURL() (string, error) {
 	if c.BaseURL != "" {
-		return c.BaseURL
+		return c.BaseURL, nil
 	}
-	return SandboxBaseURL
+	if c.Sandbox {
+		return SandboxBaseURL, nil
+	}
+	return "", &ValidationError{
+		Field: "BaseURL",
+		Message: "must be set explicitly (e.g. fincode.ProductionBaseURL or " +
+			"fincode.SandboxBaseURL); set Config.Sandbox=true to opt in to the test endpoint",
+	}
 }
 
 // Client is a low-level HTTP client for the fincode API.
@@ -44,13 +68,21 @@ type Client struct {
 
 // NewClient creates a new fincode API client.
 //
+// It returns an error when cfg.BaseURL is empty and cfg.Sandbox is false, so a
+// forgotten endpoint is caught at construction rather than silently defaulting
+// to the sandbox.
+//
 // By default, a new http.Client with a DefaultTimeout is created. Use
 // WithHTTPClient to override this (e.g., to share a client or configure
 // transport-level retries).
-func NewClient(cfg Config, opts ...ClientOption) *Client {
+func NewClient(cfg Config, opts ...ClientOption) (*Client, error) {
+	baseURL, err := cfg.resolveBaseURL()
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
 		apiKey:  cfg.APIKey,
-		baseURL: cfg.baseURL(),
+		baseURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
@@ -58,7 +90,7 @@ func NewClient(cfg Config, opts ...ClientOption) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
-	return c
+	return c, nil
 }
 
 // ClientOption configures the Client.

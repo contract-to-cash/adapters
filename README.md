@@ -59,7 +59,12 @@ server-side from `expectedVersion`.
   `idempotent_key` header window (the header is still sent as well). On such
   a duplicate rejection the adapter retrieves the existing order and replays
   its outcome (success if already completed, `*PartialAuthorizeError` if
-  registered but not executed). Void/Cancel/Refund forward their
+  registered but not executed) — but only when the request's amount and job
+  code match the existing order. Reusing the same `IdempotencyKey` for a
+  **different amount or job code** is rejected with a non-retryable
+  `port.GatewayError` (`processing_error`) instead of silently replaying the
+  original amount's outcome (matching Stripe, which refuses idempotency-key
+  reuse with changed parameters). Void/Cancel/Refund forward their
   `IdempotencyKey` as the `idempotent_key` header verbatim; Capture, which
   can issue `/change` + `/capture` from one request, forwards a distinct
   per-operation key derived from it for each call.
@@ -79,6 +84,23 @@ server-side from `expectedVersion`.
   payment's current state first, so a lost execute *response* (payment
   actually captured/authorized) is converted into a success instead of a
   failed re-execute.
+- **Capture**: a partial capture below the authorized hold is applied via
+  `/change` then `/capture`. A capture amount **above** the authorized hold is
+  rejected with a `*ValidationError` before any mutating call — fincode's
+  `/change` would otherwise silently raise the hold and over-charge (Stripe's
+  API rejects over-capture server-side; fincode does not).
+- **Configuration / `BaseURL`**: `Config.BaseURL` must be set explicitly
+  (`fincode.ProductionBaseURL` or `fincode.SandboxBaseURL`). An empty `BaseURL`
+  **no longer** silently defaults to the sandbox; `NewClient` returns an error
+  instead, so a forgotten production endpoint fails at construction rather than
+  routing every "successful" payment to the test environment unnoticed. To use
+  the sandbox, either set `BaseURL: fincode.SandboxBaseURL` or set
+  `Config.Sandbox: true` (an explicit opt-in; ignored when `BaseURL` is set).
+
+  > **Migration (breaking change)**: `NewClient(Config)` now returns
+  > `(*Client, error)`. Update call sites to handle the error, and set
+  > `BaseURL` (or `Sandbox: true`) explicitly — code that relied on the empty
+  > `BaseURL` → sandbox default must now opt in via `Sandbox: true`.
 - **Webhooks**: `fincode.WebhookHandler` verifies a configurable signature
   header (default `"signature"`, constant-time comparison) in one of two
   **explicitly selected** modes — there is **no default**, because fincode's
