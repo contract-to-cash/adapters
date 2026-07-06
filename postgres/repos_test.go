@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -32,6 +33,25 @@ func newDraftContract(t *testing.T, id shared.ContractID, accountID shared.Accou
 	agg := contract.NewContractAggregate(id, clock)
 	err := agg.Create(contract.CreateContractCommand{
 		IdempotencyKey: "idem-" + string(id),
+		AccountID:      accountID,
+		PriceID:        priceID,
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
+		Price:          jpy(1000),
+	}, eventstore.EventMetadata{UserID: "test-user"})
+	if err != nil {
+		t.Fatalf("Create contract %s: %v", id, err)
+	}
+	return agg
+}
+
+// newDraftContractKey is like newDraftContract but lets the caller choose the
+// idempotency key so two aggregates can deliberately collide.
+func newDraftContractKey(t *testing.T, id shared.ContractID, accountID shared.AccountID, priceID shared.PriceID, key string, clock shared.Clock) *contract.ContractAggregate {
+	t.Helper()
+	agg := contract.NewContractAggregate(id, clock)
+	err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: key,
 		AccountID:      accountID,
 		PriceID:        priceID,
 		ContractType:   contract.ContractTypeSubscription,
@@ -485,7 +505,129 @@ func mustPayment(t *testing.T, id, invoiceID, idempotencyKey string, status paym
 	return p
 }
 
+// Contract creation is idempotent at the storage layer: migration 010's partial
+// unique index over the contract.created event's idempotency_key rejects a
+// SECOND creation reusing a key, translated by the event store to an
+// ErrCodeConflict DomainError (per contract.Repository.Save's godoc). Distinct
+// keys are unaffected; historical events with no key are exempt.
+func TestContractRepo_DuplicateIdempotencyKey(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	repo := postgres.NewContractRepository(pool, es, clock)
+	ctx := context.Background()
+
+	first := newDraftContractKey(t, "c-idem-1", "acc-idem", "price-1", "dup-key", clock)
+	if err := repo.Save(ctx, first); err != nil {
+		t.Fatalf("Save first: %v", err)
+	}
+
+	// Same idempotency key, different contract id -> at-most-once creation.
+	second := newDraftContractKey(t, "c-idem-2", "acc-idem", "price-1", "dup-key", clock)
+	err := repo.Save(ctx, second)
+	var de *shared.DomainError
+	if !errors.As(err, &de) || de.Code != shared.ErrCodeConflict {
+		t.Fatalf("expected conflict DomainError on duplicate idempotency key, got %v", err)
+	}
+	// Only the winner persisted.
+	var streams int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(DISTINCT stream_id) FROM events WHERE data->>'idempotency_key' = 'dup-key'`).Scan(&streams); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if streams != 1 {
+		t.Errorf("expected 1 contract for the key, got %d", streams)
+	}
+
+	// A different key is fine.
+	third := newDraftContractKey(t, "c-idem-3", "acc-idem", "price-1", "other-key", clock)
+	if err := repo.Save(ctx, third); err != nil {
+		t.Fatalf("Save with distinct key: %v", err)
+	}
+
+	// Historical events with an absent idempotency_key are EXEMPT: two raw
+	// contract.created events without the key must coexist (the partial index
+	// excludes coalesce(data->>'idempotency_key','') = '').
+	for _, id := range []string{"c-legacy-1", "c-legacy-2"} {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO events (id, stream_id, type, version, schema_version, data, metadata, occurred_at)
+			 VALUES ($1, $1, 'contract.created', 1, 2, $2, '{}', NOW())`,
+			id, fmt.Sprintf(`{"contract_id":%q,"account_id":"acc-legacy"}`, id)); err != nil {
+			t.Fatalf("insert legacy event %s: %v", id, err)
+		}
+	}
+}
+
+// The event store round-trips whatever SchemaVersion core stamps on an event —
+// the append/load path is agnostic to it (ContractCreatedEvent is v3 since
+// core#159). It must store and return v3 unchanged, never coercing to 1.
+func TestEventStore_SchemaVersionRoundTrip(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	ev := eventstore.Event{
+		ID: "sv-1", Type: contract.EventTypeContractCreated, SchemaVersion: 3,
+		Data:       json.RawMessage(`{"contract_id":"c-sv","account_id":"a","idempotency_key":"sv-key"}`),
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := store.Append(ctx, "c-sv", []eventstore.Event{ev}, 0); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loaded, err := store.Load(ctx, "c-sv")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].SchemaVersion != 3 {
+		t.Fatalf("expected 1 event at SchemaVersion 3, got %+v", loaded)
+	}
+}
+
 // --- Balance Repository ---
+
+func TestBalanceRepo_FindExpired(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	repo := postgres.NewBalanceRepository(pool)
+	ctx := context.Background()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	asOf := base.Add(30 * 24 * time.Hour)
+	past := base.Add(24 * time.Hour)   // expired before asOf
+	future := asOf.Add(24 * time.Hour) // not yet expired
+
+	mk := func(id string, remaining int64, expires *time.Time, off time.Duration) {
+		snap := balance.BalanceEntrySnapshot{
+			ID: shared.BalanceEntryID(id), AccountID: "acc-exp",
+			OriginalAmount: jpy(1000), RemainingAmount: jpy(remaining),
+			Reason: balance.BalanceReasonManualAdjustment, SourceType: balance.BalanceSourceTypeManual,
+			ExpiresAt: expires, Version: 0, CreatedAt: base.Add(off),
+		}
+		e, err := balance.FromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, e); err != nil {
+			t.Fatalf("Save %s: %v", id, err)
+		}
+	}
+	mk("exp-old", 500, &past, time.Hour)      // expired + remaining -> included (first)
+	mk("exp-new", 700, &past, 2*time.Hour)    // expired + remaining -> included (second)
+	mk("exp-consumed", 0, &past, 3*time.Hour) // expired but fully consumed -> excluded
+	mk("live", 900, &future, 4*time.Hour)     // not expired -> excluded
+	mk("no-expiry", 900, nil, 5*time.Hour)    // no expiry -> excluded
+
+	got, err := repo.FindExpired(ctx, asOf)
+	if err != nil {
+		t.Fatalf("FindExpired: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 expired entries with remaining, got %d: %+v", len(got), got)
+	}
+	if got[0].ToSnapshot().ID != "exp-old" || got[1].ToSnapshot().ID != "exp-new" {
+		t.Errorf("expected FIFO order [exp-old exp-new], got [%s %s]",
+			got[0].ToSnapshot().ID, got[1].ToSnapshot().ID)
+	}
+}
 
 func TestBalanceRepo_SaveAndFindByID(t *testing.T) {
 	pool := postgrestest.NewPool(t)

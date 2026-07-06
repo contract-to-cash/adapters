@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/contract-to-cash/core/application/tx"
@@ -25,7 +26,11 @@ func newBalanceRepo(t *testing.T) (*MySQLBalanceRepository, sqlmock.Sqlmock) {
 // newBalanceEntry builds a fresh entry (loadedVersion 0 -> INSERT path).
 func newBalanceEntry(t *testing.T) *balance.BalanceEntry {
 	t.Helper()
-	return balance.NewBalanceEntry("acct-1", jpy(1000), balance.BalanceReason("proration"), fixedTime)
+	e, err := balance.NewBalanceEntry("acct-1", jpy(1000), balance.BalanceReason("proration"), fixedTime)
+	if err != nil {
+		t.Fatalf("NewBalanceEntry: %v", err)
+	}
+	return e
 }
 
 // loadedBalanceEntry builds an entry as if loaded from the DB at the given
@@ -136,6 +141,42 @@ func TestBalanceRepo_FindByID_NotFound(t *testing.T) {
 	var de *shared.DomainError
 	if !errors.As(err, &de) || de.Code != shared.ErrCodeNotFound {
 		t.Fatalf("expected not_found DomainError, got %v", err)
+	}
+}
+
+// FindExpired queries entries whose expiry has passed (expires_at < asOf) and
+// drops fully-consumed rows in Go on the precise remaining amount. Here bal-live
+// keeps a non-zero remainder (kept) while bal-spent is fully consumed (dropped),
+// exercising the filterExpiredBalance mirror of inmemory's !IsFullyConsumed.
+func TestBalanceRepo_FindExpired(t *testing.T) {
+	repo, mock := newBalanceRepo(t)
+	asOf := fixedTime
+	expiredAt := fixedTime.Add(-time.Hour)
+
+	rows := sqlmock.NewRows([]string{
+		"id", "account_id", "original_amount", "remaining_amount", "currency",
+		"reason", "source_type", "source_id", "description", "expires_at", "version", "created_at", "state",
+	}).AddRow(
+		"bal-live", "acct-1", int64(1000), int64(400), "JPY",
+		"promo", "", "", "", expiredAt, 0, fixedTime, nil,
+	).AddRow(
+		"bal-spent", "acct-1", int64(1000), int64(0), "JPY",
+		"promo", "", "", "", expiredAt, 0, fixedTime, nil,
+	)
+
+	mock.ExpectQuery(`SELECT .* FROM balance_entries WHERE expires_at IS NOT NULL AND expires_at < \? ORDER BY created_at ASC`).
+		WithArgs(asOf.UTC()).
+		WillReturnRows(rows)
+
+	got, err := repo.FindExpired(context.Background(), asOf)
+	if err != nil {
+		t.Fatalf("FindExpired: %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "bal-live" {
+		t.Fatalf("expected only the non-consumed expired entry bal-live, got %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 

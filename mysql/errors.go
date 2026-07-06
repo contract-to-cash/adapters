@@ -48,6 +48,15 @@ func isDuplicateEventID(err error) bool {
 	return dupEntryOnKey(err, "uq_event_id")
 }
 
+// isContractIdempotencyKeyConflict reports whether err is a duplicate-key error
+// on the ux_contract_idempotency_key UNIQUE index (migration 009). That index
+// enforces at-most-once contract creation per idempotency key; a clash there is
+// a creation conflict, distinct from a uq_stream_version optimistic-concurrency
+// conflict.
+func isContractIdempotencyKeyConflict(err error) bool {
+	return dupEntryOnKey(err, "ux_contract_idempotency_key")
+}
+
 // versionConflict wraps a cause in the core's structured optimistic-concurrency
 // error so callers can detect it via errors.As(*shared.DomainError) and Code.
 func versionConflict(streamID string, cause error) error {
@@ -67,6 +76,19 @@ func duplicateEventID(eventID string, cause error) error {
 	return shared.NewDomainErrorWithCause(
 		shared.ErrCodeConflict,
 		"event store: duplicate event id "+eventID,
+		cause,
+	)
+}
+
+// contractIdempotencyConflict wraps a cause in the core's structured conflict
+// error for a rejected contract creation. Per contract.Repository.Save's godoc
+// this maps to ErrCodeConflict so the retried caller can look up the existing
+// contract rather than treat it as a retryable version conflict. Mirrors the
+// payments #35 idempotency-conflict translation.
+func contractIdempotencyConflict(streamID string, cause error) error {
+	return shared.NewDomainErrorWithCause(
+		shared.ErrCodeConflict,
+		"event store: contract creation idempotency key conflict for stream "+streamID,
 		cause,
 	)
 }

@@ -32,6 +32,22 @@ func filterAvailableBalance(entries []*balance.BalanceEntry) []*balance.BalanceE
 	return result
 }
 
+// filterExpiredBalance drops fully-consumed entries, mirroring the in-memory
+// FindExpired's !IsFullyConsumed() check (remaining amount is zero) on the
+// precise (non-truncated) amount rather than the lossy BIGINT column (issue
+// #11). An entry with any non-zero remainder is retained so the batch can
+// forfeit it.
+func filterExpiredBalance(entries []*balance.BalanceEntry) []*balance.BalanceEntry {
+	var result []*balance.BalanceEntry
+	for _, e := range entries {
+		if e.RemainingAmount().IsZero() {
+			continue
+		}
+		result = append(result, e)
+	}
+	return result
+}
+
 // sumRemaining adds up the remaining amounts of the given entries using exact
 // Money arithmetic.
 func sumRemaining(entries []*balance.BalanceEntry, currency shared.Currency) (shared.Money, error) {

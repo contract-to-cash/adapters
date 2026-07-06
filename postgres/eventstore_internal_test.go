@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestReportSubErr_FiltersContextCancellation(t *testing.T) {
@@ -57,3 +59,28 @@ func TestNewEventStore_DefaultsAndOptions(t *testing.T) {
 }
 
 func errwrap(err error) error { return errors.Join(errors.New("subscribe"), err) }
+
+// isContractIdempotencyKeyConflict must match ONLY a 23505 unique-violation on
+// the ux_contract_idempotency_key index — not the stream-version constraint and
+// not a non-pg error — so an unrelated unique violation is never misreported as
+// a contract-creation conflict (mirrors isVersionConflict).
+func TestIsContractIdempotencyKeyConflict(t *testing.T) {
+	match := &pgconn.PgError{Code: pgUniqueViolation, ConstraintName: contractIdempotencyKeyConstraint}
+	if !isContractIdempotencyKeyConflict(match) {
+		t.Error("expected match on ux_contract_idempotency_key 23505")
+	}
+
+	streamVersion := &pgconn.PgError{Code: pgUniqueViolation, ConstraintName: "events_stream_id_version_key"}
+	if isContractIdempotencyKeyConflict(streamVersion) {
+		t.Error("stream-version conflict must not be classified as an idempotency conflict")
+	}
+
+	wrongCode := &pgconn.PgError{Code: "23503", ConstraintName: contractIdempotencyKeyConstraint}
+	if isContractIdempotencyKeyConflict(wrongCode) {
+		t.Error("a non-23505 code must not match")
+	}
+
+	if isContractIdempotencyKeyConflict(errors.New("boom")) {
+		t.Error("a non-pg error must not match")
+	}
+}

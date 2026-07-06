@@ -209,6 +209,36 @@ func (r *MySQLBalanceRepository) SaveRefund(ctx context.Context, refund *balance
 	return nil
 }
 
+// FindExpired returns entries whose expiry has passed as of asOf and whose
+// remaining amount is still non-zero (expired credit not yet forfeited by
+// MarkExpired), ordered by creation time ascending. It feeds the core
+// batch.BalanceExpirationProcessor (issue #159 / adapters#46) and mirrors the
+// in-memory reference (infrastructure/inmemory/balance_repository.go) exactly:
+//
+//   - Expired is BalanceEntry.IsExpired(asOf), i.e. asOf strictly after
+//     expires_at. `expires_at < ?` encodes exactly that (asOf > expires_at);
+//     rows without an expiry (expires_at IS NULL) are excluded.
+//   - Fully-consumed entries are dropped in Go on the PRECISE remaining amount
+//     from the state JSON, not the lossy BIGINT column, so a sub-unit remainder
+//     still counts as forfeitable credit (same #11 filtering as FindAvailable).
+//   - Scanned across all accounts/currencies (the batch is global), ordered by
+//     created_at ASC for deterministic processing.
+func (r *MySQLBalanceRepository) FindExpired(ctx context.Context, asOf time.Time) ([]*balance.BalanceEntry, error) {
+	rows, err := r.q(ctx).QueryContext(ctx,
+		selectBalanceEntrySQL+`
+		 WHERE expires_at IS NOT NULL AND expires_at < ?
+		 ORDER BY created_at ASC`, asOf.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("find expired balance: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	entries, err := scanBalanceEntries(rows)
+	if err != nil {
+		return nil, err
+	}
+	return filterExpiredBalance(entries), nil
+}
+
 func (r *MySQLBalanceRepository) FindByAccountID(ctx context.Context, accountID shared.AccountID, currency shared.Currency) ([]*balance.BalanceEntry, error) {
 	rows, err := r.q(ctx).QueryContext(ctx,
 		selectBalanceEntrySQL+` WHERE account_id = ? AND currency = ? ORDER BY created_at ASC`,

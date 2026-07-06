@@ -103,7 +103,11 @@ func (r *MySQLContractRepository) FindExpiring(ctx context.Context, before time.
 		 WHERE end_date IS NOT NULL AND end_date < ? AND status = 'active'`, before.UTC())
 }
 
-func (r *MySQLContractRepository) FindTrialsEndingSoon(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
+// FindTrialsEndingBefore returns trialing contracts whose trial_end_date is
+// strictly before the given time (renamed from FindTrialsEndingSoon to match
+// core#162 B4; the batch calls it with `now` to find trials that have ALREADY
+// ended).
+func (r *MySQLContractRepository) FindTrialsEndingBefore(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
 	return r.findManyFromReadModel(ctx,
 		`SELECT id FROM contract_read_models
 		 WHERE trial_end_date IS NOT NULL AND trial_end_date < ? AND status = 'trialing'`, before.UTC())

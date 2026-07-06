@@ -159,6 +159,13 @@ func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, e
 			if isStreamVersionConflict(err) {
 				return versionConflict(streamID, err)
 			}
+			// A different contract.created event reused an idempotency key
+			// (migration 009's ux_contract_idempotency_key). This is a creation
+			// conflict, not a retryable version conflict — surface it as
+			// ErrCodeConflict per contract.Repository.Save's godoc.
+			if isContractIdempotencyKeyConflict(err) {
+				return contractIdempotencyConflict(streamID, err)
+			}
 			return fmt.Errorf("event store: insert event %s: %w", e.ID, err)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/contract-to-cash/adapters/mysql"
 	"github.com/contract-to-cash/adapters/mysql/mysqltest"
+	"github.com/contract-to-cash/core/domain/balance"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
@@ -126,6 +128,96 @@ func TestIntegration_EventStore_DuplicateEventIDIsNotVersionConflict(t *testing.
 	}
 	if len(loaded) != 0 {
 		t.Errorf("expected 0 events on stream-dup-b, got %d", len(loaded))
+	}
+}
+
+// A contract.created event reusing an idempotency key trips migration 009's
+// ux_contract_idempotency_key UNIQUE index and must surface as ErrCodeConflict
+// (a creation conflict), NOT version_conflict. Distinct keys are unaffected, and
+// historical events with no key are exempt (the generated column is NULL, and a
+// UNIQUE index permits multiple NULLs). This is the case sqlmock cannot catch:
+// real MySQL evaluates the STORED generated column and produces the 1062.
+func TestIntegration_EventStore_ContractIdempotencyKeyUniqueness(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	store := mysql.New(db, integrationClock)
+	ctx := context.Background()
+
+	created := func(key string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"contract_id":"x","account_id":"a","idempotency_key":%q}`, key))
+	}
+
+	// First contract.created with a non-empty key succeeds.
+	ev1 := eventstore.Event{ID: "idem-a", Type: "contract.created", SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
+	if err := store.Append(ctx, "c-idem-a", []eventstore.Event{ev1}, 0); err != nil {
+		t.Fatalf("first Append: %v", err)
+	}
+
+	// A DIFFERENT stream reusing the same key is rejected as a conflict.
+	ev2 := eventstore.Event{ID: "idem-b", Type: "contract.created", SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
+	err := store.Append(ctx, "c-idem-b", []eventstore.Event{ev2}, 0)
+	if isDomainError(err, shared.ErrCodeVersionConflict) {
+		t.Fatalf("idempotency conflict must NOT be version_conflict: %v", err)
+	}
+	if !isDomainError(err, shared.ErrCodeConflict) {
+		t.Fatalf("expected conflict DomainError, got %v", err)
+	}
+
+	// A distinct key is fine.
+	ev3 := eventstore.Event{ID: "idem-c", Type: "contract.created", SchemaVersion: 3, Data: created("other-key"), OccurredAt: time.Now().UTC()}
+	if err := store.Append(ctx, "c-idem-c", []eventstore.Event{ev3}, 0); err != nil {
+		t.Fatalf("distinct key Append: %v", err)
+	}
+
+	// Historical events with NO idempotency_key are exempt: two coexist.
+	for _, s := range []struct{ id, stream string }{{"legacy-a", "c-legacy-a"}, {"legacy-b", "c-legacy-b"}} {
+		ev := eventstore.Event{ID: s.id, Type: "contract.created", SchemaVersion: 2, Data: json.RawMessage(`{"contract_id":"x","account_id":"a"}`), OccurredAt: time.Now().UTC()}
+		if err := store.Append(ctx, s.stream, []eventstore.Event{ev}, 0); err != nil {
+			t.Fatalf("legacy Append %s: %v", s.id, err)
+		}
+	}
+}
+
+// FindExpired returns non-consumed entries whose expiry has passed as of asOf,
+// ordered FIFO, feeding the core BalanceExpirationProcessor. Mirrors the
+// inmemory reference: fully-consumed and not-yet-expired and no-expiry entries
+// are excluded.
+func TestIntegration_BalanceRepo_FindExpired(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	repo := mysql.NewBalanceRepository(db)
+	ctx := context.Background()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	asOf := base.Add(30 * 24 * time.Hour)
+	past := base.Add(24 * time.Hour)
+	future := asOf.Add(24 * time.Hour)
+
+	mk := func(id string, remaining int64, expires *time.Time, off time.Duration) {
+		snap := balance.BalanceEntrySnapshot{
+			ID: shared.BalanceEntryID(id), AccountID: "acc-exp",
+			OriginalAmount: jpy(1000), RemainingAmount: jpy(remaining),
+			Reason: balance.BalanceReasonManualAdjustment, SourceType: balance.BalanceSourceTypeManual,
+			ExpiresAt: expires, Version: 0, CreatedAt: base.Add(off),
+		}
+		e, err := balance.FromSnapshot(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, e); err != nil {
+			t.Fatalf("Save %s: %v", id, err)
+		}
+	}
+	mk("exp-old", 500, &past, time.Hour)
+	mk("exp-new", 700, &past, 2*time.Hour)
+	mk("exp-consumed", 0, &past, 3*time.Hour)
+	mk("live", 900, &future, 4*time.Hour)
+	mk("no-expiry", 900, nil, 5*time.Hour)
+
+	got, err := repo.FindExpired(ctx, asOf)
+	if err != nil {
+		t.Fatalf("FindExpired: %v", err)
+	}
+	if len(got) != 2 || got[0].ToSnapshot().ID != "exp-old" || got[1].ToSnapshot().ID != "exp-new" {
+		t.Fatalf("expected [exp-old exp-new], got %+v", got)
 	}
 }
 

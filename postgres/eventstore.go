@@ -146,6 +146,20 @@ func (s *PostgresEventStore) appendInTx(ctx context.Context, streamID string, ev
 					fmt.Sprintf("stream %q version conflict at version %d", streamID, version),
 				)
 			}
+			if isContractIdempotencyKeyConflict(err) {
+				// A different contract.created event carried an idempotency key
+				// already used by another contract (migration 010's partial
+				// unique index ux_contract_idempotency_key). Per
+				// contract.Repository.Save's godoc this is a creation conflict,
+				// not a version conflict: the retried caller should look up the
+				// existing contract instead of retrying. Mirrors the payments
+				// #35 idempotency-conflict translation.
+				return shared.NewDomainErrorWithCause(
+					shared.ErrCodeConflict,
+					fmt.Sprintf("contract creation idempotency key conflict for stream %q", streamID),
+					err,
+				)
+			}
 			return fmt.Errorf("insert event: %w", err)
 		}
 	}
@@ -160,6 +174,25 @@ func isVersionConflict(err error) bool {
 	if errors.As(err, &pgErr) {
 		return pgErr.Code == pgUniqueViolation &&
 			pgErr.ConstraintName == "events_stream_id_version_key"
+	}
+	return false
+}
+
+// contractIdempotencyKeyConstraint is the name of the partial unique expression
+// index created by migration 010 over the contract.created event's
+// data->>'idempotency_key'. A unique-violation carries the index name in
+// ConstraintName, so matching on it — not the bare 23505 — keeps an unrelated
+// unique violation from being misreported as an idempotency conflict (same
+// approach as isVersionConflict / the payments idempotency constraint).
+const contractIdempotencyKeyConstraint = "ux_contract_idempotency_key"
+
+// isContractIdempotencyKeyConflict reports whether err is a unique-violation
+// (23505) specifically on the contract idempotency-key index.
+func isContractIdempotencyKeyConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgUniqueViolation &&
+			pgErr.ConstraintName == contractIdempotencyKeyConstraint
 	}
 	return false
 }
