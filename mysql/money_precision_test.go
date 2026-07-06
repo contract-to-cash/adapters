@@ -148,7 +148,7 @@ func TestPaymentRepo_MoneyRoundTrip_Fraction(t *testing.T) {
 		t.Fatalf("FromSnapshot: %v", err)
 	}
 	idem := "idem-frac"
-	mock.ExpectExec(`INSERT INTO payments .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`INSERT INTO payments`).
 		WithArgs("pay-frac", "inv-1", &idem, int64(100), int64(25),
 			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), state).
 		WillReturnResult(sqlmock.NewResult(1, 1))

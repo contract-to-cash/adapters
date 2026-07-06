@@ -9,6 +9,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
+	driver "github.com/go-sql-driver/mysql"
 )
 
 func newPaymentRepo(t *testing.T) (*MySQLPaymentRepository, sqlmock.Sqlmock) {
@@ -53,18 +54,78 @@ func paymentFindRow() *sqlmock.Rows {
 	)
 }
 
-func TestPaymentRepo_Save_Upsert(t *testing.T) {
+// A new payment is a plain INSERT (no ON DUPLICATE KEY UPDATE, so an
+// idempotency_key collision can no longer silently overwrite the winner —
+// issue #35).
+func TestPaymentRepo_Save_InsertNew(t *testing.T) {
 	repo, mock := newPaymentRepo(t)
 	p := samplePayment(t)
 
 	idem := "idem-pay-1"
-	mock.ExpectExec(`INSERT INTO payments .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`INSERT INTO payments`).
 		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
 			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), p); err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A same-id re-save collides on the PRIMARY key; Save must fall through to a
+// guarded UPDATE keyed on id (the 3DS Pending -> Completed upgrade path).
+func TestPaymentRepo_Save_UpdateExisting(t *testing.T) {
+	repo, mock := newPaymentRepo(t)
+	p := samplePayment(t)
+
+	idem := "idem-pay-1"
+	mock.ExpectExec(`INSERT INTO payments`).
+		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'pay-1' for key 'payments.PRIMARY'"})
+	mock.ExpectExec(`UPDATE payments SET`).
+		WithArgs("inv-1", &idem, int64(1100), int64(0), "JPY", "completed", "credit_card",
+			"txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "pay-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Save(context.Background(), p); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A duplicate on the idempotency_key UNIQUE index (a DIFFERENT payment already
+// owns the key) must translate to the core sentinel so PaymentService converges
+// on the winner rather than firing saga compensation.
+func TestPaymentRepo_Save_DuplicateIdempotencyKey(t *testing.T) {
+	repo, mock := newPaymentRepo(t)
+	p := samplePayment(t)
+
+	idem := "idem-pay-1"
+	mock.ExpectExec(`INSERT INTO payments`).
+		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'idem-pay-1' for key 'payments.idempotency_key'"})
+	// Best-effort lookup of the winner for operational debugging.
+	mock.ExpectQuery(`SELECT id FROM payments WHERE idempotency_key = \?`).
+		WithArgs("idem-pay-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("pay-winner"))
+
+	err := repo.Save(context.Background(), p)
+	if !errors.Is(err, payment.ErrDuplicateIdempotencyKey) {
+		t.Fatalf("expected ErrDuplicateIdempotencyKey, got %v", err)
+	}
+	var dup *payment.DuplicateIdempotencyKeyError
+	if !errors.As(err, &dup) {
+		t.Fatalf("expected *DuplicateIdempotencyKeyError, got %v", err)
+	}
+	if dup.Key != "idem-pay-1" || dup.AttemptedID != "pay-1" || dup.ExistingID != "pay-winner" {
+		t.Errorf("unexpected dup error: %+v", dup)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
