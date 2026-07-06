@@ -80,6 +80,10 @@ func TestInvoiceRepo_Save_Upsert(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	inv := sampleInvoice(t)
 
+	// Without an ambient transaction, Save wraps its three writes in a local
+	// transaction (issue #36) so a crash mid-sequence cannot corrupt
+	// invoice_history. Expect Begin ... 3 statements ... Commit.
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	// Close and open the history rows at one shared timestamp (bound param),
@@ -89,12 +93,75 @@ func TestInvoiceRepo_Save_Upsert(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO invoice_history`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	if err := repo.Save(context.Background(), inv); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Issue #36: when an ambient transaction IS present, Save must join it and NOT
+// open a nested transaction — the three writes run directly on the caller's tx,
+// which owns begin/commit. sqlmock records the outer Begin/Commit driven by this
+// test; Save itself must emit no additional Begin.
+func TestInvoiceRepo_Save_JoinsAmbientTx(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	inv := sampleInvoice(t)
+
+	mock.ExpectBegin()
+	sqlTx, err := repo.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ctx := ContextWithTx(context.Background(), sqlTx)
+
+	// No further ExpectBegin here: Save must reuse the ambient tx.
+	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
+		WithArgs(sqlmock.AnyArg(), "inv-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO invoice_history`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.Save(ctx, inv); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := sqlTx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Issue #36: a failure partway through the three-statement sequence must roll
+// the whole unit back — never leave the invoices row committed while the history
+// rows are inconsistent. Here the second statement (closing the prior history
+// row) fails; Save must Rollback (not Commit) and surface the error.
+func TestInvoiceRepo_Save_RollbackOnMidSequenceFailure(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	inv := sampleInvoice(t)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
+		WithArgs(sqlmock.AnyArg(), "inv-1").
+		WillReturnError(errors.New("connection reset"))
+	mock.ExpectRollback()
+
+	err := repo.Save(context.Background(), inv)
+	if err == nil {
+		t.Fatal("expected error from mid-sequence failure, got nil")
+	}
+	// The third statement must never run and the tx must roll back, not commit.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (rollback not performed?): %v", err)
 	}
 }
 

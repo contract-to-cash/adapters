@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -260,6 +261,166 @@ func TestIntegration_InvoiceRepo_SaveFindAndHistoryContiguity(t *testing.T) {
 	}
 	if asOf.ToSnapshot().Status != invoice.InvoiceStatusPaid {
 		t.Errorf("as-of status = %q, want paid", asOf.ToSnapshot().Status)
+	}
+}
+
+// Issue #36 (parity with postgres fixes_test.go
+// TestInvoiceRepo_ConcurrentFinalize_OneLoserRejected): a real-DB race, not just
+// an sqlmock SQL-text assertion. Two transactions race to finalize the same
+// draft invoice, reproducing core's BillingService.FinalizeInvoice (read ->
+// Finalize -> Save inside one tx). Because FindByID issues SELECT ... FOR UPDATE
+// inside a tx, the loser blocks until the winner commits, then reads the
+// already-finalized row and is rejected by Finalize() with
+// invalid_state_transition. Exactly one may win — the substrate guarantee that
+// lets core fire OnInvoiceIssuedHook at most once per invoice. Under InnoDB
+// REPEATABLE READ the locking read is what serializes the two finalizers.
+func TestIntegration_InvoiceRepo_ConcurrentFinalize_OneLoserRejected(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	repo := mysql.NewInvoiceRepository(db)
+	ctx := context.Background()
+
+	insertContractReadModel(t, db, "c-fin", "acc-fin")
+
+	draft, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+		ID: "inv-fin", InvoiceNumber: "INV-FIN",
+		AccountID: "acc-fin", ContractID: "c-fin",
+		Status:   invoice.InvoiceStatusDraft,
+		Subtotal: jpy(10000), TaxAmount: jpy(1000),
+		DiscountAmount: jpy(0), Total: jpy(11000),
+		AppliedBalance: jpy(0), AmountDue: jpy(11000),
+		PaidAmount: jpy(0), Balance: jpy(0),
+	})
+	if err != nil {
+		t.Fatalf("InvoiceFromSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, draft); err != nil {
+		t.Fatalf("Save draft: %v", err)
+	}
+
+	// finalizeInTx reproduces FinalizeInvoice's tx body against the adapter.
+	// afterRead (if non-nil) runs after FindByID but before Finalize/Save, so the
+	// caller can hold an open transaction while the other racer reads.
+	finalizeInTx := func(afterRead func()) error {
+		sqlTx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		txCtx := mysql.ContextWithTx(ctx, sqlTx)
+		loaded, err := repo.FindByID(txCtx, "inv-fin") // SELECT ... FOR UPDATE
+		if err != nil {
+			_ = sqlTx.Rollback()
+			return err
+		}
+		if afterRead != nil {
+			afterRead()
+		}
+		if err := loaded.Finalize(); err != nil {
+			_ = sqlTx.Rollback()
+			return err
+		}
+		if err := repo.Save(txCtx, loaded); err != nil {
+			_ = sqlTx.Rollback()
+			return err
+		}
+		return sqlTx.Commit()
+	}
+
+	// Deterministically force the race: goroutine A reads (taking the row lock),
+	// signals aRead, then lingers before writing. Goroutine B waits for aRead,
+	// then runs its full tx. Under the FOR UPDATE lock, B's FindByID blocks until
+	// A commits and then sees the finalized row (rejected). Without the lock, B
+	// would read the still-draft row and both would finalize.
+	var (
+		wg    sync.WaitGroup
+		aRead = make(chan struct{})
+		errs  [2]error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errs[0] = finalizeInTx(func() {
+			close(aRead)
+			time.Sleep(300 * time.Millisecond)
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		<-aRead
+		errs[1] = finalizeInTx(nil)
+	}()
+	wg.Wait()
+
+	successes, rejected := 0, 0
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			successes++
+		case isDomainError(e, shared.ErrCodeInvalidStateTransition):
+			rejected++
+		default:
+			t.Fatalf("unexpected finalize error: %v", e)
+		}
+	}
+	if successes != 1 || rejected != 1 {
+		t.Fatalf("expected exactly one success and one invalid_state_transition, got %d success / %d rejected", successes, rejected)
+	}
+
+	// The persisted invoice must be finalized exactly once, and its history must
+	// remain consistent: exactly one open row (valid_to IS NULL).
+	final, err := repo.FindByID(ctx, "inv-fin")
+	if err != nil {
+		t.Fatalf("FindByID after race: %v", err)
+	}
+	if final.ToSnapshot().Status != invoice.InvoiceStatusFinalized {
+		t.Errorf("final status = %q, want finalized", final.ToSnapshot().Status)
+	}
+	var openRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM invoice_history WHERE id = 'inv-fin' AND valid_to IS NULL`).Scan(&openRows); err != nil {
+		t.Fatalf("count open history rows: %v", err)
+	}
+	if openRows != 1 {
+		t.Errorf("expected exactly 1 open invoice_history row, got %d", openRows)
+	}
+}
+
+// Issue #36: a non-tx Save must be atomic and leave invoice_history consistent —
+// after each Save there is exactly one open history row (valid_to IS NULL) and
+// every prior version is closed. This exercises the Save-local transaction that
+// wraps the three writes when no ambient transaction is present.
+func TestIntegration_InvoiceRepo_NonTxSaveHistoryConsistent(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	repo := mysql.NewInvoiceRepository(db)
+	ctx := context.Background()
+
+	insertContractReadModel(t, db, "c-inv", "acc-inv")
+
+	// Three sequential non-tx saves (draft -> issued -> paid).
+	for _, st := range []invoice.InvoiceStatus{
+		invoice.InvoiceStatusDraft, invoice.InvoiceStatusIssued, invoice.InvoiceStatusPaid,
+	} {
+		if err := repo.Save(ctx, mustInvoice(t, st, 1000)); err != nil {
+			t.Fatalf("Save %s: %v", st, err)
+		}
+	}
+
+	// Exactly one open history row must remain.
+	var openRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM invoice_history WHERE id = 'inv-int' AND valid_to IS NULL`).Scan(&openRows); err != nil {
+		t.Fatalf("count open history rows: %v", err)
+	}
+	if openRows != 1 {
+		t.Fatalf("expected exactly 1 open invoice_history row after non-tx saves, got %d", openRows)
+	}
+
+	// The open row must reflect the latest state.
+	current, err := repo.FindByID(ctx, "inv-int")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if current.ToSnapshot().Status != invoice.InvoiceStatusPaid {
+		t.Errorf("current status = %q, want paid", current.ToSnapshot().Status)
 	}
 }
 

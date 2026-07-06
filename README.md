@@ -269,6 +269,27 @@ reads) no lock is taken, so ordinary lookups are unaffected. This addresses
 adapters issue #12 (and is cross-referenced by core#130, which pins the wording of
 the guarantee core relies on).
 
+**Invoice `Save` is atomic even without an ambient transaction (issue #36).** The
+three writes it performs — the `invoices` upsert, closing the prior
+`invoice_history` row, and inserting the new history row — are wrapped in a
+Save-local transaction when no ambient transaction is present (mirroring the
+event store's `Append`). This prevents a crash or connection loss mid-sequence
+from leaving `invoice_history` with a permanently-open stale row or a missing
+version, which would make `FindByIDAsOf` (temporal queries) return the wrong
+state. When core calls `Save` inside its own `tx.Run` the repository joins that
+transaction instead of nesting.
+
+**`Payment` and `CreditNote` `Save` remain last-writer-wins** and take no row
+lock. core only pins the concurrency contract for the invoice finalize path (the
+`OnInvoiceIssuedHook` at-most-once guarantee above); it makes no equivalent
+promise for payments or credit notes, so the adapter deliberately does not add
+`SELECT ... FOR UPDATE` there. The practical asymmetry to be aware of: two
+concurrent credit-note issues can both win their writes and cause core's
+`OnCreditNoteIssuedHook` to fire more than once (see core#147 / #151), and
+metrics hooks are documented as at-least-once — dedupe by entity ID in those
+hooks rather than relying on the storage layer. If your workload needs
+serialization here, apply the same ambient-tx `FOR UPDATE` pattern in a fork.
+
 ## Migrations
 
 Migration files live in `postgres/migrations/` and `mysql/migrations/`

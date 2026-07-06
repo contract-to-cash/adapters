@@ -317,6 +317,65 @@ func TestInvoiceProjector_RebuildAtomicOnFailure(t *testing.T) {
 	}
 }
 
+// --- Issue #36: non-tx invoice Save is atomic and leaves history consistent ---
+//
+// When no ambient transaction is present, Save wraps its three writes (invoices
+// upsert, close prior history row, insert new history row) in a local
+// transaction. After a sequence of non-tx saves there must be exactly one open
+// history row (valid_to IS NULL) reflecting the latest state — never a stale
+// permanently-open row or a missing version.
+func TestInvoiceRepo_NonTxSaveHistoryConsistent(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-nontx', 'acc-nontx', 'active')`); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := postgres.NewInvoiceRepository(pool)
+	mk := func(st invoice.InvoiceStatus) *invoice.Invoice {
+		inv, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+			ID: "inv-nontx", InvoiceNumber: "INV-NONTX",
+			AccountID: "acc-nontx", ContractID: "c-nontx",
+			Status:   st,
+			Subtotal: jpy(10000), TaxAmount: jpy(1000),
+			DiscountAmount: jpy(0), Total: jpy(11000),
+			AppliedBalance: jpy(0), AmountDue: jpy(11000),
+			PaidAmount: jpy(0), Balance: jpy(0),
+		})
+		if err != nil {
+			t.Fatalf("InvoiceFromSnapshot: %v", err)
+		}
+		return inv
+	}
+
+	for _, st := range []invoice.InvoiceStatus{
+		invoice.InvoiceStatusDraft, invoice.InvoiceStatusIssued, invoice.InvoiceStatusPaid,
+	} {
+		if err := repo.Save(ctx, mk(st)); err != nil {
+			t.Fatalf("Save %s: %v", st, err)
+		}
+	}
+
+	var openRows int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM invoice_history WHERE id = 'inv-nontx' AND valid_to IS NULL`).Scan(&openRows); err != nil {
+		t.Fatalf("count open history rows: %v", err)
+	}
+	if openRows != 1 {
+		t.Fatalf("expected exactly 1 open invoice_history row after non-tx saves, got %d", openRows)
+	}
+
+	current, err := repo.FindByID(ctx, "inv-nontx")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if current.ToSnapshot().Status != invoice.InvoiceStatusPaid {
+		t.Errorf("current status = %q, want paid", current.ToSnapshot().Status)
+	}
+}
+
 // --- Issue #12: concurrent FinalizeInvoice must serialize via row lock ---
 //
 // Mirrors core's BillingService.FinalizeInvoice (read -> Finalize -> Save inside
