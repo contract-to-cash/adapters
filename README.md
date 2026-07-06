@@ -59,6 +59,18 @@ signal cannot recover it from a silent no-op, which is why the adapters surface
 it by default (issue #38). A duplicate PRIMARY KEY (`id`) is a distinct,
 non-idempotent fault and always surfaces as a wrapped error.
 
+`balance.Repository.FindExpired` (added for core#159's
+`batch.BalanceExpirationProcessor`) also follows the core reference
+(`infrastructure/inmemory/balance_repository.go`): it returns entries whose
+expiry has passed as of `asOf` — `BalanceEntry.IsExpired(asOf)`, i.e. `asOf`
+strictly after `expires_at` — whose remaining amount is still non-zero (expired
+credit not yet forfeited by `MarkExpired`), ordered by `created_at` ascending
+across all accounts/currencies. Entries without an expiry and fully-consumed
+entries are excluded. Consistent with `FindAvailable` (issue #11), the
+fully-consumed check runs in Go on the **precise** remaining amount from the
+`state` JSON, not the lossy `remaining_amount` BIGINT column, so a sub-unit
+remainder still counts as forfeitable credit.
+
 ### fincode scope and conventions
 
 - **Credit cards / JPY only.** `SupportedMethods()` reports `credit_card`;
@@ -286,8 +298,14 @@ verification level differs:
 
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
-dependency. To develop against a local core checkout, add a `replace`
-directive to `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/path/to/core`).
+dependency. The pin currently tracks core `main` at the PR #163–#181 series
+(pseudo-version `v0.1.1-0.20260706162330-b987fe17c84c`), which is the catch-up
+for `balance.Repository.FindExpired` (core#159), the
+`FindTrialsEndingSoon` → `FindTrialsEndingBefore` rename (core#162), the
+`(*T, error)` constructor signatures (core#148/#167), and the
+`ContractCreatedEvent` SchemaVersion 3 idempotency key (core#159) — see issue
+#46. To develop against a local core checkout, add a `replace` directive to
+`go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/path/to/core`).
 
 ## Concurrency guarantees
 
@@ -329,6 +347,38 @@ concurrent credit-note issues can both win their writes and cause core's
 metrics hooks are documented as at-least-once — dedupe by entity ID in those
 hooks rather than relying on the storage layer. If your workload needs
 serialization here, apply the same ambient-tx `FOR UPDATE` pattern in a fork.
+
+**Contract creation is idempotent at the storage layer (issue #46 / core#159).**
+`ContractAggregate.Create` requires a non-empty `CreateContractCommand.
+IdempotencyKey` and carries it on the `contract.created` event (SchemaVersion 3),
+but the core can only validate **presence** — it has no cross-aggregate view, so
+two retried `Create` calls with the same key would otherwise produce two distinct
+contracts. `contract.Repository.Save`'s godoc makes the **uniqueness** the
+adapter's contract, so both SQL adapters add a unique constraint over the
+created event's idempotency key and translate a violation into a
+`shared.DomainError` with code `ErrCodeConflict` (the retried caller looks up the
+existing contract instead of failing opaquely — mirroring the payments #35
+pattern). The constraint lives on the **event store** (not the read model), so it
+is enforced synchronously and atomically with the event append, regardless of
+projection mode:
+
+- **postgres** (migration 010): a partial unique **expression** index,
+  `ux_contract_idempotency_key ON events ((data->>'idempotency_key')) WHERE type
+  = 'contract.created' AND coalesce(data->>'idempotency_key','') <> ''`. `Append`
+  matches the 23505 violation on that index name (like `isVersionConflict`).
+- **mysql** (migration 009): a **STORED generated column**
+  `contract_idempotency_key` that is `NULL` for every row that must not be
+  constrained (non-`contract.created` events, and `contract.created` events with
+  an empty/absent key), with a `UNIQUE` index over it — a unique index permits
+  multiple `NULL`s. `Append` matches the 1062 duplicate-key on that index name
+  (`dupEntryOnKey`).
+
+Historical pre-#159 events omit the key (`json:",omitempty"`) and are therefore
+**exempt** (NULL / `coalesce(...,'') = ''` is never constrained), so replay of
+legacy history never trips the constraint — the same NULL/empty-exemption pattern
+as the payments and usage idempotency indexes. This is orthogonal to the
+optimistic-concurrency (`stream_id, version`) conflict, which continues to map to
+`ErrCodeVersionConflict`.
 
 ## Migrations
 
@@ -492,7 +542,7 @@ written.
 ### Known limitation: contract list queries are N+1
 
 The contract-repository fan-out queries (`FindDueForRenewal`, `FindExpiring`,
-`FindTrialsEndingSoon`) resolve a batch of contract IDs from the read model and
+`FindTrialsEndingBefore`) resolve a batch of contract IDs from the read model and
 then rehydrate each aggregate with a per-ID `FindByID` — one snapshot query plus
 one event-load query apiece, i.e. ~2N+1 round trips for N contracts. This is
 acceptable for interactive lookups but shows up on large renewal/expiration
