@@ -8,8 +8,10 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/shared"
+	driver "github.com/go-sql-driver/mysql"
 )
 
 func newInvoiceRepo(t *testing.T) (*MySQLInvoiceRepository, sqlmock.Sqlmock) {
@@ -47,6 +49,39 @@ func sampleInvoice(t *testing.T) *invoice.Invoice {
 	return inv
 }
 
+// loadedInvoiceAtVersion returns a draft invoice reconstructed as if loaded from
+// persistence at the given version (so LoadedVersion()==loaded) and then
+// finalized once, bumping Version() to loaded+1. This models the read → mutate →
+// Save sequence the optimistic-lock guard protects.
+func loadedInvoiceAtVersion(t *testing.T, loaded int) *invoice.Invoice {
+	t.Helper()
+	inv, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+		ID:             "inv-1",
+		InvoiceNumber:  "INV-0001",
+		AccountID:      "acct-1",
+		ContractID:     "contract-1",
+		Status:         invoice.InvoiceStatusDraft,
+		Subtotal:       jpy(1000),
+		TaxAmount:      jpy(100),
+		DiscountAmount: jpy(0),
+		Total:          jpy(1100),
+		AppliedBalance: jpy(0),
+		AmountDue:      jpy(1100),
+		PaidAmount:     jpy(0),
+		Balance:        jpy(1100),
+		IssueDate:      fixedTime,
+		DueDate:        fixedTime,
+		Version:        loaded,
+	})
+	if err != nil {
+		t.Fatalf("InvoiceFromSnapshot: %v", err)
+	}
+	if err := inv.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	return inv
+}
+
 // invoiceFindRow builds a result row for selectInvoiceSQL, embedding the money
 // state in the line_items JSON column exactly as scanInvoiceSnapshot expects.
 func invoiceFindRow(t *testing.T) *sqlmock.Rows {
@@ -65,26 +100,33 @@ func invoiceFindRow(t *testing.T) *sqlmock.Rows {
 		"applied_balance", "amount_due", "paid_amount", "balance",
 		"billing_period_from", "billing_period_to", "issue_date", "due_date",
 		"paid_at", "payment_method_id", "allow_partial_pay",
-		"original_invoice_id", "revision_of", "void_reason", "metadata",
+		"original_invoice_id", "revision_of", "void_reason", "metadata", "lock_version",
 	}).AddRow(
 		"inv-1", "INV-0001", "acct-1", "contract-1", "issued",
 		js, int64(1000), int64(100), int64(0), int64(1100),
 		int64(0), int64(1100), int64(0), int64(1100),
 		nil, nil, fixedTime, fixedTime,
 		nil, nil, false,
-		nil, nil, "", []byte(`{}`),
+		nil, nil, "", []byte(`{}`), int64(2),
 	)
 }
 
-func TestInvoiceRepo_Save_Upsert(t *testing.T) {
+// A brand-new invoice (LoadedVersion()==0 and no row yet) takes the INSERT path:
+// the version-guarded UPDATE matches no row, the existence probe finds none, so
+// Save INSERTs then writes the two history rows. Without an ambient transaction
+// the whole unit is wrapped in a local tx (issue #36): Begin ... statements ...
+// Commit.
+func TestInvoiceRepo_Save_InsertsNewInvoice(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	inv := sampleInvoice(t)
 
-	// Without an ambient transaction, Save wraps its three writes in a local
-	// transaction (issue #36) so a crash mid-sequence cannot corrupt
-	// invoice_history. Expect Begin ... 3 statements ... Commit.
 	mock.ExpectBegin()
-	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT 1 FROM invoices WHERE id = \?`).
+		WithArgs("inv-1").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO invoices`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	// Close and open the history rows at one shared timestamp (bound param),
 	// not two separate NOW(6) evaluations.
@@ -103,6 +145,102 @@ func TestInvoiceRepo_Save_Upsert(t *testing.T) {
 	}
 }
 
+// An existing invoice at the loaded version takes the guarded-UPDATE path: the
+// version-guarded UPDATE matches its row (1 affected) so no INSERT is attempted,
+// then the history rows are written. Save must persist inv.Version() as the new
+// loaded baseline.
+func TestInvoiceRepo_Save_UpdatesExistingInvoice(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	inv := loadedInvoiceAtVersion(t, 3)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			int64(4), "inv-1", int64(3)). // new version 4, guard on loaded version 3
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
+		WithArgs(sqlmock.AnyArg(), "inv-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO invoice_history`).
+		WithArgs("inv-1", "inv-1", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.Save(context.Background(), inv); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if got := inv.LoadedVersion(); got != 4 {
+		t.Errorf("LoadedVersion after Save = %d, want 4 (persisted version becomes new baseline)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Issue #30: two loads of the same invoice at the same version, both mutated,
+// racing to Save. The first wins; the second's guarded UPDATE matches no row
+// (version already advanced) and the existence probe FINDS the row, so Save
+// returns tx.ErrVersionConflict rather than silently inserting or last-writer-wins.
+func TestInvoiceRepo_Save_VersionConflict(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	inv := loadedInvoiceAtVersion(t, 3)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // 0 rows: version moved on
+	mock.ExpectQuery(`SELECT 1 FROM invoices WHERE id = \?`).
+		WithArgs("inv-1").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1)) // row exists
+	mock.ExpectRollback()
+
+	err := repo.Save(context.Background(), inv)
+	if !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("expected tx.ErrVersionConflict, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Issue #45: an INSERT of a second non-voided, non-proration invoice for a
+// (contract_id, billing_period) already taken violates the ux_invoice_period
+// unique index (1062). Save must translate that to a shared.ErrCodeConflict
+// DomainError with the inmemory reference's message.
+func TestInvoiceRepo_Save_PeriodConflict(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+	inv := sampleInvoice(t)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT 1 FROM invoices WHERE id = \?`).
+		WithArgs("inv-1").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO invoices`).
+		WillReturnError(&driver.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry 'contract-1|...' for key 'invoices.ux_invoice_period'",
+		})
+	mock.ExpectRollback()
+
+	err := repo.Save(context.Background(), inv)
+	var de *shared.DomainError
+	if !errors.As(err, &de) || de.Code != shared.ErrCodeConflict {
+		t.Fatalf("expected ErrCodeConflict DomainError, got %v", err)
+	}
+	if de.Message != "invoice already exists for this billing period" {
+		t.Errorf("unexpected conflict message: %q", de.Message)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // Issue #39: the bitemporal history stamp comes from the injected clock, not
 // wall-clock time.Now, so history windows are deterministic and testable with
 // FixedClock. Both the close (UPDATE ... valid_to) and the open (INSERT ...
@@ -114,7 +252,12 @@ func TestInvoiceRepo_Save_StampsHistoryFromInjectedClock(t *testing.T) {
 	want := fixedTime.UTC()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT 1 FROM invoices WHERE id = \?`).
+		WithArgs("inv-1").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO invoices`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	// valid_to (close) bound to the clock instant, not sqlmock.AnyArg.
 	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
@@ -122,7 +265,7 @@ func TestInvoiceRepo_Save_StampsHistoryFromInjectedClock(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	// valid_from (open) — 4th bound arg — bound to the same clock instant.
 	mock.ExpectExec(`INSERT INTO invoice_history`).
-		WithArgs("inv-1", "inv-1", sqlmock.AnyArg(), want).
+		WithArgs("inv-1", sqlmock.AnyArg(), sqlmock.AnyArg(), want).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -135,9 +278,9 @@ func TestInvoiceRepo_Save_StampsHistoryFromInjectedClock(t *testing.T) {
 }
 
 // Issue #36: when an ambient transaction IS present, Save must join it and NOT
-// open a nested transaction — the three writes run directly on the caller's tx,
-// which owns begin/commit. sqlmock records the outer Begin/Commit driven by this
-// test; Save itself must emit no additional Begin.
+// open a nested transaction — the writes run directly on the caller's tx, which
+// owns begin/commit. sqlmock records the outer Begin/Commit driven by this test;
+// Save itself must emit no additional Begin.
 func TestInvoiceRepo_Save_JoinsAmbientTx(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	inv := sampleInvoice(t)
@@ -150,7 +293,12 @@ func TestInvoiceRepo_Save_JoinsAmbientTx(t *testing.T) {
 	ctx := ContextWithTx(context.Background(), sqlTx)
 
 	// No further ExpectBegin here: Save must reuse the ambient tx.
-	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT 1 FROM invoices WHERE id = \?`).
+		WithArgs("inv-1").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO invoices`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
 		WithArgs(sqlmock.AnyArg(), "inv-1").
@@ -170,16 +318,21 @@ func TestInvoiceRepo_Save_JoinsAmbientTx(t *testing.T) {
 	}
 }
 
-// Issue #36: a failure partway through the three-statement sequence must roll
-// the whole unit back — never leave the invoices row committed while the history
-// rows are inconsistent. Here the second statement (closing the prior history
-// row) fails; Save must Rollback (not Commit) and surface the error.
+// Issue #36: a failure partway through the write sequence must roll the whole
+// unit back — never leave the invoices row committed while the history rows are
+// inconsistent. Here the history-close statement fails; Save must Rollback (not
+// Commit) and surface the error.
 func TestInvoiceRepo_Save_RollbackOnMidSequenceFailure(t *testing.T) {
 	repo, mock := newInvoiceRepo(t)
 	inv := sampleInvoice(t)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`UPDATE invoices SET .* WHERE id = \? AND lock_version = \?`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT 1 FROM invoices WHERE id = \?`).
+		WithArgs("inv-1").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`INSERT INTO invoices`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
 		WithArgs(sqlmock.AnyArg(), "inv-1").
@@ -190,7 +343,7 @@ func TestInvoiceRepo_Save_RollbackOnMidSequenceFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from mid-sequence failure, got nil")
 	}
-	// The third statement must never run and the tx must roll back, not commit.
+	// The history-insert must never run and the tx must roll back, not commit.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations (rollback not performed?): %v", err)
 	}
@@ -212,6 +365,11 @@ func TestInvoiceRepo_FindByID_Found(t *testing.T) {
 	}
 	if s.IssueDate.Location() != nil && s.IssueDate.UTC() != fixedTime {
 		t.Errorf("issue date = %v, want %v", s.IssueDate, fixedTime)
+	}
+	// Issue #30: the invoices.version column is authoritative and restored onto
+	// both Version() and LoadedVersion() so the next Save guards on it.
+	if got.Version() != 2 || got.LoadedVersion() != 2 {
+		t.Errorf("version/loadedVersion = %d/%d, want 2/2", got.Version(), got.LoadedVersion())
 	}
 }
 

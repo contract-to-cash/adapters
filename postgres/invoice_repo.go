@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -118,7 +120,22 @@ func (r *PostgresInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Inv
 	}
 
 	q := r.q(ctx)
-	_, err = q.Exec(ctx,
+
+	// Optimistic-lock guarded upsert (issue #30). lock_version holds the domain
+	// optimistic-locking version (inv.Version()); the ON CONFLICT DO UPDATE only
+	// fires when the stored lock_version still equals LoadedVersion(). A concurrent
+	// writer that already advanced it leaves the update skipped and RowsAffected()
+	// == 0, which we report as tx.ErrVersionConflict. The separate `version` column
+	// stays the per-save counter that keys invoice_history (version = version + 1),
+	// so bitemporal history is unaffected. This is option 1 of the Save concurrency
+	// contract; the FOR UPDATE read in FindByID (option 2) is kept as well.
+	//
+	// RowsAffected(): a fresh INSERT, or a conflict whose lock_version guard passes,
+	// reports 1; a conflict whose guard fails reports 0 (no error). A brand-new
+	// invoice — including a draft legitimately persisted at version 0 — INSERTs; an
+	// existing row updates only under a matching lock_version, so a version-0 draft
+	// is never mistaken for a new insert.
+	tag, err := q.Exec(ctx,
 		`INSERT INTO invoices (
 			id, invoice_number, account_id, contract_id, status,
 			subtotal, tax_amount, discount_amount, total,
@@ -126,11 +143,11 @@ func (r *PostgresInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Inv
 			currency, billing_period_from, billing_period_to,
 			issue_date, due_date, paid_at, void_reason,
 			revision_of, original_invoice_id, payment_method_id,
-			allow_partial_pay, line_items, metadata, version, updated_at
+			allow_partial_pay, line_items, metadata, version, lock_version, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
 			$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-			$25, $26, 1, NOW()
+			$25, $26, 1, $27, NOW()
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			invoice_number = EXCLUDED.invoice_number, status = EXCLUDED.status,
@@ -146,16 +163,25 @@ func (r *PostgresInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Inv
 			payment_method_id = EXCLUDED.payment_method_id,
 			allow_partial_pay = EXCLUDED.allow_partial_pay,
 			line_items = EXCLUDED.line_items, metadata = EXCLUDED.metadata,
-			version = invoices.version + 1, updated_at = NOW()`,
+			version = invoices.version + 1, lock_version = EXCLUDED.lock_version,
+			updated_at = NOW()
+		WHERE invoices.lock_version = $28`,
 		string(s.ID), s.InvoiceNumber, string(s.AccountID), string(s.ContractID), string(s.Status),
 		s.Subtotal.Int64(), s.TaxAmount.Int64(), s.DiscountAmount.Int64(), s.Total.Int64(),
 		s.AppliedBalance.Int64(), s.AmountDue.Int64(), s.PaidAmount.Int64(), s.Balance.Int64(),
 		string(s.Total.Currency()), billingFrom, billingTo,
 		issueDate, dueDate, s.PaidAt, s.VoidReason,
 		revisionOf, originalInvoiceID, s.PaymentMethodID,
-		s.AllowPartialPay, jsonState, metadata)
+		s.AllowPartialPay, jsonState, metadata,
+		s.Version, inv.LoadedVersion())
 	if err != nil {
-		return fmt.Errorf("save invoice: %w", err)
+		return translateInvoiceSaveErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		// The row exists but its stored lock_version no longer equals
+		// LoadedVersion() (a concurrent writer advanced it). A brand-new row would
+		// have inserted, so 0 unambiguously means an optimistic-lock conflict.
+		return tx.ErrVersionConflict
 	}
 
 	if _, err := q.Exec(ctx,
@@ -176,7 +202,25 @@ func (r *PostgresInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Inv
 		string(s.ID), historySnapshot); err != nil {
 		return fmt.Errorf("insert invoice history: %w", err)
 	}
+
+	// Record the persisted optimistic-lock version as the new loaded baseline so a
+	// subsequent Save of this same in-memory entity compares against the right one.
+	inv.SetVersion(s.Version)
 	return nil
+}
+
+// translateInvoiceSaveErr maps the ux_invoice_period unique violation
+// (migration 012) to a shared.ErrCodeConflict DomainError carrying the per-period
+// message from the inmemory reference (issue #45). Any other error is wrapped
+// verbatim.
+func translateInvoiceSaveErr(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation &&
+		pgErr.ConstraintName == "ux_invoice_period" {
+		return shared.NewDomainError(shared.ErrCodeConflict,
+			"invoice already exists for this billing period")
+	}
+	return fmt.Errorf("save invoice: %w", err)
 }
 
 func (r *PostgresInvoiceRepository) FindByID(ctx context.Context, id shared.InvoiceID) (*invoice.Invoice, error) {
@@ -295,7 +339,7 @@ const selectInvoiceSQL = `
 	       applied_balance, amount_due, paid_amount, balance,
 	       billing_period_from, billing_period_to, issue_date, due_date,
 	       paid_at, payment_method_id, allow_partial_pay,
-	       original_invoice_id, revision_of, void_reason, metadata
+	       original_invoice_id, revision_of, void_reason, metadata, lock_version
 	FROM invoices`
 
 type scanTarget interface {
@@ -350,6 +394,7 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 		originalInvoiceID, revisionOf       *string
 		voidReason                          string
 		metadata                            json.RawMessage
+		lockVersion                         int
 	)
 	if err := t.Scan(
 		&id, &number, &accountID, &contractID, &status,
@@ -357,7 +402,7 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 		&appliedBalance, &amountDue, &paidAmount, &balance,
 		&billingFrom, &billingTo, &issueDate, &dueDate,
 		&paidAt, &paymentMethodID, &allowPartialPay,
-		&originalInvoiceID, &revisionOf, &voidReason, &metadata,
+		&originalInvoiceID, &revisionOf, &voidReason, &metadata, &lockVersion,
 	); err != nil {
 		return invoice.InvoiceSnapshot{}, err
 	}
@@ -407,5 +452,9 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 			return invoice.InvoiceSnapshot{}, fmt.Errorf("unmarshal invoice metadata: %w", err)
 		}
 	}
+	// The invoices.lock_version column is authoritative for the current-state
+	// optimistic-locking version (issue #30). InvoiceFromSnapshot restores both
+	// version and loadedVersion from this, so the next Save guards on it.
+	s.Version = lockVersion
 	return s, nil
 }

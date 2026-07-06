@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/shared"
 )
@@ -130,44 +131,84 @@ func (r *MySQLInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Invoic
 	}
 
 	q := r.q(ctx)
-	_, err = q.ExecContext(ctx,
-		`INSERT INTO invoices (
-			id, invoice_number, account_id, contract_id, status,
-			subtotal, tax_amount, discount_amount, total,
-			applied_balance, amount_due, paid_amount, balance,
-			currency, billing_period_from, billing_period_to,
-			issue_date, due_date, paid_at, void_reason,
-			revision_of, original_invoice_id, payment_method_id,
-			allow_partial_pay, line_items, metadata, version, updated_at
-		) VALUES (
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, 1, NOW(6)
-		)
-		ON DUPLICATE KEY UPDATE
-			invoice_number = VALUES(invoice_number), status = VALUES(status),
-			subtotal = VALUES(subtotal), tax_amount = VALUES(tax_amount),
-			discount_amount = VALUES(discount_amount), total = VALUES(total),
-			applied_balance = VALUES(applied_balance), amount_due = VALUES(amount_due),
-			paid_amount = VALUES(paid_amount), balance = VALUES(balance),
-			currency = VALUES(currency), billing_period_from = VALUES(billing_period_from),
-			billing_period_to = VALUES(billing_period_to), issue_date = VALUES(issue_date),
-			due_date = VALUES(due_date), paid_at = VALUES(paid_at),
-			void_reason = VALUES(void_reason), revision_of = VALUES(revision_of),
-			original_invoice_id = VALUES(original_invoice_id),
-			payment_method_id = VALUES(payment_method_id),
-			allow_partial_pay = VALUES(allow_partial_pay),
-			line_items = VALUES(line_items), metadata = VALUES(metadata),
-			version = version + 1, updated_at = NOW(6)`,
-		string(s.ID), s.InvoiceNumber, string(s.AccountID), string(s.ContractID), string(s.Status),
+
+	// Optimistic-lock guarded write (issue #30). MySQL's INSERT ... ON DUPLICATE
+	// KEY UPDATE has no WHERE clause, so a single-statement version-guarded upsert
+	// is not possible; and the balance-style "LoadedVersion()==0 => INSERT" split
+	// is also unsafe here because the billing pipeline persists a draft at
+	// version 0 and FinalizeInvoice re-loads it at version 0 (LoadedVersion()==0
+	// does NOT imply "no row yet"). We therefore attempt the lock_version-guarded
+	// UPDATE first and INSERT only when the row genuinely does not exist. The guard
+	// is WHERE lock_version = LoadedVersion(); the separate `version` column stays
+	// the per-save counter that keys invoice_history (version = version + 1 here,
+	// 1 on insert), so bitemporal history is unaffected. This is option 1 of the
+	// Save concurrency contract; the FOR UPDATE read in FindByID (option 2) is kept.
+	res, err := q.ExecContext(ctx,
+		`UPDATE invoices SET
+			invoice_number = ?, status = ?,
+			subtotal = ?, tax_amount = ?, discount_amount = ?, total = ?,
+			applied_balance = ?, amount_due = ?, paid_amount = ?, balance = ?,
+			currency = ?, billing_period_from = ?, billing_period_to = ?,
+			issue_date = ?, due_date = ?, paid_at = ?, void_reason = ?,
+			revision_of = ?, original_invoice_id = ?, payment_method_id = ?,
+			allow_partial_pay = ?, line_items = ?, metadata = ?,
+			version = version + 1, lock_version = ?, updated_at = NOW(6)
+		 WHERE id = ? AND lock_version = ?`,
+		s.InvoiceNumber, string(s.Status),
 		s.Subtotal.Int64(), s.TaxAmount.Int64(), s.DiscountAmount.Int64(), s.Total.Int64(),
 		s.AppliedBalance.Int64(), s.AmountDue.Int64(), s.PaidAmount.Int64(), s.Balance.Int64(),
 		string(s.Total.Currency()), billingFrom, billingTo,
 		issueDate, dueDate, paidAt, s.VoidReason,
 		revisionOf, originalInvoiceID, s.PaymentMethodID,
-		s.AllowPartialPay, jsonState, metadata)
+		s.AllowPartialPay, jsonState, metadata,
+		s.Version, string(s.ID), inv.LoadedVersion())
 	if err != nil {
-		return fmt.Errorf("save invoice: %w", err)
+		return translateInvoiceSaveErr(err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("invoice save rows affected: %w", err)
+	}
+
+	if affected == 0 {
+		// No row matched (id, lock_version = LoadedVersion()). Either the row does
+		// not exist yet (brand-new invoice -> INSERT) or it exists at a different
+		// lock_version (concurrent writer already advanced it -> optimistic-lock
+		// conflict). updated_at = NOW(6) always changes on a matching UPDATE, so a
+		// matched row never reports 0 affected — 0 unambiguously means "did not
+		// match".
+		var probe int
+		err := q.QueryRowContext(ctx, `SELECT 1 FROM invoices WHERE id = ?`, string(s.ID)).Scan(&probe)
+		switch {
+		case err == nil:
+			return tx.ErrVersionConflict
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := q.ExecContext(ctx,
+				`INSERT INTO invoices (
+					id, invoice_number, account_id, contract_id, status,
+					subtotal, tax_amount, discount_amount, total,
+					applied_balance, amount_due, paid_amount, balance,
+					currency, billing_period_from, billing_period_to,
+					issue_date, due_date, paid_at, void_reason,
+					revision_of, original_invoice_id, payment_method_id,
+					allow_partial_pay, line_items, metadata, version, lock_version, updated_at
+				) VALUES (
+					?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+					?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+					?, ?, 1, ?, NOW(6)
+				)`,
+				string(s.ID), s.InvoiceNumber, string(s.AccountID), string(s.ContractID), string(s.Status),
+				s.Subtotal.Int64(), s.TaxAmount.Int64(), s.DiscountAmount.Int64(), s.Total.Int64(),
+				s.AppliedBalance.Int64(), s.AmountDue.Int64(), s.PaidAmount.Int64(), s.Balance.Int64(),
+				string(s.Total.Currency()), billingFrom, billingTo,
+				issueDate, dueDate, paidAt, s.VoidReason,
+				revisionOf, originalInvoiceID, s.PaymentMethodID,
+				s.AllowPartialPay, jsonState, metadata, s.Version); err != nil {
+				return translateInvoiceSaveErr(err)
+			}
+		default:
+			return fmt.Errorf("probe invoice existence: %w", err)
+		}
 	}
 
 	// Close the current history row and open the new one at a single shared
@@ -199,7 +240,31 @@ func (r *MySQLInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Invoic
 		string(s.ID), string(s.ID), historySnapshot, histNow); err != nil {
 		return fmt.Errorf("insert invoice history: %w", err)
 	}
+
+	// Record the persisted optimistic-lock version as the new loaded baseline so a
+	// subsequent Save of this same in-memory entity compares against the right one.
+	inv.SetVersion(s.Version)
 	return nil
+}
+
+// translateInvoiceSaveErr maps driver-level duplicate-key errors raised by the
+// invoices write to structured domain errors:
+//   - ux_invoice_period (migration 011) -> shared.ErrCodeConflict with the
+//     per-period message from the inmemory reference (issue #45).
+//   - PRIMARY (a concurrent INSERT of the same id slipped in between our guarded
+//     UPDATE and existence probe) -> tx.ErrVersionConflict, so the caller retries
+//     exactly as it would for a version conflict.
+//
+// Any other error is wrapped verbatim.
+func translateInvoiceSaveErr(err error) error {
+	if dupEntryOnKey(err, "ux_invoice_period") {
+		return shared.NewDomainError(shared.ErrCodeConflict,
+			"invoice already exists for this billing period")
+	}
+	if dupEntryOnKey(err, "PRIMARY") {
+		return tx.ErrVersionConflict
+	}
+	return fmt.Errorf("save invoice: %w", err)
 }
 
 func (r *MySQLInvoiceRepository) FindByID(ctx context.Context, id shared.InvoiceID) (*invoice.Invoice, error) {
@@ -320,7 +385,7 @@ const selectInvoiceSQL = `
 	       applied_balance, amount_due, paid_amount, balance,
 	       billing_period_from, billing_period_to, issue_date, due_date,
 	       paid_at, payment_method_id, allow_partial_pay,
-	       original_invoice_id, revision_of, void_reason, metadata
+	       original_invoice_id, revision_of, void_reason, metadata, lock_version
 	FROM invoices`
 
 func scanInvoiceRow(row *sql.Row, id shared.InvoiceID) (*invoice.Invoice, error) {
@@ -371,6 +436,7 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 		originalInvoiceID, revisionOf       sql.NullString
 		voidReason                          string
 		metadata                            json.RawMessage
+		lockVersion                         int
 	)
 	if err := t.Scan(
 		&id, &number, &accountID, &contractID, &status,
@@ -378,7 +444,7 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 		&appliedBalance, &amountDue, &paidAmount, &balance,
 		&billingFrom, &billingTo, &issueDate, &dueDate,
 		&paidAt, &paymentMethodID, &allowPartialPay,
-		&originalInvoiceID, &revisionOf, &voidReason, &metadata,
+		&originalInvoiceID, &revisionOf, &voidReason, &metadata, &lockVersion,
 	); err != nil {
 		return invoice.InvoiceSnapshot{}, err
 	}
@@ -434,5 +500,9 @@ func scanInvoiceSnapshot(t scanTarget) (invoice.InvoiceSnapshot, error) {
 			return invoice.InvoiceSnapshot{}, fmt.Errorf("unmarshal invoice metadata: %w", err)
 		}
 	}
+	// The invoices.lock_version column is authoritative for the current-state
+	// optimistic-locking version (issue #30). InvoiceFromSnapshot restores both
+	// version and loadedVersion from this, so the next Save guards on it.
+	s.Version = lockVersion
 	return s, nil
 }

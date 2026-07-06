@@ -1,0 +1,38 @@
+-- 011: invoice optimistic-locking version column
+-- (issue adapters#30 / core#130 / core#147).
+--
+-- Background. core#130 added an optimistic-locking contract to
+-- invoice.Repository.Save, and core#147 made EVERY mutating Invoice method bump
+-- Version(). The Invoice entity now carries Version()/LoadedVersion()/SetVersion()
+-- exactly like BalanceEntry. This adapter previously satisfied the concurrency
+-- contract via option 2 only (a tx-scoped SELECT ... FOR UPDATE in FindByID, from
+-- adapters#12/PR #21). This migration + the accompanying invoice_repo.go change
+-- ALSO implement option 1 (a version-guarded write), for parity with
+-- balance_entries and to give high-concurrency deployments a lock-free path.
+-- Both guards are now in place (belt and suspenders); the core godoc allows
+-- either or both.
+--
+-- Why a NEW column rather than the existing `version`. The invoices table already
+-- has a `version` column (migration 003), but it is an internal per-SAVE counter
+-- that keys the bitemporal invoice_history rows (one distinct (id, version) row
+-- per save, incremented as version = version + 1). The domain optimistic-locking
+-- version is a DIFFERENT quantity — it counts state MUTATIONS, and two saves of
+-- the same loaded version must collapse rather than fork history. Overloading the
+-- one column would break invoice_history contiguity, so the optimistic-lock
+-- version gets its own column, `lock_version`, and the history counter is left
+-- exactly as-is.
+--
+-- Backfill convergence (why DEFAULT 0 is safe). Existing rows get lock_version 0.
+-- On the first load after deploy, invoice_repo.go reads lock_version as
+-- authoritative (into the snapshot) and SetVersion() makes it the loaded baseline
+-- (0), overriding whatever domain version the state JSON might imply. The next
+-- mutation bumps it to 1 and the guarded UPDATE (WHERE lock_version = 0) matches,
+-- so the sequence advances cleanly from the migrated baseline. A draft
+-- legitimately persisted at version 0 is handled the same way; the
+-- "new INSERT vs existing UPDATE" decision keys off row existence, never off the
+-- lock_version value, so a version-0 row is never mistaken for a brand-new insert.
+--
+-- Forward-only runner (no .down files); applied files are tracked in
+-- schema_migrations, so re-running skips this file.
+ALTER TABLE invoices
+    ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;

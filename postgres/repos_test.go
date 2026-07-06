@@ -197,6 +197,157 @@ func TestInvoiceRepo_FindByID_NotFound(t *testing.T) {
 	}
 }
 
+// Issue #30: option-1 optimistic locking. Two loads observe the same version,
+// both finalize, and race to Save. The first wins; the second is rejected with
+// tx.ErrVersionConflict (not last-writer-wins), so FinalizeInvoice would retry
+// the loser, re-read the finalized row, and be rejected by Finalize(). The
+// winner's state is durably persisted and the version advances.
+func TestInvoiceRepo_Save_OptimisticLockConflict(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-ol', 'acc-ol', 'active')`); err != nil {
+		t.Fatal(err)
+	}
+	repo := postgres.NewInvoiceRepository(pool)
+
+	base, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+		ID: "inv-ol", InvoiceNumber: "INV-OL", AccountID: "acc-ol", ContractID: "c-ol",
+		Status: invoice.InvoiceStatusDraft, Subtotal: jpy(1000), TaxAmount: jpy(0),
+		DiscountAmount: jpy(0), Total: jpy(1000), AppliedBalance: jpy(0),
+		AmountDue: jpy(1000), PaidAmount: jpy(0), Balance: jpy(1000),
+	})
+	if err != nil {
+		t.Fatalf("build base: %v", err)
+	}
+	if err := repo.Save(ctx, base); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	a, err := repo.FindByID(ctx, "inv-ol")
+	if err != nil {
+		t.Fatalf("load a: %v", err)
+	}
+	b, err := repo.FindByID(ctx, "inv-ol")
+	if err != nil {
+		t.Fatalf("load b: %v", err)
+	}
+	if err := a.Finalize(); err != nil {
+		t.Fatalf("finalize a: %v", err)
+	}
+	if err := b.Finalize(); err != nil {
+		t.Fatalf("finalize b: %v", err)
+	}
+
+	if err := repo.Save(ctx, a); err != nil {
+		t.Fatalf("first Save (winner): %v", err)
+	}
+	if err := repo.Save(ctx, b); !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("second Save: expected tx.ErrVersionConflict, got %v", err)
+	}
+
+	reloaded, err := repo.FindByID(ctx, "inv-ol")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Status() != invoice.InvoiceStatusFinalized {
+		t.Errorf("status = %s, want finalized", reloaded.Status())
+	}
+	if reloaded.Version() != 1 {
+		t.Errorf("persisted version = %d, want 1", reloaded.Version())
+	}
+	// The retry path (re-load the finalized row, mutate, Save) must still work,
+	// proving the guard does not wedge a legitimate follow-up write. History
+	// stays consistent: the as-of read at the reload returns the finalized state.
+	if err := reloaded.VoidWithReason("superseded"); err != nil {
+		t.Fatalf("void reloaded: %v", err)
+	}
+	if err := repo.Save(ctx, reloaded); err != nil {
+		t.Fatalf("retry Save after reload: %v", err)
+	}
+	asOf, err := repo.FindByIDAsOf(ctx, "inv-ol", time.Now())
+	if err != nil {
+		t.Fatalf("FindByIDAsOf: %v", err)
+	}
+	if asOf.Status() != invoice.InvoiceStatusVoided {
+		t.Errorf("as-of status = %s, want voided", asOf.Status())
+	}
+}
+
+// Issue #45: the per-(contract_id, billing_period) partial unique index. A second
+// DISTINCT non-voided, non-proration invoice for the same period is rejected with
+// ErrCodeConflict, while proration invoices, zero-period invoices, and a
+// void-and-recreate replacement all coexist (the exemptions in the Save godoc /
+// inmemory reference).
+func TestInvoiceRepo_Save_PeriodUniqueness(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-pu', 'acc-pu', 'active')`); err != nil {
+		t.Fatal(err)
+	}
+	repo := postgres.NewInvoiceRepository(pool)
+
+	period, err := shared.NewDateRange(
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("period: %v", err)
+	}
+
+	mk := func(id string, status invoice.InvoiceStatus, p shared.DateRange, meta map[string]string) *invoice.Invoice {
+		t.Helper()
+		inv, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+			ID: shared.InvoiceID(id), AccountID: "acc-pu", ContractID: "c-pu",
+			Status: status, Subtotal: jpy(1000), TaxAmount: jpy(0), DiscountAmount: jpy(0),
+			Total: jpy(1000), AppliedBalance: jpy(0), AmountDue: jpy(1000),
+			PaidAmount: jpy(0), Balance: jpy(1000), BillingPeriod: p, Metadata: meta,
+		})
+		if err != nil {
+			t.Fatalf("build %s: %v", id, err)
+		}
+		return inv
+	}
+
+	if err := repo.Save(ctx, mk("inv-p1", invoice.InvoiceStatusFinalized, period, nil)); err != nil {
+		t.Fatalf("first period invoice: %v", err)
+	}
+	// Second distinct regular invoice for the same period -> conflict.
+	if err := repo.Save(ctx, mk("inv-p2", invoice.InvoiceStatusFinalized, period, nil)); !isDomainError(err, shared.ErrCodeConflict) {
+		t.Fatalf("second period invoice: expected ErrCodeConflict, got %v", err)
+	}
+	// Proration invoice for the same period coexists (exempt).
+	if err := repo.Save(ctx, mk("inv-pro", invoice.InvoiceStatusFinalized, period,
+		map[string]string{invoice.MetadataKeyInvoiceType: invoice.InvoiceTypeProration})); err != nil {
+		t.Fatalf("proration invoice should coexist: %v", err)
+	}
+	// Zero-period invoices are unconstrained.
+	if err := repo.Save(ctx, mk("inv-z1", invoice.InvoiceStatusFinalized, shared.DateRange{}, nil)); err != nil {
+		t.Fatalf("zero-period invoice 1: %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-z2", invoice.InvoiceStatusFinalized, shared.DateRange{}, nil)); err != nil {
+		t.Fatalf("zero-period invoice 2: %v", err)
+	}
+
+	// Void-and-recreate (RegenerateInvoice shape): void the original, then a
+	// regeneration replacement for the SAME period succeeds because the voided
+	// original is exempt.
+	first, err := repo.FindByID(ctx, "inv-p1")
+	if err != nil {
+		t.Fatalf("load inv-p1: %v", err)
+	}
+	if err := first.VoidWithReason("superseded"); err != nil {
+		t.Fatalf("void inv-p1: %v", err)
+	}
+	if err := repo.Save(ctx, first); err != nil {
+		t.Fatalf("save voided inv-p1: %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-p1r", invoice.InvoiceStatusFinalized, period,
+		map[string]string{invoice.MetadataKeyInvoiceType: invoice.InvoiceTypeRegeneration})); err != nil {
+		t.Fatalf("regeneration replacement for same period after void: %v", err)
+	}
+}
+
 func TestInvoiceRepo_FindByStatus(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	ctx := context.Background()
