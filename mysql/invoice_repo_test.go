@@ -19,7 +19,7 @@ func newInvoiceRepo(t *testing.T) (*MySQLInvoiceRepository, sqlmock.Sqlmock) {
 		t.Fatalf("sqlmock.New: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return NewInvoiceRepository(db), mock
+	return NewInvoiceRepository(db, shared.FixedClock{FixedTime: fixedTime}), mock
 }
 
 func sampleInvoice(t *testing.T) *invoice.Invoice {
@@ -92,6 +92,37 @@ func TestInvoiceRepo_Save_Upsert(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), "inv-1").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`INSERT INTO invoice_history`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	if err := repo.Save(context.Background(), inv); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Issue #39: the bitemporal history stamp comes from the injected clock, not
+// wall-clock time.Now, so history windows are deterministic and testable with
+// FixedClock. Both the close (UPDATE ... valid_to) and the open (INSERT ...
+// valid_from) must be bound to the exact clock instant.
+func TestInvoiceRepo_Save_StampsHistoryFromInjectedClock(t *testing.T) {
+	repo, mock := newInvoiceRepo(t) // clock = FixedClock{fixedTime}
+	inv := sampleInvoice(t)
+
+	want := fixedTime.UTC()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO invoices .* ON DUPLICATE KEY UPDATE`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	// valid_to (close) bound to the clock instant, not sqlmock.AnyArg.
+	mock.ExpectExec(`UPDATE invoice_history SET valid_to = \? WHERE id = \? AND valid_to IS NULL`).
+		WithArgs(want, "inv-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// valid_from (open) — 4th bound arg — bound to the same clock instant.
+	mock.ExpectExec(`INSERT INTO invoice_history`).
+		WithArgs("inv-1", "inv-1", sqlmock.AnyArg(), want).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

@@ -217,7 +217,7 @@ func TestIntegration_ContractProjector_Rebuild(t *testing.T) {
 // gap for FindByIDAsOf to fall through.
 func TestIntegration_InvoiceRepo_SaveFindAndHistoryContiguity(t *testing.T) {
 	db := mysqltest.NewDB(t)
-	repo := mysql.NewInvoiceRepository(db)
+	repo := mysql.NewInvoiceRepository(db, integrationClock)
 	ctx := context.Background()
 
 	insertContractReadModel(t, db, "c-inv", "acc-inv")
@@ -276,7 +276,7 @@ func TestIntegration_InvoiceRepo_SaveFindAndHistoryContiguity(t *testing.T) {
 // REPEATABLE READ the locking read is what serializes the two finalizers.
 func TestIntegration_InvoiceRepo_ConcurrentFinalize_OneLoserRejected(t *testing.T) {
 	db := mysqltest.NewDB(t)
-	repo := mysql.NewInvoiceRepository(db)
+	repo := mysql.NewInvoiceRepository(db, integrationClock)
 	ctx := context.Background()
 
 	insertContractReadModel(t, db, "c-fin", "acc-fin")
@@ -390,7 +390,7 @@ func TestIntegration_InvoiceRepo_ConcurrentFinalize_OneLoserRejected(t *testing.
 // wraps the three writes when no ambient transaction is present.
 func TestIntegration_InvoiceRepo_NonTxSaveHistoryConsistent(t *testing.T) {
 	db := mysqltest.NewDB(t)
-	repo := mysql.NewInvoiceRepository(db)
+	repo := mysql.NewInvoiceRepository(db, integrationClock)
 	ctx := context.Background()
 
 	insertContractReadModel(t, db, "c-inv", "acc-inv")

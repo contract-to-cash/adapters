@@ -14,14 +14,20 @@ import (
 
 // MySQLInvoiceRepository is a MySQL-backed invoice.Repository.
 type MySQLInvoiceRepository struct {
-	db *sql.DB
+	db    *sql.DB
+	clock shared.Clock
 }
 
 var _ invoice.Repository = (*MySQLInvoiceRepository)(nil)
 
 // NewInvoiceRepository constructs an invoice repository over an existing *sql.DB.
-func NewInvoiceRepository(db *sql.DB) *MySQLInvoiceRepository {
-	return &MySQLInvoiceRepository{db: db}
+// The clock stamps the bitemporal invoice_history valid_from/valid_to columns;
+// inject shared.FixedClock in tests so history windows are deterministic, and
+// shared.SystemClock in production. The clock is a required argument, mirroring
+// the event store's New(db, clock, ...) so the whole adapter takes its time from
+// one injected source rather than a mix of injected and wall-clock reads.
+func NewInvoiceRepository(db *sql.DB, clock shared.Clock) *MySQLInvoiceRepository {
+	return &MySQLInvoiceRepository{db: db, clock: clock}
 }
 
 func (r *MySQLInvoiceRepository) q(ctx context.Context) Querier {
@@ -170,8 +176,10 @@ func (r *MySQLInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Invoic
 	// is already past but the new row's valid_from has not yet begun — a
 	// FindByIDAsOf at that instant would match neither. Binding one Go-computed
 	// timestamp to both closes the gap (postgres avoids it via a tx-stable
-	// NOW()).
-	histNow := time.Now().UTC()
+	// NOW()). The instant comes from the injected clock (not wall-clock
+	// time.Now) so history windows are deterministic under FixedClock and honour
+	// the module's clock-injection convention.
+	histNow := r.clock.Now().UTC()
 
 	if _, err := q.ExecContext(ctx,
 		`UPDATE invoice_history SET valid_to = ? WHERE id = ? AND valid_to IS NULL`,

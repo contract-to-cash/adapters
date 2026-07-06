@@ -274,8 +274,10 @@ verification level differs:
   and repository round-trips). Like postgres, the integration suite self-skips
   without a reachable database; setting `ADAPTERS_TEST_MYSQL_DSN` makes an
   unreachable database a hard failure (used in CI, which runs a `mysql:8` service
-  container). The DSN should enable `multiStatements=true` (to apply the
-  multi-statement migration files) and `parseTime=true&loc=UTC`.
+  container). The integration DSN needs `parseTime=true&loc=UTC`;
+  `multiStatements` is **not** required — `mysql.Migrate` splits each migration
+  file into single statements itself (`mysql/migrate.go`, `splitStatements`) and
+  executes them one at a time, so it never issues a multi-statement query.
 - **fincode**: `httptest`-based unit tests against a fake fincode server
   (no live API calls).
 - **stripe**: `httptest`-based unit tests against a fake Stripe API, with the
@@ -389,6 +391,20 @@ the postgres file uses `DROP INDEX IF EXISTS` / `CREATE INDEX IF NOT
 EXISTS`; MySQL 8.0 supports neither, so the mysql file guards each change
 with an `information_schema` lookup executed through a prepared statement.
 
+**009_drop_dead_balance_index** (postgres only) drops the partial index
+`idx_balance_entries_available` that 004 created with `WHERE remaining_amount
+> 0`. Issue #11 reworked `FindAvailable` to decide availability in Go on the
+precise remaining amount from the state JSON, so the query no longer carries a
+`remaining_amount > 0` predicate; a PostgreSQL partial index is unusable to the
+planner unless the query implies its predicate, so the index was pure write
+amplification (the plain `idx_balance_entries_account_currency` from 003 already
+serves the scan). There is **no mysql 009**: MySQL has no partial indexes, so
+its 004 already created a plain composite index over `(account_id, currency,
+created_at)` that the planner still uses for the same lookup — it is not dead.
+`DROP INDEX IF EXISTS` makes the migration idempotent. The runner is
+forward-only (no `.down` files); the file's header documents the exact
+`CREATE INDEX` to restore it by hand.
+
 ## MySQL schema & connection
 
 Apply the DDL in `mysql/migrations/` before use; `mysql/schema.sql`
@@ -402,9 +418,12 @@ and returned in UTC; `DATETIME` columns are scanned correctly under either
 
 - Optimistic concurrency: `UNIQUE (stream_id, version)` (event store) and a
   version-guarded `UPDATE ... WHERE version = ?` (balance) — same as postgres.
-- No deferrable constraints: the contract read-model `Rebuild` wraps its reload
-  in `SET SESSION foreign_key_checks = 0/1` (postgres uses `SET CONSTRAINTS
-  ALL DEFERRED`).
+- Constraint juggling during `Rebuild`: none needed in either dialect. Migration
+  008 (issue #29) dropped the write-side → `contract_read_models` foreign keys, so
+  the contract read-model `Rebuild` no longer disables/defers constraints while it
+  empties and repopulates the projection — the former mysql `SET SESSION
+  foreign_key_checks = 0/1` and postgres `SET CONSTRAINTS ALL DEFERRED` were both
+  removed (`mysql/contract_projector.go`, `postgres/contract_projector.go`).
 - No `LISTEN/NOTIFY`: `Subscribe` tails new events by polling `LoadAll`
   (replay-then-tail, honours `fromPosition`, back-pressures slow consumers).
 - Partial indexes are emulated as full indexes; `JSONB`→`JSON`,
@@ -469,3 +488,17 @@ fail with a foreign-key violation whenever the projector is behind. Either apply
 008 (recommended) or run projections **synchronously** (project in the append
 transaction) so the read-model row always exists before dependent rows are
 written.
+
+### Known limitation: contract list queries are N+1
+
+The contract-repository fan-out queries (`FindDueForRenewal`, `FindExpiring`,
+`FindTrialsEndingSoon`) resolve a batch of contract IDs from the read model and
+then rehydrate each aggregate with a per-ID `FindByID` — one snapshot query plus
+one event-load query apiece, i.e. ~2N+1 round trips for N contracts. This is
+acceptable for interactive lookups but shows up on large renewal/expiration
+batches. A future optimization can collapse most of it by batch-loading events
+with `WHERE stream_id = ANY($1)` (postgres) / `WHERE stream_id IN (?, …)`
+(mysql) and grouping in memory; it is deferred rather than shipped here because
+doing it correctly in both dialects (snapshot + post-snapshot event windows,
+per-stream ordering) is a larger change than this housekeeping pass warrants.
+Until then, keep batch sizes bounded on very large renewal runs.
