@@ -43,6 +43,22 @@ Event store semantics follow the core reference implementation
 cuts off on snapshot `CreatedAt`, and `Append` derives event versions
 server-side from `expectedVersion`.
 
+`usage.Repository.Record` also follows the core reference
+(`infrastructure/inmemory/usage_repository.go`): recording a `UsageRecord`
+whose `idempotency_key` collides with an existing row returns a
+`shared.DomainError` with code `duplicate_request` (not a silent success).
+Both SQL adapters translate the unique-key violation
+(Postgres `usage_records_idempotency_key_key` / MySQL 1062 on the
+`idempotency_key` index) into that sentinel, so behaviour is identical to what
+integrators observe when testing against the in-memory repository. A record
+with an empty `idempotency_key` is never deduplicated (inserted
+unconditionally). Metering ingest pipelines that prefer silent at-least-once
+dedup can `errors.As` the `*shared.DomainError`, check for
+`ErrCodeDuplicateRequest`, and drop it; a caller that needs the duplicate
+signal cannot recover it from a silent no-op, which is why the adapters surface
+it by default (issue #38). A duplicate PRIMARY KEY (`id`) is a distinct,
+non-idempotent fault and always surfaces as a wrapped error.
+
 ### fincode scope and conventions
 
 - **Credit cards / JPY only.** `SupportedMethods()` reports `credit_card`;

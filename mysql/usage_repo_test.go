@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -54,9 +55,12 @@ func TestUsageRepo_Record(t *testing.T) {
 	}
 }
 
-// A duplicate idempotency_key is an idempotent no-op (mirrors postgres'
-// ON CONFLICT (idempotency_key) DO NOTHING): Record must swallow it.
-func TestUsageRepo_Record_DuplicateIdempotencyKeyIsNoOp(t *testing.T) {
+// A duplicate idempotency_key must surface as the core's
+// DomainError(duplicate_request), matching the in-memory reference
+// implementation integrators test against (issue #38). It is NOT a silent no-op:
+// a caller who wants ignore-duplicates semantics can check the error code, but a
+// caller who needs the signal cannot recover it from a silent success.
+func TestUsageRepo_Record_DuplicateIdempotencyKeyReturnsDuplicateRequest(t *testing.T) {
 	repo, mock := newUsageRepo(t)
 	rec := sampleUsageRecord(t)
 
@@ -66,8 +70,16 @@ func TestUsageRepo_Record_DuplicateIdempotencyKeyIsNoOp(t *testing.T) {
 			Message: "Duplicate entry 'idem-ur-1' for key 'usage_records.idempotency_key'",
 		})
 
-	if err := repo.Record(context.Background(), rec); err != nil {
-		t.Fatalf("Record duplicate idempotency key should be a no-op, got: %v", err)
+	err := repo.Record(context.Background(), rec)
+	if err == nil {
+		t.Fatal("expected duplicate idempotency key to return an error, got nil")
+	}
+	var de *shared.DomainError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *shared.DomainError, got %T: %v", err, err)
+	}
+	if de.Code != shared.ErrCodeDuplicateRequest {
+		t.Errorf("Code = %q, want %q", de.Code, shared.ErrCodeDuplicateRequest)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

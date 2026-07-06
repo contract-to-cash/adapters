@@ -436,25 +436,46 @@ func TestIntegration_UsageRepo_IdempotencyKeySemantics(t *testing.T) {
 		t.Fatalf("Record: %v", err)
 	}
 
-	// Same idempotency_key, DIFFERENT id: idempotent no-op (must NOT error).
+	// Same idempotency_key, DIFFERENT id: must surface as the core's
+	// DomainError(duplicate_request), matching the in-memory reference
+	// implementation (issue #38) — not a silent no-op.
 	dupKey := mustUsageRecord(t, "ur-int-2", "idem-int")
-	if err := repo.Record(ctx, dupKey); err != nil {
-		t.Fatalf("duplicate idempotency_key should be a no-op, got: %v", err)
+	err := repo.Record(ctx, dupKey)
+	if err == nil {
+		t.Fatal("expected duplicate idempotency_key to return an error, got nil")
+	}
+	if !isDomainError(err, shared.ErrCodeDuplicateRequest) {
+		t.Errorf("expected DomainError(%s), got %T: %v", shared.ErrCodeDuplicateRequest, err, err)
 	}
 
-	// Same id (PRIMARY KEY collision): a real fault that must surface.
+	// Same id (PRIMARY KEY collision): a real fault that must surface — as a
+	// plain wrapped error, NOT the duplicate_request sentinel.
 	dupID := mustUsageRecord(t, "ur-int-1", "idem-different")
-	if err := repo.Record(ctx, dupID); err == nil {
+	err = repo.Record(ctx, dupID)
+	if err == nil {
 		t.Fatal("duplicate id must surface as an error, got nil")
 	}
+	if isDomainError(err, shared.ErrCodeDuplicateRequest) {
+		t.Errorf("duplicate id must not be reported as duplicate_request, got: %v", err)
+	}
 
-	// Exactly one row must have persisted (only ur-int-1).
+	// Records without an idempotency key are never deduplicated (NULLs are
+	// distinct), matching inmemory.
+	for _, id := range []string{"ur-int-nokey-1", "ur-int-nokey-2"} {
+		rk := mustUsageRecord(t, id, "")
+		if err := repo.Record(ctx, rk); err != nil {
+			t.Fatalf("Record %s (no key): %v", id, err)
+		}
+	}
+
+	// Exactly three rows must have persisted (ur-int-1 + the two keyless ones);
+	// both duplicate writes were rejected.
 	var count int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_records WHERE contract_id = 'c-usage'`).Scan(&count); err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("expected 1 usage record, got %d", count)
+	if count != 3 {
+		t.Errorf("expected 3 usage records, got %d", count)
 	}
 }
 
