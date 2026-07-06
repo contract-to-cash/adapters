@@ -194,6 +194,39 @@ func TestEventStore_Append_DuplicateEventIDIsNotVersionConflict(t *testing.T) {
 	}
 }
 
+// A contract.created event reusing an idempotency key trips the
+// ux_contract_idempotency_key UNIQUE index (migration 009), reported by MySQL as
+// 1062 with the index name in the message. It must map to ErrCodeConflict (a
+// creation conflict), NOT ErrCodeVersionConflict — a retry can never succeed, so
+// the caller must look up the existing contract instead.
+func TestEventStore_Append_ContractIdempotencyConflictMapsToConflict(t *testing.T) {
+	store, mock := newTestStore(t)
+	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	mock.ExpectExec(`INSERT INTO events`).
+		WillReturnError(&driver.MySQLError{
+			Number:  1062,
+			Message: "Duplicate entry 'dup-key' for key 'events.ux_contract_idempotency_key'",
+		})
+	mock.ExpectRollback()
+
+	err := store.Append(context.Background(), "contract-1", events, 0)
+	var de *shared.DomainError
+	if !errors.As(err, &de) || de.Code != shared.ErrCodeConflict {
+		t.Fatalf("expected conflict DomainError, got %v", err)
+	}
+	if de.Code == shared.ErrCodeVersionConflict {
+		t.Fatal("idempotency conflict must NOT be a version conflict")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func TestEventStore_LoadUntilVersion(t *testing.T) {
 	store, mock := newTestStore(t)
 	mock.ExpectQuery(`SELECT .* FROM events WHERE stream_id = \? AND version <= \? ORDER BY version ASC`).

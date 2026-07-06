@@ -103,7 +103,11 @@ func (r *PostgresContractRepository) FindExpiring(ctx context.Context, before ti
 		 WHERE end_date IS NOT NULL AND end_date < $1 AND status = 'active'`, before)
 }
 
-func (r *PostgresContractRepository) FindTrialsEndingSoon(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
+// FindTrialsEndingBefore returns trialing contracts whose trial_end_date is
+// strictly before the given time (renamed from FindTrialsEndingSoon to match
+// core#162 B4; the batch calls it with `now` to find trials that have ALREADY
+// ended).
+func (r *PostgresContractRepository) FindTrialsEndingBefore(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
 	return r.findManyFromReadModel(ctx,
 		`SELECT id FROM contract_read_models
 		 WHERE trial_end_date IS NOT NULL AND trial_end_date < $1 AND status = 'trialing'`, before)

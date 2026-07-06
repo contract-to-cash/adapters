@@ -30,11 +30,12 @@ func newDraftContract(t *testing.T, id string) *contract.ContractAggregate {
 	t.Helper()
 	agg := contract.NewContractAggregate(shared.ContractID(id), shared.FixedClock{FixedTime: fixedTime})
 	err := agg.Create(contract.CreateContractCommand{
-		AccountID:    "acct-1",
-		PriceID:      "price-1",
-		Price:        jpy(1000),
-		ContractType: contract.ContractTypeSubscription,
-		Interval:     pricing.Monthly(),
+		IdempotencyKey: "idem-" + id,
+		AccountID:      "acct-1",
+		PriceID:        "price-1",
+		Price:          jpy(1000),
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
 	}, eventstore.EventMetadata{UserID: "user-1"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
