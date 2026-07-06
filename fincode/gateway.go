@@ -1018,10 +1018,22 @@ func (g *Gateway) wrapGatewayError(op string, err error) error {
 			ge.Retryable = true
 		}
 		if he.APIError != nil && len(he.APIError.Errors) > 0 {
-			// Preserve the fincode-specific error code for dispatching;
-			// fincode publishes hundreds of codes, so no table mapping is
-			// attempted here.
-			ge.DeclineCode = he.APIError.Errors[0].ErrorCode
+			// Preserve the fincode-specific error code for dispatching and for
+			// callers that want the raw code (e.g. dashboard lookup).
+			declineCode := he.APIError.Errors[0].ErrorCode
+			ge.DeclineCode = declineCode
+			// Classify known fincode error codes into a port.ErrorCode so that
+			// ErrorCode-based policy (dunning classification, user-facing
+			// messaging) behaves consistently with the Stripe adapter instead
+			// of collapsing every 4xx business rejection into processing_error.
+			// Status-derived codes set above (rate limit / timeout / 5xx) take
+			// precedence and are not overridden; anything we cannot ground keeps
+			// the processing_error fallback (see classifyFincodeErrorCode).
+			if ge.Code == port.ErrorCodeProcessingError {
+				if mapped, ok := classifyFincodeErrorCode(declineCode); ok {
+					ge.Code = mapped
+				}
+			}
 		}
 		return ge
 	}
@@ -1030,6 +1042,42 @@ func (g *Gateway) wrapGatewayError(op string, err error) error {
 	ge.Code = port.ErrorCodeGatewayUnavailable
 	ge.Retryable = true
 	return ge
+}
+
+// classifyFincodeErrorCode maps a fincode API error_code to the corresponding
+// port.ErrorCode, mirroring the Stripe adapter's decline taxonomy
+// (stripe/gateway.go mapStripeErrorCode) so that ErrorCode-based policy is
+// symmetric across gateways. It reports ok=false when the code is not one we
+// can classify with confidence, in which case the caller keeps the
+// processing_error fallback and the raw code stays on GatewayError.DeclineCode.
+//
+// Grounding and scope: fincode publishes hundreds of codes and, unlike Stripe,
+// does NOT expose a granular decline reason (insufficient funds vs. expired
+// card vs. invalid card vs. CVC) in its error_code. Card-company authorization
+// declines are surfaced under a single "E9993" family (オーソリエラー /
+// card-company authorization error) per fincode's published error reference
+// (https://docs.fincode.jp/develop_support/error). We therefore map that whole
+// family to card_declined — the accounting-relevant umbrella that dunning and
+// user messaging branch on — and deliberately do NOT synthesise the finer
+// Stripe categories (insufficient_funds, card_expired, invalid_cvc, ...) that
+// fincode does not report. The specific fincode code remains available on
+// GatewayError.DeclineCode for callers that need the raw value. Additional
+// codes should be added here only when grounded in fincode's documentation,
+// never guessed (a small correct table beats a large speculative one).
+//
+// Note: the 3D Secure / authentication_required category has no mapping because
+// this adapter rejects the 3DS flow up front (see unsupported3DSError); such a
+// decline is never reached through the charge path.
+func classifyFincodeErrorCode(code string) (port.ErrorCode, bool) {
+	switch {
+	case strings.HasPrefix(code, "E9993"):
+		// Card-company authorization decline (over-limit, lost/stolen, expired,
+		// invalid card, issuer rejection, ...). fincode does not distinguish the
+		// reason in error_code; it lives only in the dashboard / DeclineCode.
+		return port.ErrorCodeCardDeclined, true
+	default:
+		return "", false
+	}
 }
 
 func unsupported3DSError() error {
