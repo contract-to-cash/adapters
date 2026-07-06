@@ -10,6 +10,7 @@ import (
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -68,7 +69,16 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 		processedAt = &t
 	}
 
-	_, err = r.q(ctx).Exec(ctx,
+	q := r.q(ctx)
+
+	// The upsert conflicts on (id) only, so a same-id re-save (e.g. the 3DS
+	// Pending -> Completed upgrade path) is updated in place. A DIFFERENT payment
+	// carrying the same idempotency_key does NOT match ON CONFLICT (id); it trips
+	// the payments_idempotency_key_key UNIQUE constraint and raises 23505. That
+	// raw pgconn error MUST be translated to the core sentinel (issue #35 /
+	// core#97) — otherwise PaymentService routes the race loser through saga
+	// compensation and refunds the winner's legitimate charge.
+	_, err = q.Exec(ctx,
 		`INSERT INTO payments (id, invoice_id, idempotency_key, amount, refunded_amount,
 			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
@@ -83,9 +93,47 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 		string(s.Amount.Currency()), string(s.Status), string(s.Method),
 		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState)
 	if err != nil {
+		if isIdempotencyKeyConflict(err) {
+			return r.duplicateIdempotencyKey(ctx, q, s)
+		}
 		return fmt.Errorf("save payment: %w", err)
 	}
 	return nil
+}
+
+// paymentsIdempotencyKeyConstraint is the auto-generated name of the UNIQUE
+// constraint on payments.idempotency_key (Postgres names a column-level UNIQUE
+// constraint <table>_<column>_key). Matching on the constraint name — not the
+// bare 23505 code — keeps an unrelated UNIQUE violation from being misreported
+// as a duplicate idempotency key (mirrors isVersionConflict in eventstore.go).
+const paymentsIdempotencyKeyConstraint = "payments_idempotency_key_key"
+
+// isIdempotencyKeyConflict reports whether err is a unique-violation (23505)
+// specifically on the payments idempotency_key constraint.
+func isIdempotencyKeyConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgUniqueViolation &&
+			pgErr.ConstraintName == paymentsIdempotencyKeyConstraint
+	}
+	return false
+}
+
+// duplicateIdempotencyKey builds the core's payment.ErrDuplicateIdempotencyKey
+// sentinel for a rejected write. It makes a best-effort lookup of the winning
+// record's id for operational debugging; a lookup failure must never mask the
+// duplicate signal.
+func (r *PostgresPaymentRepository) duplicateIdempotencyKey(ctx context.Context, q Querier, s payment.PaymentSnapshot) error {
+	dup := &payment.DuplicateIdempotencyKeyError{
+		Key:         s.IdempotencyKey,
+		AttemptedID: s.ID,
+	}
+	var existingID string
+	if err := q.QueryRow(ctx,
+		`SELECT id FROM payments WHERE idempotency_key = $1`, s.IdempotencyKey).Scan(&existingID); err == nil {
+		dup.ExistingID = shared.PaymentID(existingID)
+	}
+	return dup
 }
 
 func (r *PostgresPaymentRepository) FindByID(ctx context.Context, id shared.PaymentID) (*payment.Payment, error) {

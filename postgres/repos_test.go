@@ -402,6 +402,89 @@ func TestPaymentRepo_FindByIdempotencyKey(t *testing.T) {
 	}
 }
 
+// Two payments with the SAME idempotency_key but DIFFERENT ids: the loser's
+// INSERT trips the payments_idempotency_key_key UNIQUE constraint (23505). Save
+// MUST translate the raw pgconn error to payment.ErrDuplicateIdempotencyKey
+// (issue #35 / core#97) — otherwise PaymentService routes the loser through
+// saga compensation and refunds the winner's legitimate charge. A same-id
+// re-save must still upsert in place.
+func TestPaymentRepo_DuplicateIdempotencyKey(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	_, _ = pool.Exec(ctx, `INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-pay-dup', 'acc-pay-dup', 'active')`)
+	_, _ = pool.Exec(ctx, `INSERT INTO invoices (id, account_id, contract_id, status, subtotal, tax_amount, discount_amount, total, applied_balance, amount_due, paid_amount, balance) VALUES ('inv-pay-dup', 'acc-pay-dup', 'c-pay-dup', 'issued', 0, 0, 0, 0, 0, 0, 0, 0)`)
+
+	repo := postgres.NewPaymentRepository(pool)
+
+	winner := mustPayment(t, "pay-win", "inv-pay-dup", "idem-collide", payment.PaymentStatusCompleted, 5000)
+	if err := repo.Save(ctx, winner); err != nil {
+		t.Fatalf("Save winner: %v", err)
+	}
+
+	// Same idempotency_key, DIFFERENT id: must surface the core sentinel.
+	loser := mustPayment(t, "pay-lose", "inv-pay-dup", "idem-collide", payment.PaymentStatusFailed, 9999)
+	err := repo.Save(ctx, loser)
+	if !errors.Is(err, payment.ErrDuplicateIdempotencyKey) {
+		t.Fatalf("expected ErrDuplicateIdempotencyKey, got %v", err)
+	}
+	var dup *payment.DuplicateIdempotencyKeyError
+	if !errors.As(err, &dup) {
+		t.Fatalf("expected *DuplicateIdempotencyKeyError, got %v", err)
+	}
+	if dup.Key != "idem-collide" || dup.AttemptedID != "pay-lose" || dup.ExistingID != "pay-win" {
+		t.Errorf("unexpected dup error: %+v", dup)
+	}
+
+	// The winner's row must be intact.
+	got, err := repo.FindByID(ctx, "pay-win")
+	if err != nil {
+		t.Fatalf("FindByID winner: %v", err)
+	}
+	ws := got.ToSnapshot()
+	if ws.Status != payment.PaymentStatusCompleted || ws.Amount.Int64() != 5000 {
+		t.Errorf("winner corrupted: status=%q amount=%d (want completed/5000)", ws.Status, ws.Amount.Int64())
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM payments WHERE idempotency_key = 'idem-collide'`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 payment for the key, got %d", count)
+	}
+
+	// Same id (the 3DS upgrade path): re-saving pay-win must upsert in place.
+	upgraded := mustPayment(t, "pay-win", "inv-pay-dup", "idem-collide", payment.PaymentStatusRefunded, 5000)
+	if err := repo.Save(ctx, upgraded); err != nil {
+		t.Fatalf("same-id re-save should upsert, got: %v", err)
+	}
+	reloaded, err := repo.FindByID(ctx, "pay-win")
+	if err != nil {
+		t.Fatalf("FindByID after update: %v", err)
+	}
+	if reloaded.ToSnapshot().Status != payment.PaymentStatusRefunded {
+		t.Errorf("status = %q, want refunded", reloaded.ToSnapshot().Status)
+	}
+}
+
+func mustPayment(t *testing.T, id, invoiceID, idempotencyKey string, status payment.PaymentStatus, amount int64) *payment.Payment {
+	t.Helper()
+	p, err := payment.FromSnapshot(payment.PaymentSnapshot{
+		ID:             shared.PaymentID(id),
+		InvoiceID:      shared.InvoiceID(invoiceID),
+		Amount:         jpy(amount),
+		RefundedAmount: jpy(0),
+		Method:         payment.PaymentMethodCreditCard,
+		Status:         status,
+		IdempotencyKey: idempotencyKey,
+		ProcessedAt:    time.Now().UTC().Truncate(time.Microsecond),
+	})
+	if err != nil {
+		t.Fatalf("payment.FromSnapshot: %v", err)
+	}
+	return p
+}
+
 // --- Balance Repository ---
 
 func TestBalanceRepo_SaveAndFindByID(t *testing.T) {

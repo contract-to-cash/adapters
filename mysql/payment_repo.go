@@ -69,24 +69,76 @@ func (r *MySQLPaymentRepository) Save(ctx context.Context, p *payment.Payment) e
 		processedAt = &t
 	}
 
-	_, err = r.q(ctx).ExecContext(ctx,
+	q := r.q(ctx)
+
+	// A plain INSERT (NOT `ON DUPLICATE KEY UPDATE`) so that a collision on the
+	// idempotency_key UNIQUE index is reported as an error rather than silently
+	// overwriting the winner's row with the loser's fields (issue #35 / core#97).
+	// Same-id re-saves (e.g. the 3DS Pending -> Completed upgrade path) collide on
+	// the PRIMARY key and are routed to a guarded UPDATE below.
+	_, err = q.ExecContext(ctx,
 		`INSERT INTO payments (id, invoice_id, idempotency_key, amount, refunded_amount,
 			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
-		 ON DUPLICATE KEY UPDATE
-			status = VALUES(status), amount = VALUES(amount),
-			refunded_amount = VALUES(refunded_amount), currency = VALUES(currency),
-			method = VALUES(method), gateway_transaction_id = VALUES(gateway_transaction_id),
-			failure_reason = VALUES(failure_reason), processed_at = VALUES(processed_at),
-			metadata = VALUES(metadata), state = VALUES(state), updated_at = NOW(6)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))`,
 		string(s.ID), string(s.InvoiceID), idempotencyKey,
 		s.Amount.Int64(), s.RefundedAmount.Int64(),
 		string(s.Amount.Currency()), string(s.Status), string(s.Method),
 		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState)
-	if err != nil {
-		return fmt.Errorf("save payment: %w", err)
+	if err == nil {
+		return nil
 	}
-	return nil
+
+	// InnoDB inserts into the clustered PRIMARY key before any secondary index,
+	// so a row that duplicates BOTH id and idempotency_key surfaces as a PRIMARY
+	// violation. Therefore an idempotency_key-named duplicate here is always a
+	// genuine cross-id collision (a DIFFERENT payment already owns this key) and
+	// MUST be translated to the core sentinel; PaymentService converges on the
+	// winner instead of firing saga compensation.
+	if dupEntryOnKey(err, "idempotency_key") {
+		return r.duplicateIdempotencyKey(ctx, q, s)
+	}
+
+	// PRIMARY-key duplicate: the payment already exists, so this Save is an
+	// update. Guard the UPDATE on id only, never touching another record.
+	if dupEntryOnKey(err, "PRIMARY") {
+		_, upErr := q.ExecContext(ctx,
+			`UPDATE payments SET
+				invoice_id = ?, idempotency_key = ?, amount = ?, refunded_amount = ?,
+				currency = ?, status = ?, method = ?, gateway_transaction_id = ?,
+				failure_reason = ?, processed_at = ?, metadata = ?, state = ?, updated_at = NOW(6)
+			 WHERE id = ?`,
+			string(s.InvoiceID), idempotencyKey, s.Amount.Int64(), s.RefundedAmount.Int64(),
+			string(s.Amount.Currency()), string(s.Status), string(s.Method), s.GatewayTransactionID,
+			failureReason, processedAt, metadata, jsonState, string(s.ID))
+		if upErr != nil {
+			// An idempotency_key change that collides with another record still
+			// maps to the sentinel; any other error is technical.
+			if dupEntryOnKey(upErr, "idempotency_key") {
+				return r.duplicateIdempotencyKey(ctx, q, s)
+			}
+			return fmt.Errorf("save payment: %w", upErr)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("save payment: %w", err)
+}
+
+// duplicateIdempotencyKey builds the core's payment.ErrDuplicateIdempotencyKey
+// sentinel for a rejected write. It makes a best-effort lookup of the winning
+// record's id for operational debugging; a lookup failure must never mask the
+// duplicate signal.
+func (r *MySQLPaymentRepository) duplicateIdempotencyKey(ctx context.Context, q Querier, s payment.PaymentSnapshot) error {
+	dup := &payment.DuplicateIdempotencyKeyError{
+		Key:         s.IdempotencyKey,
+		AttemptedID: s.ID,
+	}
+	var existingID string
+	if err := q.QueryRowContext(ctx,
+		`SELECT id FROM payments WHERE idempotency_key = ?`, s.IdempotencyKey).Scan(&existingID); err == nil {
+		dup.ExistingID = shared.PaymentID(existingID)
+	}
+	return dup
 }
 
 func (r *MySQLPaymentRepository) FindByID(ctx context.Context, id shared.PaymentID) (*payment.Payment, error) {

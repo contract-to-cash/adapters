@@ -12,6 +12,7 @@ import (
 	"github.com/contract-to-cash/adapters/mysql"
 	"github.com/contract-to-cash/adapters/mysql/mysqltest"
 	"github.com/contract-to-cash/core/domain/invoice"
+	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/domain/usage"
 	"github.com/contract-to-cash/core/eventstore"
@@ -294,6 +295,93 @@ func TestIntegration_UsageRepo_IdempotencyKeySemantics(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected 1 usage record, got %d", count)
 	}
+}
+
+// Two payments with the SAME idempotency_key but DIFFERENT ids must not corrupt
+// each other: the loser's INSERT trips the idempotency_key UNIQUE index and Save
+// must translate it to payment.ErrDuplicateIdempotencyKey (issue #35 / core#97),
+// leaving the winner's row untouched. A same-id re-save must still update in
+// place.
+func TestIntegration_PaymentRepo_DuplicateIdempotencyKey(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	repo := mysql.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	insertContractReadModel(t, db, "c-pay-idem", "acc-pay-idem")
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO invoices (id, account_id, contract_id, status, subtotal, tax_amount, discount_amount, total, applied_balance, amount_due, paid_amount, balance, currency, void_reason, line_items, metadata)
+		 VALUES ('inv-pay-idem', 'acc-pay-idem', 'c-pay-idem', 'issued', 0,0,0,0,0,0,0,0,'JPY','', '[]','{}')`); err != nil {
+		t.Fatalf("seed invoice: %v", err)
+	}
+
+	winner := mustPayment(t, "pay-win", "inv-pay-idem", "idem-collide", payment.PaymentStatusCompleted, 5000)
+	if err := repo.Save(ctx, winner); err != nil {
+		t.Fatalf("Save winner: %v", err)
+	}
+
+	// Same idempotency_key, DIFFERENT id: must surface the core sentinel.
+	loser := mustPayment(t, "pay-lose", "inv-pay-idem", "idem-collide", payment.PaymentStatusFailed, 9999)
+	err := repo.Save(ctx, loser)
+	if !errors.Is(err, payment.ErrDuplicateIdempotencyKey) {
+		t.Fatalf("expected ErrDuplicateIdempotencyKey, got %v", err)
+	}
+	var dup *payment.DuplicateIdempotencyKeyError
+	if !errors.As(err, &dup) {
+		t.Fatalf("expected *DuplicateIdempotencyKeyError, got %v", err)
+	}
+	if dup.Key != "idem-collide" || dup.AttemptedID != "pay-lose" || dup.ExistingID != "pay-win" {
+		t.Errorf("unexpected dup error: %+v", dup)
+	}
+
+	// The winner's row must be intact — NOT overwritten with the loser's fields.
+	got, err := repo.FindByID(ctx, "pay-win")
+	if err != nil {
+		t.Fatalf("FindByID winner: %v", err)
+	}
+	ws := got.ToSnapshot()
+	if ws.Status != payment.PaymentStatusCompleted || ws.Amount.Int64() != 5000 {
+		t.Errorf("winner corrupted: status=%q amount=%d (want completed/5000)", ws.Status, ws.Amount.Int64())
+	}
+
+	// Exactly one row must own the key.
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM payments WHERE idempotency_key = 'idem-collide'`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 payment for the key, got %d", count)
+	}
+
+	// Same id (the 3DS upgrade path): re-saving pay-win must update in place.
+	upgraded := mustPayment(t, "pay-win", "inv-pay-idem", "idem-collide", payment.PaymentStatusRefunded, 5000)
+	if err := repo.Save(ctx, upgraded); err != nil {
+		t.Fatalf("same-id re-save should update, got: %v", err)
+	}
+	reloaded, err := repo.FindByID(ctx, "pay-win")
+	if err != nil {
+		t.Fatalf("FindByID after update: %v", err)
+	}
+	if reloaded.ToSnapshot().Status != payment.PaymentStatusRefunded {
+		t.Errorf("status = %q, want refunded", reloaded.ToSnapshot().Status)
+	}
+}
+
+func mustPayment(t *testing.T, id, invoiceID, idempotencyKey string, status payment.PaymentStatus, amount int64) *payment.Payment {
+	t.Helper()
+	p, err := payment.FromSnapshot(payment.PaymentSnapshot{
+		ID:             shared.PaymentID(id),
+		InvoiceID:      shared.InvoiceID(invoiceID),
+		Amount:         jpy(amount),
+		RefundedAmount: jpy(0),
+		Method:         payment.PaymentMethodCreditCard,
+		Status:         status,
+		IdempotencyKey: idempotencyKey,
+		ProcessedAt:    integrationClock.Now(),
+	})
+	if err != nil {
+		t.Fatalf("payment.FromSnapshot: %v", err)
+	}
+	return p
 }
 
 func mustInvoice(t *testing.T, status invoice.InvoiceStatus, subtotal int64) *invoice.Invoice {
