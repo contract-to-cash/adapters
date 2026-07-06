@@ -89,6 +89,28 @@ server-side from `expectedVersion`.
   rejected with a `*ValidationError` before any mutating call — fincode's
   `/change` would otherwise silently raise the hold and over-charge (Stripe's
   API rejects over-capture server-side; fincode does not).
+- **Error mapping**: `*fincode.HTTPError`s are converted to `*port.GatewayError`
+  with the original error preserved via `RawError` (recoverable with
+  `errors.As`), and the fincode `error_code` is carried on `GatewayError.DeclineCode`.
+  Status-derived codes are classified as before: 429 → `rate_limit_exceeded`,
+  408/504 → `gateway_timeout`, 5xx → `gateway_unavailable` (all retryable),
+  transport failures → retryable `gateway_unavailable`. **Card-company
+  authorization declines** — fincode's `E9993*` family (オーソリエラー) — are
+  classified as `card_declined`, so `port.ErrorCode`-based policy (dunning
+  classification, user-facing messaging) behaves the same as with the Stripe
+  adapter for the dominant decline case, instead of collapsing every business
+  rejection into `processing_error`. **Asymmetry with Stripe**: unlike Stripe,
+  fincode does **not** expose a granular decline reason (insufficient funds vs.
+  expired card vs. invalid card vs. CVC) in `error_code` — the whole
+  authorization-decline class shares the `E9993` family and the reason lives
+  only in the dashboard. This adapter therefore maps that family to the
+  `card_declined` umbrella and deliberately does **not** synthesise the finer
+  `port.ErrorCode` categories fincode does not report; the raw fincode code
+  remains on `DeclineCode` for callers that need it. Any `error_code` that is
+  not grounded in fincode's [error documentation](https://docs.fincode.jp/develop_support/error)
+  keeps the non-retryable `processing_error` fallback rather than being guessed.
+  (The 3D Secure flow is rejected up front — see below — so no
+  `authentication_required` mapping is needed.)
 - **Configuration / `BaseURL`**: `Config.BaseURL` must be set explicitly
   (`fincode.ProductionBaseURL` or `fincode.SandboxBaseURL`). An empty `BaseURL`
   **no longer** silently defaults to the sandbox; `NewClient` returns an error

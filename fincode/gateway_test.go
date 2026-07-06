@@ -1736,6 +1736,129 @@ func TestGateway_ErrorMapping_NetworkErrorIsRetryable(t *testing.T) {
 	}
 }
 
+// classifyFincodeErrorCode maps grounded fincode error codes (the E9993
+// card-company authorization family) to a port.ErrorCode; everything else falls
+// back to the processing_error path (ok=false). See gateway.go for the grounding.
+func TestClassifyFincodeErrorCode(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     string
+		wantCode port.ErrorCode
+		wantOK   bool
+	}{
+		{"auth decline family bare prefix", "E9993", port.ErrorCodeCardDeclined, true},
+		{"auth decline family with suffix", "E99930001", port.ErrorCodeCardDeclined, true},
+		{"auth decline another suffix", "E9993999", port.ErrorCodeCardDeclined, true},
+		// Unmapped codes must keep the processing_error fallback, never guess.
+		{"request validation code", "E0100001", "", false},
+		{"token validation code", "E0200001", "", false},
+		{"generic/placeholder code E9999", "E9999", "", false},
+		{"unrelated E999 non-auth code", "E9990001", "", false},
+		{"empty code", "", "", false},
+		{"non-E code", "SOMETHING", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := classifyFincodeErrorCode(tt.code)
+			if ok != tt.wantOK {
+				t.Fatalf("classifyFincodeErrorCode(%q) ok = %v, want %v", tt.code, ok, tt.wantOK)
+			}
+			if got != tt.wantCode {
+				t.Errorf("classifyFincodeErrorCode(%q) = %q, want %q", tt.code, got, tt.wantCode)
+			}
+		})
+	}
+}
+
+// wrapGatewayError classifies a 4xx card-company authorization decline (E9993
+// family) into card_declined so ErrorCode-based dunning/messaging matches the
+// Stripe adapter, while preserving the raw fincode code on DeclineCode and
+// leaving status-derived codes (429/5xx/timeout) and unmapped 4xx codes
+// untouched.
+func TestGateway_WrapGatewayError_DeclineClassification(t *testing.T) {
+	gw := NewGateway(mustNewClient(Config{APIKey: "sk", BaseURL: "http://example.invalid"}))
+
+	tests := []struct {
+		name          string
+		status        int
+		code          string
+		wantCode      port.ErrorCode
+		wantRetryable bool
+		wantDecline   string
+	}{
+		{
+			name:        "card decline maps to card_declined",
+			status:      http.StatusBadRequest,
+			code:        "E99930001",
+			wantCode:    port.ErrorCodeCardDeclined,
+			wantDecline: "E99930001",
+		},
+		{
+			name:        "card decline 402 also maps",
+			status:      http.StatusPaymentRequired,
+			code:        "E9993",
+			wantCode:    port.ErrorCodeCardDeclined,
+			wantDecline: "E9993",
+		},
+		{
+			name:        "unmapped 4xx keeps processing_error fallback",
+			status:      http.StatusBadRequest,
+			code:        "E0100001",
+			wantCode:    port.ErrorCodeProcessingError,
+			wantDecline: "E0100001",
+		},
+		{
+			// Status-derived rate limit must win over the decline classifier,
+			// which only runs while Code is still processing_error.
+			name:          "429 stays rate_limit even with E9993 code",
+			status:        http.StatusTooManyRequests,
+			code:          "E99930001",
+			wantCode:      port.ErrorCodeRateLimitExceeded,
+			wantRetryable: true,
+			wantDecline:   "E99930001",
+		},
+		{
+			name:          "5xx stays gateway_unavailable",
+			status:        http.StatusBadGateway,
+			code:          "E99930001",
+			wantCode:      port.ErrorCodeGatewayUnavailable,
+			wantRetryable: true,
+			wantDecline:   "E99930001",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			he := &HTTPError{
+				StatusCode: tt.status,
+				Method:     http.MethodPut,
+				Path:       "/v1/payments/o1",
+				APIError: &ErrorResponse{
+					Errors: []APIError{{ErrorCode: tt.code, ErrorMessage: "decline"}},
+				},
+			}
+			err := gw.wrapGatewayError("execute payment", he)
+			var ge *port.GatewayError
+			if !errors.As(err, &ge) {
+				t.Fatalf("expected *port.GatewayError, got %T: %v", err, err)
+			}
+			if ge.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", ge.Code, tt.wantCode)
+			}
+			if ge.Retryable != tt.wantRetryable {
+				t.Errorf("Retryable = %v, want %v", ge.Retryable, tt.wantRetryable)
+			}
+			if ge.DeclineCode != tt.wantDecline {
+				t.Errorf("DeclineCode = %q, want %q (raw fincode code must pass through)", ge.DeclineCode, tt.wantDecline)
+			}
+			// The typed HTTP error must remain reachable through the chain.
+			var reached *HTTPError
+			if !errors.As(err, &reached) {
+				t.Error("expected errors.As to reach *HTTPError")
+			}
+		})
+	}
+}
+
 // --- helpers ---
 
 func TestSplitPaymentMethodID_SplitsAtLastSlash(t *testing.T) {
