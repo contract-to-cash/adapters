@@ -1,0 +1,26 @@
+-- Drop the dead partial index idx_balance_entries_available.
+--
+-- 004 created it as a PARTIAL index (... WHERE remaining_amount > 0) to serve
+-- BalanceRepository.FindAvailable. Issue #11 reworked FindAvailable to decide
+-- availability in Go on the precise remaining amount from the state JSON, so the
+-- SQL query no longer carries a `remaining_amount > 0` predicate
+-- (postgres/balance_repo.go). A PostgreSQL partial index is only usable when the
+-- query's WHERE implies the index predicate, so the planner can never use this
+-- one — it is pure write amplification. The plain composite index
+-- idx_balance_entries_account_currency (003) already serves the
+-- `WHERE account_id = $1 AND currency = $2 ... ORDER BY created_at` scan.
+--
+-- MySQL needs no equivalent migration: its 004 already dropped the partial
+-- predicate (MySQL has no partial indexes) and created a plain composite index
+-- on (account_id, currency, created_at), which the planner still uses for the
+-- same lookup, so it is not dead there.
+--
+-- Guarded with IF EXISTS so the migration converges on databases created before
+-- 009 (index present) and any that dropped it by hand; this also makes a re-run
+-- a no-op. This adapter's migration runner is forward-only (there are no .down
+-- files). To restore the index by hand, recreate it exactly as 004 defined:
+--   CREATE INDEX IF NOT EXISTS idx_balance_entries_available
+--       ON balance_entries (account_id, currency, created_at)
+--       WHERE remaining_amount > 0;
+
+DROP INDEX IF EXISTS idx_balance_entries_available;

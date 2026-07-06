@@ -2,11 +2,43 @@ package postgres_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/contract-to-cash/adapters/postgres"
 	"github.com/contract-to-cash/adapters/postgres/postgrestest"
 )
+
+// TestMigration009_DropsDeadBalanceIndexIdempotently checks the embedded 009
+// migration (issue #39) drops the dead partial index and does so with an
+// IF EXISTS guard, so a re-run against an already-migrated database is a no-op
+// rather than an error. This is a content assertion and needs no database.
+func TestMigration009_DropsDeadBalanceIndexIdempotently(t *testing.T) {
+	data, err := postgres.Migrations.ReadFile("migrations/009_drop_dead_balance_index.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 009: %v", err)
+	}
+	sql := string(data)
+
+	// Ignore comment lines so a "DROP INDEX ..." mentioned in prose does not
+	// satisfy the assertion; only executable statements count.
+	var exec strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		exec.WriteString(line)
+		exec.WriteString("\n")
+	}
+	stmt := strings.ToUpper(exec.String())
+
+	if !strings.Contains(stmt, "DROP INDEX IF EXISTS") {
+		t.Errorf("009 must DROP INDEX IF EXISTS for idempotency, got:\n%s", sql)
+	}
+	if !strings.Contains(stmt, "IDX_BALANCE_ENTRIES_AVAILABLE") {
+		t.Errorf("009 must drop idx_balance_entries_available, got:\n%s", sql)
+	}
+}
 
 // TestMigrate_Idempotent verifies the runner can be invoked repeatedly against
 // an already-migrated database: every file is recorded in schema_migrations and
