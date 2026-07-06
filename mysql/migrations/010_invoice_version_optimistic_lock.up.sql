@@ -1,0 +1,41 @@
+-- 010: invoice optimistic-locking version column
+-- (issue adapters#30 / core#130 / core#147). MySQL mirror of
+-- postgres/migrations/011_invoice_version_optimistic_lock.up.sql.
+--
+-- Background. core#130 added an optimistic-locking contract to
+-- invoice.Repository.Save, and core#147 made EVERY mutating Invoice method bump
+-- Version(). The Invoice entity now carries Version()/LoadedVersion()/SetVersion()
+-- exactly like BalanceEntry. This adapter previously satisfied the concurrency
+-- contract via option 2 only (a tx-scoped SELECT ... FOR UPDATE in FindByID, from
+-- adapters#12/PR #21). This migration + the accompanying invoice_repo.go change
+-- ALSO implement option 1 (a version-guarded write), for parity with
+-- balance_entries and to give high-concurrency deployments a lock-free path.
+-- Both guards are now in place (belt and suspenders); the core godoc allows
+-- either or both.
+--
+-- Why a NEW column rather than the existing `version`. The invoices table already
+-- has a `version` column (migration 003), an internal per-SAVE counter that keys
+-- the bitemporal invoice_history rows (one distinct (id, version) row per save,
+-- version = version + 1). The domain optimistic-locking version counts state
+-- MUTATIONS instead, and two saves at the same loaded version must collapse
+-- rather than fork history. Overloading the one column would break
+-- invoice_history contiguity, so the optimistic-lock version gets its own column,
+-- `lock_version`, and the history counter is left exactly as-is.
+--
+-- MySQL's INSERT ... ON DUPLICATE KEY UPDATE has no WHERE clause, so
+-- invoice_repo.go does the guarded write as an UPDATE ... WHERE lock_version =
+-- LoadedVersion() first and INSERTs only when no row exists (keyed off row
+-- existence, not the lock_version value, so a draft persisted at version 0 is not
+-- mistaken for a brand-new insert). The `version` counter continues to increment
+-- as version = version + 1 inside that UPDATE and is set to 1 on INSERT, so
+-- invoice_history keeps its per-save (id, version) rows unchanged.
+--
+-- Backfill convergence (why DEFAULT 0 is safe). Existing rows get lock_version 0.
+-- On the first load after deploy the column is read as authoritative and
+-- SetVersion() makes 0 the loaded baseline; the next mutation bumps it to 1 and
+-- the guarded UPDATE (WHERE lock_version = 0) matches, advancing cleanly.
+--
+-- Forward-only runner (no .down files); a mid-file failure is caught by the
+-- 'pending' status marker.
+ALTER TABLE invoices
+    ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;

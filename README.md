@@ -327,15 +327,68 @@ reads) no lock is taken, so ordinary lookups are unaffected. This addresses
 adapters issue #12 (and is cross-referenced by core#130, which pins the wording of
 the guarantee core relies on).
 
+**Invoice optimistic locking (issue #30 / core#130 / core#147).** core's
+`invoice.Repository.Save` godoc lets an adapter satisfy the concurrency contract by
+either (1) optimistic locking or (2) read serialization. The `FOR UPDATE` read
+above is option 2; the adapter now **also** implements option 1, for parity with
+`balance_entries` and to give lock-averse deployments a path that does not hold a
+row lock. Both guards are in place at once (belt and suspenders) — the core godoc
+permits either or both. Each `invoices` row carries a `lock_version` column
+(migration postgres 011 / mysql 010) holding the Invoice's domain optimistic-lock
+`Version()`, which core#147 bumps on **every** mutating method. `Save` writes the
+new `Version()` only when the stored `lock_version` still equals the entity's
+`LoadedVersion()`; a mismatch means a concurrent writer already advanced the row,
+and `Save` returns an error matching `errors.Is(err, tx.ErrVersionConflict)`
+(so `FinalizeInvoice` retries the loser, which re-reads the finalized row and is
+rejected by `Finalize()`). `FindByID` / list finders restore `lock_version` onto
+both `Version()` and `LoadedVersion()` (the column is authoritative; the value
+persisted on the next `Save` is the entity's `Version()`), and it round-trips
+through `InvoiceSnapshot.Version` for `FindByIDAsOf`. A dedicated `lock_version`
+column is used rather than overloading the pre-existing `version` column: `version`
+is the per-**save** counter that keys the bitemporal `invoice_history` rows, whereas
+the optimistic-lock version counts state **mutations** — two saves at the same
+loaded version must fork history (new `version`) yet not both win the lock.
+Backfill is seamless: existing rows default `lock_version` to 0, the first load
+adopts 0 as the baseline, and the first guarded write advances cleanly (a draft
+legitimately persisted at version 0 is distinguished from a brand-new insert by row
+existence, never by the version value).
+
 **Invoice `Save` is atomic even without an ambient transaction (issue #36).** The
-three writes it performs — the `invoices` upsert, closing the prior
-`invoice_history` row, and inserting the new history row — are wrapped in a
-Save-local transaction when no ambient transaction is present (mirroring the
-event store's `Append`). This prevents a crash or connection loss mid-sequence
-from leaving `invoice_history` with a permanently-open stale row or a missing
-version, which would make `FindByIDAsOf` (temporal queries) return the wrong
-state. When core calls `Save` inside its own `tx.Run` the repository joins that
-transaction instead of nesting.
+writes it performs — the `invoices` upsert (a `lock_version`-guarded upsert on
+postgres; a guarded `UPDATE` then conditional `INSERT` on mysql, which has no
+`WHERE` on `ON DUPLICATE KEY UPDATE`), closing the prior `invoice_history` row, and
+inserting the new history row — are wrapped in a Save-local transaction when no
+ambient transaction is present (mirroring the event store's `Append`). This
+prevents a crash or connection loss mid-sequence from leaving `invoice_history`
+with a permanently-open stale row or a missing version, which would make
+`FindByIDAsOf` (temporal queries) return the wrong state. When core calls `Save`
+inside its own `tx.Run` the repository joins that transaction instead of nesting.
+
+**Per-period invoice uniqueness (issue #45 / core#149).** core's
+`invoice.Repository.Save` godoc also requires that two DISTINCT non-voided,
+non-proration invoices cannot exist for the same `(contract_id, billing_period)`.
+core re-checks inside the generation `tx.Run`, but a check-then-insert of a NEW
+invoice has no prior version to conflict on, so under READ COMMITTED two concurrent
+`GenerateInvoice(contractID, samePeriod)` calls can both insert. Both adapters add
+the storage-layer backstop, and translate a violation into a `shared.DomainError`
+with code `ErrCodeConflict` and the same message the inmemory reference uses
+(`"invoice already exists for this billing period"`):
+
+- **postgres** (migration 012): a partial unique index
+  `ux_invoice_period ON invoices (contract_id, billing_period_from, billing_period_to)
+  WHERE status <> 'voided' AND billing_period_from IS NOT NULL AND
+  coalesce(metadata->>'invoice_type','') <> 'proration'`. `Save` matches the 23505
+  on that index name.
+- **mysql** (migration 011): a **STORED generated column** `period_uniq_key` that is
+  `NULL` for every exempt row (voided, proration, or zero-period) and
+  `CONCAT(contract_id,'|',billing_period_from,'|',billing_period_to)` otherwise, with
+  a `UNIQUE` index over it (a unique index permits multiple `NULL`s). `Save` matches
+  the 1062 on that index name (`dupEntryOnKey`).
+
+VOIDED, PRORATION (`metadata.invoice_type = "proration"`), and ZERO-PERIOD invoices
+are EXEMPT, so `RegenerateInvoice` (void-and-recreate the same period), proration
+adjustments that coexist with the period invoice, and period-less invoices all keep
+working; a `regeneration` replacement is a regular period invoice and participates.
 
 **`Payment` and `CreditNote` `Save` remain last-writer-wins** and take no row
 lock. core only pins the concurrency contract for the invoice finalize path (the

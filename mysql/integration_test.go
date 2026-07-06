@@ -13,6 +13,7 @@ import (
 
 	"github.com/contract-to-cash/adapters/mysql"
 	"github.com/contract-to-cash/adapters/mysql/mysqltest"
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/balance"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/payment"
@@ -473,6 +474,150 @@ func TestIntegration_InvoiceRepo_ConcurrentFinalize_OneLoserRejected(t *testing.
 	}
 	if openRows != 1 {
 		t.Errorf("expected exactly 1 open invoice_history row, got %d", openRows)
+	}
+}
+
+// Issue #30: option-1 optimistic locking against real MySQL. Two loads observe
+// the same lock_version, both finalize, and Save sequentially. The first wins;
+// the second's guarded UPDATE matches no row and the existence probe finds the
+// row, so Save returns tx.ErrVersionConflict (not last-writer-wins). The winner's
+// state is durably persisted; the retry path (re-load, mutate, Save) still works
+// and invoice_history stays consistent.
+func TestIntegration_InvoiceRepo_OptimisticLockConflict(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	repo := mysql.NewInvoiceRepository(db, integrationClock)
+	ctx := context.Background()
+
+	insertContractReadModel(t, db, "c-ol", "acc-ol")
+
+	base, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+		ID: "inv-ol", InvoiceNumber: "INV-OL", AccountID: "acc-ol", ContractID: "c-ol",
+		Status: invoice.InvoiceStatusDraft, Subtotal: jpy(1000), TaxAmount: jpy(0),
+		DiscountAmount: jpy(0), Total: jpy(1000), AppliedBalance: jpy(0),
+		AmountDue: jpy(1000), PaidAmount: jpy(0), Balance: jpy(1000),
+	})
+	if err != nil {
+		t.Fatalf("build base: %v", err)
+	}
+	if err := repo.Save(ctx, base); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	a, err := repo.FindByID(ctx, "inv-ol")
+	if err != nil {
+		t.Fatalf("load a: %v", err)
+	}
+	b, err := repo.FindByID(ctx, "inv-ol")
+	if err != nil {
+		t.Fatalf("load b: %v", err)
+	}
+	if err := a.Finalize(); err != nil {
+		t.Fatalf("finalize a: %v", err)
+	}
+	if err := b.Finalize(); err != nil {
+		t.Fatalf("finalize b: %v", err)
+	}
+
+	if err := repo.Save(ctx, a); err != nil {
+		t.Fatalf("first Save (winner): %v", err)
+	}
+	if err := repo.Save(ctx, b); !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("second Save: expected tx.ErrVersionConflict, got %v", err)
+	}
+
+	reloaded, err := repo.FindByID(ctx, "inv-ol")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.ToSnapshot().Status != invoice.InvoiceStatusFinalized {
+		t.Errorf("status = %s, want finalized", reloaded.ToSnapshot().Status)
+	}
+	if reloaded.Version() != 1 {
+		t.Errorf("persisted lock_version = %d, want 1", reloaded.Version())
+	}
+	// The retry path must still succeed (the guard does not wedge a legitimate
+	// follow-up write), and history stays consistent: exactly one open row.
+	if err := reloaded.VoidWithReason("superseded"); err != nil {
+		t.Fatalf("void reloaded: %v", err)
+	}
+	if err := repo.Save(ctx, reloaded); err != nil {
+		t.Fatalf("retry Save after reload: %v", err)
+	}
+	var openRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM invoice_history WHERE id = 'inv-ol' AND valid_to IS NULL`).Scan(&openRows); err != nil {
+		t.Fatalf("count open history rows: %v", err)
+	}
+	if openRows != 1 {
+		t.Errorf("expected exactly 1 open invoice_history row, got %d", openRows)
+	}
+}
+
+// Issue #45: the per-(contract_id, billing_period) uniqueness backstop against
+// real MySQL, enforced by the generated period_uniq_key column + ux_invoice_period
+// unique index (migration 011). A second distinct non-voided, non-proration
+// invoice for the same period is rejected with ErrCodeConflict, while proration,
+// zero-period, and void-and-recreate replacements all coexist.
+func TestIntegration_InvoiceRepo_PeriodUniqueness(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	repo := mysql.NewInvoiceRepository(db, integrationClock)
+	ctx := context.Background()
+
+	insertContractReadModel(t, db, "c-pu", "acc-pu")
+
+	period, err := shared.NewDateRange(
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("period: %v", err)
+	}
+
+	mk := func(id string, status invoice.InvoiceStatus, p shared.DateRange, meta map[string]string) *invoice.Invoice {
+		t.Helper()
+		inv, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+			ID: shared.InvoiceID(id), AccountID: "acc-pu", ContractID: "c-pu",
+			Status: status, Subtotal: jpy(1000), TaxAmount: jpy(0), DiscountAmount: jpy(0),
+			Total: jpy(1000), AppliedBalance: jpy(0), AmountDue: jpy(1000),
+			PaidAmount: jpy(0), Balance: jpy(1000), BillingPeriod: p, Metadata: meta,
+		})
+		if err != nil {
+			t.Fatalf("build %s: %v", id, err)
+		}
+		return inv
+	}
+
+	if err := repo.Save(ctx, mk("inv-p1", invoice.InvoiceStatusFinalized, period, nil)); err != nil {
+		t.Fatalf("first period invoice: %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-p2", invoice.InvoiceStatusFinalized, period, nil)); !isDomainError(err, shared.ErrCodeConflict) {
+		t.Fatalf("second period invoice: expected ErrCodeConflict, got %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-pro", invoice.InvoiceStatusFinalized, period,
+		map[string]string{invoice.MetadataKeyInvoiceType: invoice.InvoiceTypeProration})); err != nil {
+		t.Fatalf("proration invoice should coexist: %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-z1", invoice.InvoiceStatusFinalized, shared.DateRange{}, nil)); err != nil {
+		t.Fatalf("zero-period invoice 1: %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-z2", invoice.InvoiceStatusFinalized, shared.DateRange{}, nil)); err != nil {
+		t.Fatalf("zero-period invoice 2: %v", err)
+	}
+
+	// Void-and-recreate: void the original, then a regeneration replacement for the
+	// SAME period succeeds because the voided original drops out of the index.
+	first, err := repo.FindByID(ctx, "inv-p1")
+	if err != nil {
+		t.Fatalf("load inv-p1: %v", err)
+	}
+	if err := first.VoidWithReason("superseded"); err != nil {
+		t.Fatalf("void inv-p1: %v", err)
+	}
+	if err := repo.Save(ctx, first); err != nil {
+		t.Fatalf("save voided inv-p1: %v", err)
+	}
+	if err := repo.Save(ctx, mk("inv-p1r", invoice.InvoiceStatusFinalized, period,
+		map[string]string{invoice.MetadataKeyInvoiceType: invoice.InvoiceTypeRegeneration})); err != nil {
+		t.Fatalf("regeneration replacement for same period after void: %v", err)
 	}
 }
 
