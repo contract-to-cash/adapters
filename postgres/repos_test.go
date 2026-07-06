@@ -587,9 +587,35 @@ func TestUsageRepo_RecordAndGetSummary(t *testing.T) {
 		t.Fatalf("Record: %v", err)
 	}
 
-	// Idempotent: recording again should not error.
-	if err := repo.Record(ctx, rec); err != nil {
-		t.Fatalf("duplicate Record: %v", err)
+	// A second record reusing the same idempotency key (even with a different id)
+	// must surface as the core's DomainError(duplicate_request), matching the
+	// in-memory reference implementation — not be silently swallowed (issue #38).
+	dup, err := usage.NewUsageRecord("ur-2", "c-usage", "api_calls", 200, now, "idem-ur-1")
+	if err != nil {
+		t.Fatalf("NewUsageRecord dup: %v", err)
+	}
+	err = repo.Record(ctx, dup)
+	if err == nil {
+		t.Fatal("expected duplicate idempotency key to return an error, got nil")
+	}
+	var de *shared.DomainError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *shared.DomainError, got %T: %v", err, err)
+	}
+	if de.Code != shared.ErrCodeDuplicateRequest {
+		t.Errorf("Code = %q, want %q", de.Code, shared.ErrCodeDuplicateRequest)
+	}
+
+	// Records without an idempotency key are never deduplicated (NULLs are
+	// distinct in Postgres), matching inmemory.
+	for _, id := range []shared.UsageRecordID{"ur-nokey-1", "ur-nokey-2"} {
+		rk, err := usage.NewUsageRecord(id, "c-usage", "api_calls", 5, now, "")
+		if err != nil {
+			t.Fatalf("NewUsageRecord %s: %v", id, err)
+		}
+		if err := repo.Record(ctx, rk); err != nil {
+			t.Fatalf("Record %s (no key): %v", id, err)
+		}
 	}
 
 	period, err := shared.NewDateRange(now.Add(-time.Hour), now.Add(time.Hour))
@@ -600,8 +626,9 @@ func TestUsageRepo_RecordAndGetSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.TotalUsage != 100 {
-		t.Errorf("TotalUsage = %d, want 100", summary.TotalUsage)
+	// 100 (rec) + 5 + 5 (keyless); the duplicate-key write was rejected.
+	if summary.TotalUsage != 110 {
+		t.Errorf("TotalUsage = %d, want 110", summary.TotalUsage)
 	}
 }
 

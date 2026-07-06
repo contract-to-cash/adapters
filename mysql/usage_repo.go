@@ -39,14 +39,18 @@ func (r *MySQLUsageRepository) Record(ctx context.Context, rec *usage.UsageRecor
 		idempotencyKey = &s.IdempotencyKey
 	}
 
-	// Idempotent insert scoped to idempotency_key only. A blanket
-	// `ON DUPLICATE KEY UPDATE id = id` would also swallow a PRIMARY KEY (id)
-	// collision, hiding a genuine bug (ULID ids never collide by chance). Like
-	// postgres' `ON CONFLICT (idempotency_key) DO NOTHING`, we want a duplicate
-	// idempotency_key to be a no-op but any other duplicate — notably a
-	// duplicate id — to surface. MySQL cannot scope ON DUPLICATE KEY to a single
-	// index, so we attempt a plain insert and treat only a 1062 on the
-	// idempotency_key index as the idempotent no-op.
+	// A duplicate idempotency_key must surface as the core's
+	// DomainError(duplicate_request) — matching the reference in-memory
+	// implementation (core/infrastructure/inmemory/usage_repository.go) that
+	// integrators test against — rather than being silently swallowed (issue
+	// #38). A blanket `ON DUPLICATE KEY UPDATE id = id` would also swallow a
+	// PRIMARY KEY (id) collision, hiding a genuine bug (ULID ids never collide by
+	// chance), and MySQL cannot scope ON DUPLICATE KEY to a single index, so we
+	// attempt a plain insert and inspect the 1062 by key name: a duplicate on the
+	// idempotency_key index becomes the duplicate_request signal, while any other
+	// duplicate — notably a duplicate id — surfaces as a wrapped error. A NULL
+	// idempotency_key never conflicts, so keyless records are inserted
+	// unconditionally, matching inmemory.
 	_, err = r.q(ctx).ExecContext(ctx,
 		`INSERT INTO usage_records (id, contract_id, metric, quantity, timestamp, idempotency_key, metadata)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -54,7 +58,8 @@ func (r *MySQLUsageRepository) Record(ctx context.Context, rec *usage.UsageRecor
 		s.Quantity, s.Timestamp.UTC(), idempotencyKey, metadata)
 	if err != nil {
 		if dupEntryOnKey(err, "idempotency_key") {
-			return nil
+			return shared.NewDomainError(shared.ErrCodeDuplicateRequest,
+				fmt.Sprintf("duplicate usage record with idempotency key %s", s.IdempotencyKey))
 		}
 		return fmt.Errorf("record usage: %w", err)
 	}
