@@ -41,7 +41,41 @@ type invoiceJSONState struct {
 	LineItems      []invoice.LineItemSnapshot `json:"line_items"`
 }
 
+// Save upserts the invoice and appends its bitemporal history in a single
+// atomic unit. The three writes (invoices upsert, close of the prior
+// invoice_history row, insert of the new history row) must commit together: run
+// as separate auto-committed statements, a crash or connection loss between them
+// leaves invoice_history with a permanently-open stale row or a missing version,
+// so a later FindByIDAsOf returns the wrong state; two concurrent non-tx Saves
+// could likewise interleave and lose a history snapshot.
+//
+// When an ambient transaction is present (e.g. core's FinalizeInvoice) we join
+// it — the caller owns begin/commit, no nesting. Otherwise we wrap the three
+// writes in a local transaction, mirroring the event store's Append
+// (eventstore.go).
 func (r *MySQLInvoiceRepository) Save(ctx context.Context, inv *invoice.Invoice) error {
+	if _, ok := TxFromContext(ctx); ok {
+		return r.saveOn(ctx, inv)
+	}
+
+	sqlTx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin invoice save tx: %w", err)
+	}
+	if err := r.saveOn(ContextWithTx(ctx, sqlTx), inv); err != nil {
+		_ = sqlTx.Rollback()
+		return err
+	}
+	if err := sqlTx.Commit(); err != nil {
+		return fmt.Errorf("commit invoice save tx: %w", err)
+	}
+	return nil
+}
+
+// saveOn performs the three-statement invoice write on the querier resolved from
+// ctx (an ambient or Save-local transaction). It must always run inside a
+// transaction so the writes are atomic; Save guarantees that.
+func (r *MySQLInvoiceRepository) saveOn(ctx context.Context, inv *invoice.Invoice) error {
 	s := inv.ToSnapshot()
 
 	jsonState, err := json.Marshal(invoiceJSONState{
