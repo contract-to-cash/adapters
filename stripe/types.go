@@ -1,6 +1,7 @@
-// Package stripe implements the core port.PaymentGateway and
-// port.WebhookHandler interfaces on top of the Stripe API, using the official
-// stripe-go SDK (github.com/stripe/stripe-go/v82).
+// Package stripe implements the core port.PaymentGateway,
+// port.CustomerGateway and port.WebhookHandler interfaces on top of the
+// Stripe API, using the official stripe-go SDK
+// (github.com/stripe/stripe-go/v82).
 //
 // API reference: https://docs.stripe.com/api
 //
@@ -15,6 +16,23 @@
 //   - Payment method IDs are the Stripe PaymentMethod ID ("pm_..."). They are
 //     flat (no compositing) and global — Get/Delete take the ID directly,
 //     List takes the customer ID.
+//   - Customer IDs are the Stripe Customer ID ("cus_..."). Stripe only
+//     accepts its own customer IDs, so internal account IDs (e.g. core
+//     AccountID ULIDs) must NOT be passed as ChargeRequest.CustomerID.
+//
+// # Customer workflow (required before charging with a customer)
+//
+// Stripe rejects a charge that references a customer it does not know with
+// "No such customer". Integrators therefore create the customer on Stripe
+// first and persist the mapping:
+//
+//  1. On account registration, call Gateway.CreateCustomer. Put your own
+//     account ID in CreateCustomerRequest.InternalID; it is stored in the
+//     Stripe customer's metadata under MetadataInternalIDKey.
+//  2. Save the returned Customer.ID ("cus_...") on your account record.
+//  3. Pass that "cus_..." ID as ChargeRequest.CustomerID /
+//     AuthorizeRequest.CustomerID (and as the CustomerID for
+//     RegisterPaymentMethod / ListPaymentMethods).
 //
 // # Currency and amounts
 //

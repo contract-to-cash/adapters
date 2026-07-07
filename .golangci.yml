@@ -34,7 +34,7 @@ linters:
       # Migrating to it is tracked separately; the current calls are correct and
       # tested. Scope the allowance to the stripe adapter so real deprecations
       # elsewhere still fail.
-      - path: 'stripe/gateway\.go$'
+      - path: 'stripe/(gateway|customer)\.go$'
         linters: [staticcheck]
         text: 'SA1019'
       # mapStripeErrorCode intentionally handles only the Stripe error codes/types
