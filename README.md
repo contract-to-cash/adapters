@@ -35,6 +35,7 @@ Testing section for the difference in how each is verified).
 | `tx.TxManager` | ✅ | ✅ | — | — |
 | `projection.Projector` (contract + invoice) | ✅ | ✅ | — | — |
 | `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card; JPY/USD/EUR) |
+| `port.CustomerGateway` | — | — | — | ✅ |
 | `port.WebhookHandler` | — | — | ✅ | ✅ |
 
 Event store semantics follow the core reference implementation
@@ -189,7 +190,9 @@ remainder still counts as forfeitable credit.
 
 Built on the official `github.com/stripe/stripe-go/v82` SDK. Unlike fincode,
 Stripe maps almost one-to-one onto `port.PaymentGateway` — every method is
-implemented; nothing is rejected as unsupported except by currency.
+implemented; nothing is rejected as unsupported except by currency. The same
+`Gateway` also implements `port.CustomerGateway`
+(`CreateCustomer` / `GetCustomer` / `UpdateCustomer` / `DeleteCustomer`).
 
 - **Cards; JPY / USD / EUR.** `SupportedMethods()` reports `credit_card` and
   `debit_card` (Stripe's single `card` PaymentMethod type). Only the
@@ -225,6 +228,18 @@ implemented; nothing is rejected as unsupported except by currency.
   `TransactionStatusRequiresAction` and a `ThreeDSecureResult.RedirectURL`
   (from the PaymentIntent's `next_action.redirect_to_url`), not an error — the
   caller redirects the customer and completes the flow.
+- **Customers**: Stripe only accepts its own customer IDs (`cus_...`), so a
+  charge that references an unknown customer fails with `No such customer` —
+  internal account IDs (e.g. core `AccountID` ULIDs) must never be passed as
+  `ChargeRequest.CustomerID`. The intended wiring is: **create the customer
+  before charging** — on account registration call `CreateCustomer` (your own
+  account ID goes in `CreateCustomerRequest.InternalID` and is stored in the
+  Stripe customer's metadata under `internal_id`), persist the returned
+  `cus_...` ID on the account, and pass that ID as
+  `ChargeRequest.CustomerID` / `AuthorizeRequest.CustomerID` and to the
+  payment-method APIs. A get/update/delete of a customer Stripe does not know
+  (or a get of a deleted customer — Stripe returns a deleted stub, not a 404)
+  surfaces as a `port.GatewayError` with code `customer_not_found`.
 - **Payment methods**: `RegisterPaymentMethod` attaches an existing
   Stripe PaymentMethod (created client-side with Stripe.js/Elements and passed
   as `Token`) to the customer, optionally setting it as the customer's default
