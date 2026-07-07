@@ -64,10 +64,13 @@ func (g *Gateway) CreateCustomer(ctx context.Context, req *port.CreateCustomerRe
 	return toCustomer(c), nil
 }
 
-// UpdateCustomer updates a Stripe customer. Only non-nil fields are sent to
-// Stripe; a pointer to an empty string clears that field on the customer.
-// Metadata keys are merged into the existing metadata (Stripe semantics: an
-// empty value unsets that key).
+// UpdateCustomer updates a Stripe customer. Only non-nil scalar fields are
+// sent to Stripe; a pointer to an empty string clears that field on the
+// customer. Metadata keys are merged into the existing metadata (Stripe
+// semantics: an empty value unsets that key). A non-nil Address updates only
+// its non-empty sub-fields — the port Address uses plain (non-pointer) strings,
+// so an unset sub-field is indistinguishable from an intentional blank and is
+// left untouched rather than clearing City/State/etc. on Stripe.
 func (g *Gateway) UpdateCustomer(ctx context.Context, req *port.UpdateCustomerRequest) (*port.Customer, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -170,18 +173,37 @@ func toCustomer(c *stripego.Customer) *port.Customer {
 	return out
 }
 
+// toStripeAddressParams maps a port Address to Stripe params, emitting only
+// non-empty sub-fields. Because the port Address sub-fields are plain strings
+// (no pointers), sending them unconditionally would encode empties as
+// address[state]= etc., which Stripe treats as "clear this field" — so a
+// partial-address update would silently wipe the omitted sub-fields. Omitting
+// empties keeps updates non-destructive; on create the omitted fields are
+// simply unset.
 func toStripeAddressParams(a *port.Address) *stripego.AddressParams {
 	if a == nil {
 		return nil
 	}
-	return &stripego.AddressParams{
-		Line1:      stripego.String(a.Line1),
-		Line2:      stripego.String(a.Line2),
-		City:       stripego.String(a.City),
-		State:      stripego.String(a.State),
-		PostalCode: stripego.String(a.PostalCode),
-		Country:    stripego.String(a.Country),
+	p := &stripego.AddressParams{}
+	if a.Line1 != "" {
+		p.Line1 = stripego.String(a.Line1)
 	}
+	if a.Line2 != "" {
+		p.Line2 = stripego.String(a.Line2)
+	}
+	if a.City != "" {
+		p.City = stripego.String(a.City)
+	}
+	if a.State != "" {
+		p.State = stripego.String(a.State)
+	}
+	if a.PostalCode != "" {
+		p.PostalCode = stripego.String(a.PostalCode)
+	}
+	if a.Country != "" {
+		p.Country = stripego.String(a.Country)
+	}
+	return p
 }
 
 func fromStripeAddress(a *stripego.Address) *port.Address {

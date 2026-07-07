@@ -129,6 +129,52 @@ func TestGateway_UpdateCustomer_OnlySetFieldsSent(t *testing.T) {
 	}
 }
 
+func TestGateway_UpdateCustomer_EmptyStringClearsField(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/customers/cus_1", customerJSON("cus_1", nil))
+	g := f.gateway()
+
+	empty := ""
+	if _, err := g.UpdateCustomer(context.Background(), &port.UpdateCustomerRequest{
+		CustomerID: "cus_1",
+		Email:      &empty,
+	}); err != nil {
+		t.Fatalf("UpdateCustomer: %v", err)
+	}
+	// A pointer to "" must be sent as an explicit empty value (email=) so
+	// Stripe clears the field, not omitted. url.Values.Get can't tell absent
+	// from present-empty, so assert on presence of the key itself.
+	if _, ok := f.lastForm["email"]; !ok {
+		t.Errorf("form should contain empty email= to clear the field, got keys %v", f.lastForm)
+	}
+}
+
+func TestGateway_UpdateCustomer_PartialAddressPreservesOtherFields(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/customers/cus_1", customerJSON("cus_1", nil))
+	g := f.gateway()
+
+	if _, err := g.UpdateCustomer(context.Background(), &port.UpdateCustomerRequest{
+		CustomerID: "cus_1",
+		Address:    &port.Address{Line1: "new line", City: "Osaka"},
+	}); err != nil {
+		t.Fatalf("UpdateCustomer: %v", err)
+	}
+	if got := f.lastForm.Get("address[line1]"); got != "new line" {
+		t.Errorf("form address[line1] = %q, want %q", got, "new line")
+	}
+	if got := f.lastForm.Get("address[city]"); got != "Osaka" {
+		t.Errorf("form address[city] = %q, want Osaka", got)
+	}
+	// Empty sub-fields must NOT be sent (sending address[state]= would clear
+	// state on Stripe, wiping data the caller didn't intend to touch).
+	for _, key := range []string{"address[line2]", "address[state]", "address[postal_code]", "address[country]"} {
+		if _, ok := f.lastForm[key]; ok {
+			t.Errorf("form should not contain empty %s, got %q", key, f.lastForm.Get(key))
+		}
+	}
+}
+
 func TestGateway_UpdateCustomer_RequiresID(t *testing.T) {
 	f := newFakeStripe(t)
 	g := f.gateway()
