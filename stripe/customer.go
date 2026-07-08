@@ -137,6 +137,27 @@ func (g *Gateway) DeleteCustomer(ctx context.Context, customerID string) error {
 	return nil
 }
 
+// SetDefaultPaymentMethod sets the customer's default invoice payment method,
+// used for automatic charges when no invoice- or contract-level method is set.
+func (g *Gateway) SetDefaultPaymentMethod(ctx context.Context, customerID, paymentMethodID string) error {
+	if customerID == "" {
+		return &ValidationError{Field: "customerID", Message: "must not be empty"}
+	}
+	if paymentMethodID == "" {
+		return &ValidationError{Field: "paymentMethodID", Message: "must not be empty"}
+	}
+	params := &stripego.CustomerParams{
+		InvoiceSettings: &stripego.CustomerInvoiceSettingsParams{
+			DefaultPaymentMethod: stripego.String(paymentMethodID),
+		},
+	}
+	setContext(&params.Params, ctx)
+	if _, err := g.client.customers.Update(customerID, params); err != nil {
+		return g.wrapCustomerError("set default payment method", err)
+	}
+	return nil
+}
+
 // wrapCustomerError wraps an SDK error like wrapGatewayError, additionally
 // mapping Stripe's resource_missing (the "No such customer" 404) to
 // ErrorCodeCustomerNotFound: within a customer operation the missing resource

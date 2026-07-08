@@ -256,6 +256,46 @@ func TestGateway_DeleteCustomer_MissingIsNotFound(t *testing.T) {
 	}
 }
 
+func TestGateway_SetDefaultPaymentMethod(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/customers/cus_1", customerJSON("cus_1", map[string]any{
+		"invoice_settings": map[string]any{
+			"default_payment_method": map[string]any{"id": "pm_1", "object": "payment_method"},
+		},
+	}))
+	g := f.gateway()
+
+	if err := g.SetDefaultPaymentMethod(context.Background(), "cus_1", "pm_1"); err != nil {
+		t.Fatalf("SetDefaultPaymentMethod: %v", err)
+	}
+	if f.lastPath != "/v1/customers/cus_1" {
+		t.Errorf("path = %q, want /v1/customers/cus_1", f.lastPath)
+	}
+	if got := f.lastForm.Get("invoice_settings[default_payment_method]"); got != "pm_1" {
+		t.Errorf("form invoice_settings[default_payment_method] = %q, want pm_1", got)
+	}
+}
+
+func TestGateway_SetDefaultPaymentMethod_RequiresCustomerID(t *testing.T) {
+	f := newFakeStripe(t)
+	g := f.gateway()
+
+	err := g.SetDefaultPaymentMethod(context.Background(), "", "pm_1")
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want validation error", err)
+	}
+}
+
+func TestGateway_SetDefaultPaymentMethod_RequiresPaymentMethodID(t *testing.T) {
+	f := newFakeStripe(t)
+	g := f.gateway()
+
+	err := g.SetDefaultPaymentMethod(context.Background(), "cus_1", "")
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want validation error", err)
+	}
+}
+
 func TestGateway_CustomerNilAndEmptyGuards(t *testing.T) {
 	f := newFakeStripe(t)
 	g := f.gateway()

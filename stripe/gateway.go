@@ -340,14 +340,8 @@ func (g *Gateway) RegisterPaymentMethod(ctx context.Context, req *port.RegisterP
 	}
 
 	if req.SetAsDefault {
-		updateParams := &stripego.CustomerParams{
-			InvoiceSettings: &stripego.CustomerInvoiceSettingsParams{
-				DefaultPaymentMethod: stripego.String(pm.ID),
-			},
-		}
-		setContext(&updateParams.Params, ctx)
-		if _, err := g.client.customers.Update(req.CustomerID, updateParams); err != nil {
-			return nil, g.wrapGatewayError("set default payment method", err)
+		if err := g.SetDefaultPaymentMethod(ctx, req.CustomerID, pm.ID); err != nil {
+			return nil, err
 		}
 	}
 
