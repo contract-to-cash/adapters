@@ -318,6 +318,78 @@ func TestGateway_Authorize_ThreeDSRequested(t *testing.T) {
 	}
 }
 
+// TestGateway_Charge_AutomaticPaymentMethodsNoRedirect verifies that a plain
+// charge (no return URL) disables redirect-based payment methods so Stripe
+// does not demand a return_url for Dashboard-enabled dynamic payment methods
+// (issue #51).
+func TestGateway_Charge_AutomaticPaymentMethodsNoRedirect(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	_, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), PaymentMethodID: &pmID,
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if got := f.lastForm.Get("automatic_payment_methods[enabled]"); got != "true" {
+		t.Errorf("automatic_payment_methods[enabled] = %q, want true", got)
+	}
+	if got := f.lastForm.Get("automatic_payment_methods[allow_redirects]"); got != "never" {
+		t.Errorf("automatic_payment_methods[allow_redirects] = %q, want never", got)
+	}
+}
+
+// TestGateway_Charge_AutomaticPaymentMethodsWithReturnURL verifies that when
+// the caller provides a 3DS return URL, redirects stay allowed: Stripe rejects
+// return_url combined with allow_redirects=never, so the restriction must be
+// omitted on that path.
+func TestGateway_Charge_AutomaticPaymentMethodsWithReturnURL(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	_, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(1000), PaymentMethodID: &pmID,
+		ThreeDSecure: &port.ThreeDSecureRequest{ReturnURL: "https://app/return"},
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if got := f.lastForm.Get("automatic_payment_methods[enabled]"); got != "true" {
+		t.Errorf("automatic_payment_methods[enabled] = %q, want true", got)
+	}
+	if _, ok := f.lastForm["automatic_payment_methods[allow_redirects]"]; ok {
+		t.Errorf("allow_redirects should be omitted when a return_url is set, got %q",
+			f.lastForm.Get("automatic_payment_methods[allow_redirects]"))
+	}
+}
+
+// TestGateway_Authorize_AutomaticPaymentMethodsNoRedirect verifies the same
+// pinning applies on the Authorize path.
+func TestGateway_Authorize_AutomaticPaymentMethodsNoRedirect(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("POST /v1/payment_intents", piJSON("pi_auth", "requires_capture", 5000, "jpy"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	_, err := g.Authorize(context.Background(), &port.AuthorizeRequest{
+		Amount: jpy(5000), PaymentMethodID: &pmID,
+	})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	if got := f.lastForm.Get("automatic_payment_methods[enabled]"); got != "true" {
+		t.Errorf("automatic_payment_methods[enabled] = %q, want true", got)
+	}
+	if got := f.lastForm.Get("automatic_payment_methods[allow_redirects]"); got != "never" {
+		t.Errorf("automatic_payment_methods[allow_redirects] = %q, want never", got)
+	}
+}
+
 func TestGateway_Charge_CardDeclined(t *testing.T) {
 	f := newFakeStripe(t)
 	f.onStatus("POST /v1/payment_intents", http.StatusPaymentRequired, `{

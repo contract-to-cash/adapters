@@ -94,6 +94,7 @@ func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.Ch
 		params.Customer = stripego.String(req.CustomerID)
 	}
 	applyThreeDS(params, req.ThreeDSecure)
+	applyAutomaticPaymentMethods(params)
 	applyMetadata(&params.Params, req.Metadata)
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
 	setContext(&params.Params, ctx)
@@ -133,6 +134,7 @@ func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*p
 		params.Customer = stripego.String(req.CustomerID)
 	}
 	applyThreeDS(params, req.ThreeDSecure)
+	applyAutomaticPaymentMethods(params)
 	applyMetadata(&params.Params, req.Metadata)
 	setIdempotencyKey(&params.Params, req.IdempotencyKey)
 	setContext(&params.Params, ctx)
@@ -575,6 +577,30 @@ func applyThreeDS(params *stripego.PaymentIntentParams, tds *port.ThreeDSecureRe
 			string(stripego.PaymentIntentPaymentMethodOptionsCardRequestThreeDSecureAny),
 		)
 	}
+}
+
+// applyAutomaticPaymentMethods pins the PaymentIntent to the explicitly
+// supplied payment method instead of the account's Dashboard-configured
+// dynamic payment methods. Without it, Stripe treats Dashboard-enabled
+// redirect-based payment methods as confirmation candidates and rejects the
+// request with "you must provide a return_url" even though a card
+// PaymentMethod is explicitly attached (issue #51).
+//
+// Must run after applyThreeDS: when the caller supplied no ReturnURL a
+// redirect flow is impossible, so redirects are disabled outright
+// (allow_redirects=never). When a ReturnURL is present (3DS redirect flow),
+// allow_redirects is left at Stripe's default ("always") because Stripe
+// rejects return_url combined with allow_redirects=never.
+func applyAutomaticPaymentMethods(params *stripego.PaymentIntentParams) {
+	apm := &stripego.PaymentIntentAutomaticPaymentMethodsParams{
+		Enabled: stripego.Bool(true),
+	}
+	if params.ReturnURL == nil {
+		apm.AllowRedirects = stripego.String(
+			string(stripego.PaymentIntentAutomaticPaymentMethodsAllowRedirectsNever),
+		)
+	}
+	params.AutomaticPaymentMethods = apm
 }
 
 func applyMetadata(params *stripego.Params, metadata map[string]string) {
