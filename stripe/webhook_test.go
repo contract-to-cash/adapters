@@ -8,11 +8,19 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/contract-to-cash/core/application/port"
+	"github.com/contract-to-cash/core/domain/shared"
 )
 
 const testWebhookSecret = "whsec_test_secret"
+
+// testSignTime is the fixed instant the test payloads are signed at. newHandler
+// injects a FixedClock pinned here so the signed transport timestamp stays
+// within tolerance deterministically (the replay check added for core#191 uses
+// the injected clock).
+const testSignTime = int64(1_700_000_000)
 
 // signStripe builds a valid Stripe-Signature header for the given body and
 // timestamp, mirroring the scheme the SDK verifies:
@@ -40,7 +48,8 @@ func refundEventBody(id, eventType, status string) []byte {
 
 func newHandler(t *testing.T) *WebhookHandler {
 	t.Helper()
-	h, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret})
+	h, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret},
+		WithWebhookClock(shared.FixedClock{FixedTime: time.Unix(testSignTime, 0)}))
 	if err != nil {
 		t.Fatalf("NewWebhookHandler: %v", err)
 	}
@@ -220,5 +229,77 @@ func TestNewWebhookHandler_RequiresSecret(t *testing.T) {
 	_, err := NewWebhookHandler(WebhookConfig{})
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("want ValidationError, got %v", err)
+	}
+}
+
+func TestNewWebhookHandler_RejectsNegativeTolerance(t *testing.T) {
+	_, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret, Tolerance: -time.Second})
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("want ValidationError for negative tolerance, got %v", err)
+	}
+}
+
+// TestWebhook_StaleTimestampRejected verifies transport-level replay protection
+// (core#191): a validly-signed request whose transport timestamp is older than
+// the tolerance is rejected as invalid_signature, even though the signature is
+// perfectly valid.
+func TestWebhook_StaleTimestampRejected(t *testing.T) {
+	// Clock is far ahead of the signed timestamp (default tolerance is 5m).
+	h, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret},
+		WithWebhookClock(shared.FixedClock{FixedTime: time.Unix(testSignTime+3600, 0)}))
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+	body := eventBody("evt_stale", "payment_intent.succeeded")
+	sig := signStripe(testWebhookSecret, testSignTime, body)
+
+	_, err = h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"Stripe-Signature": sig},
+		Body:    body,
+	})
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Fatalf("want invalid_signature WebhookError for stale timestamp, got %v", err)
+	}
+}
+
+// TestWebhook_FutureTimestampRejected verifies the tolerance is bidirectional:
+// a signed timestamp too far in the future (a clock-skew forgery attempt) is
+// also rejected.
+func TestWebhook_FutureTimestampRejected(t *testing.T) {
+	h, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret},
+		WithWebhookClock(shared.FixedClock{FixedTime: time.Unix(testSignTime-3600, 0)}))
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+	body := eventBody("evt_future", "payment_intent.succeeded")
+	sig := signStripe(testWebhookSecret, testSignTime, body)
+
+	_, err = h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"Stripe-Signature": sig},
+		Body:    body,
+	})
+	var we *port.WebhookError
+	if !errors.As(err, &we) || we.Code != port.WebhookErrorCodeInvalidSignature {
+		t.Fatalf("want invalid_signature WebhookError for future timestamp, got %v", err)
+	}
+}
+
+// TestWebhook_WithinToleranceAccepted confirms a signed timestamp within the
+// tolerance window (but not identical to the clock) still verifies.
+func TestWebhook_WithinToleranceAccepted(t *testing.T) {
+	h, err := NewWebhookHandler(WebhookConfig{Secret: testWebhookSecret},
+		WithWebhookClock(shared.FixedClock{FixedTime: time.Unix(testSignTime+120, 0)})) // 2m skew < 5m
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+	body := eventBody("evt_ok", "payment_intent.succeeded")
+	sig := signStripe(testWebhookSecret, testSignTime, body)
+
+	if _, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+		Headers: map[string]string{"Stripe-Signature": sig},
+		Body:    body,
+	}); err != nil {
+		t.Fatalf("ParseAndVerify within tolerance: %v", err)
 	}
 }

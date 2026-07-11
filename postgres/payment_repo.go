@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
@@ -78,26 +79,50 @@ func (r *PostgresPaymentRepository) Save(ctx context.Context, p *payment.Payment
 	// raw pgconn error MUST be translated to the core sentinel (issue #35 /
 	// core#97) — otherwise PaymentService routes the race loser through saga
 	// compensation and refunds the winner's legitimate charge.
-	_, err = q.Exec(ctx,
+	//
+	// Optimistic-lock guarded update (core#190). lock_version holds the domain
+	// optimistic-locking version (p.Version()); the ON CONFLICT DO UPDATE only
+	// fires when the stored lock_version still equals LoadedVersion(). A concurrent
+	// writer that already advanced it leaves the update skipped and RowsAffected()
+	// == 0, which we report as tx.ErrVersionConflict. This is what stops two
+	// concurrent RecordRefund calls on the same completed payment from both
+	// persisting last-writer-wins; the loser retries and RecordRefund re-validates
+	// against the winner's already-booked total, rejecting the over-refund. A
+	// brand-new payment (id absent) INSERTs regardless of lock_version, so a
+	// version-0 payment is never mistaken for a conflict — the INSERT-vs-UPDATE
+	// decision keys off row existence, never off the lock_version value.
+	tag, err := q.Exec(ctx,
 		`INSERT INTO payments (id, invoice_id, idempotency_key, amount, refunded_amount,
-			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, lock_version, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
 		 ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status, amount = EXCLUDED.amount,
 			refunded_amount = EXCLUDED.refunded_amount, currency = EXCLUDED.currency,
 			method = EXCLUDED.method, gateway_transaction_id = EXCLUDED.gateway_transaction_id,
 			failure_reason = EXCLUDED.failure_reason, processed_at = EXCLUDED.processed_at,
-			metadata = EXCLUDED.metadata, state = EXCLUDED.state, updated_at = NOW()`,
+			metadata = EXCLUDED.metadata, state = EXCLUDED.state,
+			lock_version = EXCLUDED.lock_version, updated_at = NOW()
+		 WHERE payments.lock_version = $15`,
 		string(s.ID), string(s.InvoiceID), idempotencyKey,
 		s.Amount.Int64(), s.RefundedAmount.Int64(),
 		string(s.Amount.Currency()), string(s.Status), string(s.Method),
-		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState)
+		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState,
+		s.Version, p.LoadedVersion())
 	if err != nil {
 		if isIdempotencyKeyConflict(err) {
 			return r.duplicateIdempotencyKey(ctx, q, s)
 		}
 		return fmt.Errorf("save payment: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		// The row exists but its stored lock_version no longer equals
+		// LoadedVersion() (a concurrent writer advanced it). A brand-new row would
+		// have inserted, so 0 unambiguously means an optimistic-lock conflict.
+		return tx.ErrVersionConflict
+	}
+	// Record the persisted optimistic-lock version as the new loaded baseline so a
+	// subsequent Save of this same in-memory entity compares against the right one.
+	p.SetVersion(s.Version)
 	return nil
 }
 
@@ -191,7 +216,7 @@ func scanPaymentRows(rows pgx.Rows) ([]*payment.Payment, error) {
 
 const selectPaymentSQL = `
 	SELECT id, invoice_id, idempotency_key, amount, refunded_amount, currency,
-	       status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state
+	       status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, lock_version
 	FROM payments`
 
 func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
@@ -205,10 +230,11 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 		processedAt                         *time.Time
 		metadata                            json.RawMessage
 		stateRaw                            []byte
+		lockVersion                         int
 	)
 	if err := t.Scan(
 		&id, &invoiceID, &idempotencyKey, &amount, &refundedAmount, &currency,
-		&status, &method, &gatewayTransactionID, &failureReason, &processedAt, &metadata, &stateRaw,
+		&status, &method, &gatewayTransactionID, &failureReason, &processedAt, &metadata, &stateRaw, &lockVersion,
 	); err != nil {
 		return payment.PaymentSnapshot{}, err
 	}
@@ -246,5 +272,9 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 			return payment.PaymentSnapshot{}, fmt.Errorf("unmarshal payment metadata: %w", err)
 		}
 	}
+	// The payments.lock_version column is authoritative for the optimistic-locking
+	// version (core#190). FromSnapshot restores both version and loadedVersion from
+	// it, so the next Save guards on the right baseline.
+	s.Version = lockVersion
 	return s, nil
 }

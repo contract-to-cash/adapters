@@ -194,3 +194,49 @@ func TestBalanceRepo_FindAvailable(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", got)
 	}
 }
+
+// SaveRefund must persist the invoice_id / application_id linkage (core#184).
+func TestBalanceRepo_SaveRefund(t *testing.T) {
+	repo, mock := newBalanceRepo(t)
+	refund := &balance.BalanceRefund{
+		ID: "rf-1", BalanceEntryID: "bal-1", AccountID: "acct-1",
+		Amount: jpy(500), RefundedAt: fixedTime,
+		InvoiceID: "inv-1", ApplicationID: "app-1",
+	}
+	mock.ExpectExec(`INSERT INTO balance_refunds`).
+		WithArgs("rf-1", "bal-1", "acct-1", int64(500), "JPY", sqlmock.AnyArg(), "inv-1", "app-1").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := repo.SaveRefund(context.Background(), refund); err != nil {
+		t.Fatalf("SaveRefund: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// FindRefundsByInvoice reads back the refunds recorded against an invoice,
+// including the invoice_id / application_id linkage columns.
+func TestBalanceRepo_FindRefundsByInvoice(t *testing.T) {
+	repo, mock := newBalanceRepo(t)
+	rows := sqlmock.NewRows([]string{
+		"id", "balance_entry_id", "account_id", "amount", "currency", "refunded_at", "invoice_id", "application_id",
+	}).AddRow("rf-1", "bal-1", "acct-1", int64(500), "JPY", fixedTime, "inv-1", "app-1")
+	mock.ExpectQuery(`SELECT .* FROM balance_refunds WHERE invoice_id = \? ORDER BY refunded_at ASC`).
+		WithArgs("inv-1").
+		WillReturnRows(rows)
+
+	got, err := repo.FindRefundsByInvoice(context.Background(), "inv-1")
+	if err != nil {
+		t.Fatalf("FindRefundsByInvoice: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 refund, got %d", len(got))
+	}
+	if got[0].ID != "rf-1" || got[0].InvoiceID != "inv-1" || got[0].ApplicationID != "app-1" {
+		t.Errorf("unexpected refund: %+v", got[0])
+	}
+	if got[0].Amount.Int64() != 500 {
+		t.Errorf("amount = %d, want 500", got[0].Amount.Int64())
+	}
+}

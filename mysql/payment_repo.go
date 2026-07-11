@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
 )
@@ -76,15 +77,19 @@ func (r *MySQLPaymentRepository) Save(ctx context.Context, p *payment.Payment) e
 	// overwriting the winner's row with the loser's fields (issue #35 / core#97).
 	// Same-id re-saves (e.g. the 3DS Pending -> Completed upgrade path) collide on
 	// the PRIMARY key and are routed to a guarded UPDATE below.
+	//
+	// lock_version carries the domain optimistic-locking version (p.Version(),
+	// core#190); a brand-new payment INSERTs it directly.
 	_, err = q.ExecContext(ctx,
 		`INSERT INTO payments (id, invoice_id, idempotency_key, amount, refunded_amount,
-			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))`,
+			currency, status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, lock_version, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))`,
 		string(s.ID), string(s.InvoiceID), idempotencyKey,
 		s.Amount.Int64(), s.RefundedAmount.Int64(),
 		string(s.Amount.Currency()), string(s.Status), string(s.Method),
-		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState)
+		s.GatewayTransactionID, failureReason, processedAt, metadata, jsonState, s.Version)
 	if err == nil {
+		p.SetVersion(s.Version)
 		return nil
 	}
 
@@ -99,17 +104,22 @@ func (r *MySQLPaymentRepository) Save(ctx context.Context, p *payment.Payment) e
 	}
 
 	// PRIMARY-key duplicate: the payment already exists, so this Save is an
-	// update. Guard the UPDATE on id only, never touching another record.
+	// update. Guard the UPDATE on id AND lock_version so a concurrent writer that
+	// already advanced the version loses (core#190): the WHERE misses, zero rows
+	// change, and we report tx.ErrVersionConflict. Because lock_version always
+	// changes on a real match (the version is bumped by the mutation that
+	// preceded this Save), MySQL's changed-rows RowsAffected is 1 on success and 0
+	// only on a genuine version miss — mirroring the balance/invoice repos.
 	if dupEntryOnKey(err, "PRIMARY") {
-		_, upErr := q.ExecContext(ctx,
+		res, upErr := q.ExecContext(ctx,
 			`UPDATE payments SET
 				invoice_id = ?, idempotency_key = ?, amount = ?, refunded_amount = ?,
 				currency = ?, status = ?, method = ?, gateway_transaction_id = ?,
-				failure_reason = ?, processed_at = ?, metadata = ?, state = ?, updated_at = NOW(6)
-			 WHERE id = ?`,
+				failure_reason = ?, processed_at = ?, metadata = ?, state = ?, lock_version = ?, updated_at = NOW(6)
+			 WHERE id = ? AND lock_version = ?`,
 			string(s.InvoiceID), idempotencyKey, s.Amount.Int64(), s.RefundedAmount.Int64(),
 			string(s.Amount.Currency()), string(s.Status), string(s.Method), s.GatewayTransactionID,
-			failureReason, processedAt, metadata, jsonState, string(s.ID))
+			failureReason, processedAt, metadata, jsonState, s.Version, string(s.ID), p.LoadedVersion())
 		if upErr != nil {
 			// An idempotency_key change that collides with another record still
 			// maps to the sentinel; any other error is technical.
@@ -118,6 +128,14 @@ func (r *MySQLPaymentRepository) Save(ctx context.Context, p *payment.Payment) e
 			}
 			return fmt.Errorf("save payment: %w", upErr)
 		}
+		affected, aErr := res.RowsAffected()
+		if aErr != nil {
+			return fmt.Errorf("payment rows affected: %w", aErr)
+		}
+		if affected == 0 {
+			return tx.ErrVersionConflict
+		}
+		p.SetVersion(s.Version)
 		return nil
 	}
 
@@ -196,7 +214,7 @@ func scanPaymentRows(rows *sql.Rows) ([]*payment.Payment, error) {
 
 const selectPaymentSQL = `
 	SELECT id, invoice_id, idempotency_key, amount, refunded_amount, currency,
-	       status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state
+	       status, method, gateway_transaction_id, failure_reason, processed_at, metadata, state, lock_version
 	FROM payments`
 
 func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
@@ -210,10 +228,11 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 		processedAt                         sql.NullTime
 		metadata                            json.RawMessage
 		stateRaw                            []byte
+		lockVersion                         int
 	)
 	if err := t.Scan(
 		&id, &invoiceID, &idempotencyKey, &amount, &refundedAmount, &currency,
-		&status, &method, &gatewayTransactionID, &failureReason, &processedAt, &metadata, &stateRaw,
+		&status, &method, &gatewayTransactionID, &failureReason, &processedAt, &metadata, &stateRaw, &lockVersion,
 	); err != nil {
 		return payment.PaymentSnapshot{}, err
 	}
@@ -251,5 +270,9 @@ func scanPaymentSnapshot(t scanTarget) (payment.PaymentSnapshot, error) {
 			return payment.PaymentSnapshot{}, fmt.Errorf("unmarshal payment metadata: %w", err)
 		}
 	}
+	// The payments.lock_version column is authoritative for the optimistic-locking
+	// version (core#190). FromSnapshot restores both version and loadedVersion from
+	// it, so the next Save guards on the right baseline.
+	s.Version = lockVersion
 	return s, nil
 }

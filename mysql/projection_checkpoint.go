@@ -5,12 +5,20 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/contract-to-cash/core/application/projection"
 )
 
 // CheckpointStore persists the last processed global_position for a named projector.
+//
+// It satisfies the core application/projection.CheckpointStore port (core#192):
+// Load returns 0 when no checkpoint exists, and Save upserts the position. The
+// additional Reset method is an adapter-local convenience outside the port.
 type CheckpointStore struct {
 	db *sql.DB
 }
+
+var _ projection.CheckpointStore = (*CheckpointStore)(nil)
 
 // NewCheckpointStore constructs a CheckpointStore over an existing *sql.DB.
 func NewCheckpointStore(db *sql.DB) *CheckpointStore {

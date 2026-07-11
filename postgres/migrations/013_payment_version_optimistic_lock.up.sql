@@ -1,0 +1,34 @@
+-- 013: payment optimistic-locking version column
+-- (issue adapters#/ core#190).
+--
+-- Background. core#190 added an optimistic-locking contract to
+-- payment.Repository.Save: the Payment entity now carries
+-- Version()/LoadedVersion()/SetVersion() exactly like invoice.Invoice and
+-- balance.BalanceEntry, and every mutating transition (Complete, Fail,
+-- MarkRefunded, MarkPartiallyRefunded, MarkChargedBack, RecordRefund) bumps
+-- Version(). Save MUST reject a write whose stored version no longer matches the
+-- payment's LoadedVersion, so two operators that each load a completed payment
+-- and RecordRefund a partial amount cannot both persist last-writer-wins
+-- (booking one refund while the gateway moved money twice), and a concurrent
+-- Pending->Completed (3DS) vs Pending->Failed (webhook) pair cannot silently
+-- lose a transition.
+--
+-- This migration adds the lock_version column; the accompanying
+-- payment_repo.go change implements option 1 of the Save concurrency contract
+-- (a version-guarded upsert: ON CONFLICT (id) DO UPDATE ... WHERE
+-- payments.lock_version = LoadedVersion(), reporting RowsAffected()==0 as
+-- tx.ErrVersionConflict). It mirrors the invoices.lock_version column added in
+-- migration 011.
+--
+-- Backfill convergence (why DEFAULT 0 is safe). Existing rows get lock_version
+-- 0. FromSnapshot restores both version and loadedVersion from this column, so
+-- the first load after deploy makes 0 the loaded baseline; the next mutation
+-- bumps it to 1 and the guarded UPDATE (WHERE lock_version = 0) matches,
+-- advancing cleanly. A brand-new payment (LoadedVersion 0) INSERTs, so it is
+-- never mistaken for a conflicting update — the INSERT-vs-UPDATE decision keys
+-- off row existence, never off the lock_version value.
+--
+-- Forward-only runner (no .down files); applied files are tracked in
+-- schema_migrations, so re-running skips this file.
+ALTER TABLE payments
+    ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;

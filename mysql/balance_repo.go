@@ -198,15 +198,59 @@ func (r *MySQLBalanceRepository) FindApplicationsByInvoice(ctx context.Context, 
 }
 
 func (r *MySQLBalanceRepository) SaveRefund(ctx context.Context, refund *balance.BalanceRefund) error {
+	// invoice_id and application_id (core#184) make void-triggered restoration
+	// idempotent: FindRefundsByInvoice reads them back so a double void / retry
+	// skips applications whose credit was already restored. Both are empty for
+	// refunds not tied to an invoice/application.
 	_, err := r.q(ctx).ExecContext(ctx,
-		`INSERT INTO balance_refunds (id, balance_entry_id, account_id, amount, currency, refunded_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO balance_refunds (id, balance_entry_id, account_id, amount, currency, refunded_at, invoice_id, application_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		refund.ID, string(refund.BalanceEntryID), string(refund.AccountID),
-		refund.Amount.Int64(), string(refund.Amount.Currency()), refund.RefundedAt.UTC())
+		refund.Amount.Int64(), string(refund.Amount.Currency()), refund.RefundedAt.UTC(),
+		string(refund.InvoiceID), refund.ApplicationID)
 	if err != nil {
 		return fmt.Errorf("save balance refund: %w", err)
 	}
 	return nil
+}
+
+// FindRefundsByInvoice returns all credit refunds recorded against an invoice
+// (core#184). The void-restoration flow uses it to skip applications whose
+// consumed credit was already restored, making a double void / transaction
+// retry idempotent. Ordering is unspecified by the contract; refunded_at ASC is
+// used for a deterministic result.
+func (r *MySQLBalanceRepository) FindRefundsByInvoice(ctx context.Context, invoiceID shared.InvoiceID) ([]*balance.BalanceRefund, error) {
+	rows, err := r.q(ctx).QueryContext(ctx,
+		`SELECT id, balance_entry_id, account_id, amount, currency, refunded_at, invoice_id, application_id
+		 FROM balance_refunds WHERE invoice_id = ? ORDER BY refunded_at ASC`,
+		string(invoiceID))
+	if err != nil {
+		return nil, fmt.Errorf("find balance refunds by invoice: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []*balance.BalanceRefund
+	for rows.Next() {
+		var (
+			id, entryID, accountID string
+			amount                 int64
+			currency               string
+			refundedAt             utcTime
+			invID, applicationID   string
+		)
+		if err := rows.Scan(&id, &entryID, &accountID, &amount, &currency, &refundedAt, &invID, &applicationID); err != nil {
+			return nil, fmt.Errorf("scan balance refund: %w", err)
+		}
+		result = append(result, &balance.BalanceRefund{
+			ID: id, BalanceEntryID: shared.BalanceEntryID(entryID),
+			AccountID:     shared.AccountID(accountID),
+			Amount:        moneyFromInt64(amount, shared.Currency(currency)),
+			RefundedAt:    refundedAt.Time,
+			InvoiceID:     shared.InvoiceID(invID),
+			ApplicationID: applicationID,
+		})
+	}
+	return result, rows.Err()
 }
 
 // FindExpired returns entries whose expiry has passed as of asOf and whose
