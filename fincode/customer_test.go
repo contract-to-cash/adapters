@@ -506,9 +506,3 @@ func TestGateway_CustomerNilAndEmptyGuards(t *testing.T) {
 		t.Errorf("DeleteCustomer(\"\") = %v, want validation error", err)
 	}
 }
-
-// --- Compile-time conformance ---
-
-func TestGateway_ImplementsCustomerGateway(t *testing.T) {
-	var _ port.CustomerGateway = (*Gateway)(nil)
-}

@@ -43,7 +43,8 @@ var _ port.CustomerGateway = (*Gateway)(nil)
 // caller's intended split.
 //
 // Address: Line1/Line2/City/State/PostalCode/Country map to fincode's
-// addr_line_1/addr_city/addr_state/addr_post_code/addr_country respectively.
+// addr_line_1/addr_line_2/addr_city/addr_state/addr_post_code/addr_country
+// respectively.
 // addr_country is ISO 3166-1 *numeric* per fincode's customer schema (e.g.
 // "392" for Japan); port.Address.Country is passed through unmodified, so
 // callers must supply the numeric code fincode expects rather than an
