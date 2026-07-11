@@ -1,0 +1,33 @@
+-- 012: payment optimistic-locking version column
+-- (issue adapters#/ core#190). MySQL mirror of
+-- postgres/migrations/013_payment_version_optimistic_lock.up.sql.
+--
+-- Background. core#190 added an optimistic-locking contract to
+-- payment.Repository.Save: the Payment entity now carries
+-- Version()/LoadedVersion()/SetVersion() like invoice.Invoice and
+-- balance.BalanceEntry, and every mutating transition (Complete, Fail,
+-- MarkRefunded, MarkPartiallyRefunded, MarkChargedBack, RecordRefund) bumps
+-- Version(). Save MUST reject a write whose stored version no longer matches the
+-- payment's LoadedVersion, so two operators that each RecordRefund a partial
+-- amount on the same completed payment cannot both persist last-writer-wins, and
+-- a concurrent Pending->Completed (3DS) vs Pending->Failed (webhook) pair cannot
+-- silently lose a transition.
+--
+-- MySQL's INSERT keeps its plain form (a duplicate idempotency_key must surface
+-- as an error, not an upsert — issue #35 / core#97), and the same-id update path
+-- becomes a version-guarded UPDATE ... WHERE id = ? AND lock_version =
+-- LoadedVersion(); payment_repo.go reports RowsAffected()==0 there as
+-- tx.ErrVersionConflict. Mirrors the invoices.lock_version column (migration
+-- 010).
+--
+-- Backfill convergence (why DEFAULT 0 is safe). Existing rows get lock_version
+-- 0. FromSnapshot restores both version and loadedVersion from this column, so
+-- the first load after deploy makes 0 the loaded baseline; the next mutation
+-- bumps it to 1 and the guarded UPDATE (WHERE lock_version = 0) matches. A
+-- brand-new payment INSERTs, keyed off the PRIMARY-key collision, never off the
+-- lock_version value.
+--
+-- Forward-only runner (no .down files); a mid-file failure is caught by the
+-- 'pending' status marker.
+ALTER TABLE payments
+    ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;

@@ -638,6 +638,83 @@ func TestPaymentRepo_DuplicateIdempotencyKey(t *testing.T) {
 	}
 }
 
+// Two operators load the SAME completed payment and each RecordRefund a partial
+// amount. Optimistic locking (core#190) must let exactly one Save win and reject
+// the other with tx.ErrVersionConflict, so the gateway's money movement is
+// booked once — not twice (last-writer-wins would silently double-book).
+func TestPaymentRepo_ConcurrentRecordRefund_VersionConflict(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	_, _ = pool.Exec(ctx, `INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-refund', 'acc-refund', 'active')`)
+	_, _ = pool.Exec(ctx, `INSERT INTO invoices (id, account_id, contract_id, status, subtotal, tax_amount, discount_amount, total, applied_balance, amount_due, paid_amount, balance) VALUES ('inv-refund', 'acc-refund', 'c-refund', 'issued', 0, 0, 0, 0, 0, 0, 0, 0)`)
+
+	repo := postgres.NewPaymentRepository(pool)
+
+	// Seed a completed payment (persisted lock_version 0).
+	seed := mustPayment(t, "pay-refund", "inv-refund", "idem-refund", payment.PaymentStatusCompleted, 5000)
+	if err := repo.Save(ctx, seed); err != nil {
+		t.Fatalf("Save seed: %v", err)
+	}
+
+	// Two independent loads, each observing lock_version 0.
+	opA, err := repo.FindByID(ctx, "pay-refund")
+	if err != nil {
+		t.Fatalf("load A: %v", err)
+	}
+	opB, err := repo.FindByID(ctx, "pay-refund")
+	if err != nil {
+		t.Fatalf("load B: %v", err)
+	}
+
+	if err := opA.RecordRefund(jpy(2000)); err != nil {
+		t.Fatalf("A RecordRefund: %v", err)
+	}
+	if err := opB.RecordRefund(jpy(2000)); err != nil {
+		t.Fatalf("B RecordRefund: %v", err)
+	}
+
+	// A wins.
+	if err := repo.Save(ctx, opA); err != nil {
+		t.Fatalf("Save A should succeed: %v", err)
+	}
+	// B loses: its LoadedVersion (0) no longer matches the stored version.
+	if err := repo.Save(ctx, opB); !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("Save B: expected tx.ErrVersionConflict, got %v", err)
+	}
+
+	// Exactly one refund is booked: refunded_amount == 2000, status partially_refunded.
+	got, err := repo.FindByID(ctx, "pay-refund")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	gs := got.ToSnapshot()
+	if gs.RefundedAmount.Int64() != 2000 {
+		t.Errorf("refunded_amount = %d, want 2000 (no double-book)", gs.RefundedAmount.Int64())
+	}
+	if gs.Status != payment.PaymentStatusPartiallyRefunded {
+		t.Errorf("status = %q, want partially_refunded", gs.Status)
+	}
+
+	// A retry by B (re-load, re-apply against the winner's state) then converges.
+	opB2, err := repo.FindByID(ctx, "pay-refund")
+	if err != nil {
+		t.Fatalf("reload B: %v", err)
+	}
+	if err := opB2.RecordRefund(jpy(2000)); err != nil {
+		t.Fatalf("B retry RecordRefund: %v", err)
+	}
+	if err := repo.Save(ctx, opB2); err != nil {
+		t.Fatalf("Save B retry should succeed: %v", err)
+	}
+	final, err := repo.FindByID(ctx, "pay-refund")
+	if err != nil {
+		t.Fatalf("final reload: %v", err)
+	}
+	if final.ToSnapshot().RefundedAmount.Int64() != 4000 {
+		t.Errorf("final refunded_amount = %d, want 4000", final.ToSnapshot().RefundedAmount.Int64())
+	}
+}
+
 func mustPayment(t *testing.T, id, invoiceID, idempotencyKey string, status payment.PaymentStatus, amount int64) *payment.Payment {
 	t.Helper()
 	p, err := payment.FromSnapshot(payment.PaymentSnapshot{
@@ -808,6 +885,72 @@ func TestBalanceRepo_SaveAndFindByID(t *testing.T) {
 	}
 	if found.ToSnapshot().OriginalAmount.Int64() != 10000 {
 		t.Errorf("OriginalAmount = %d, want 10000", found.ToSnapshot().OriginalAmount.Int64())
+	}
+}
+
+// SaveRefund persists the invoice_id / application_id linkage (core#184) and
+// FindRefundsByInvoice reads back exactly the refunds for a given invoice, so
+// the void-restoration flow can skip already-restored applications and stay
+// idempotent under a double void / retry.
+func TestBalanceRepo_SaveAndFindRefundsByInvoice(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	repo := postgres.NewBalanceRepository(pool)
+	ctx := context.Background()
+
+	// A balance entry is required by the balance_refunds FK.
+	entry, err := balance.FromSnapshot(balance.BalanceEntrySnapshot{
+		ID: "be-refund", AccountID: "acc-refund2",
+		OriginalAmount: jpy(10000), RemainingAmount: jpy(10000),
+		Reason: balance.BalanceReasonManualAdjustment, SourceType: balance.BalanceSourceTypeManual,
+		Version: 0, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, entry); err != nil {
+		t.Fatalf("Save entry: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	// One refund tied to inv-A, another to inv-B.
+	refA := &balance.BalanceRefund{
+		ID: "rf-a", BalanceEntryID: "be-refund", AccountID: "acc-refund2",
+		Amount: jpy(3000), RefundedAt: now,
+		InvoiceID: "inv-A", ApplicationID: "app-A",
+	}
+	refB := &balance.BalanceRefund{
+		ID: "rf-b", BalanceEntryID: "be-refund", AccountID: "acc-refund2",
+		Amount: jpy(1500), RefundedAt: now,
+		InvoiceID: "inv-B", ApplicationID: "app-B",
+	}
+	if err := repo.SaveRefund(ctx, refA); err != nil {
+		t.Fatalf("SaveRefund A: %v", err)
+	}
+	if err := repo.SaveRefund(ctx, refB); err != nil {
+		t.Fatalf("SaveRefund B: %v", err)
+	}
+
+	got, err := repo.FindRefundsByInvoice(ctx, "inv-A")
+	if err != nil {
+		t.Fatalf("FindRefundsByInvoice: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 refund for inv-A, got %d", len(got))
+	}
+	if got[0].ID != "rf-a" || got[0].InvoiceID != "inv-A" || got[0].ApplicationID != "app-A" {
+		t.Errorf("unexpected refund: %+v", got[0])
+	}
+	if got[0].Amount.Int64() != 3000 {
+		t.Errorf("amount = %d, want 3000", got[0].Amount.Int64())
+	}
+
+	// An invoice with no refunds returns empty.
+	none, err := repo.FindRefundsByInvoice(ctx, "inv-none")
+	if err != nil {
+		t.Fatalf("FindRefundsByInvoice none: %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("expected no refunds for inv-none, got %d", len(none))
 	}
 }
 

@@ -117,7 +117,7 @@ func TestPaymentRepo_MoneyRoundTrip_Fraction(t *testing.T) {
 
 	row := sqlmock.NewRows(paymentColumns).AddRow(
 		"pay-frac", "inv-1", "idem-frac", int64(100), int64(25), "JPY",
-		"completed", "credit_card", "txn-1", "", fixedTime, []byte(`{}`), state,
+		"completed", "credit_card", "txn-1", "", fixedTime, []byte(`{}`), state, int64(0),
 	)
 	repo, mock := newPaymentRepo(t)
 	mock.ExpectQuery(`SELECT .* FROM payments WHERE id = \?`).
@@ -150,7 +150,7 @@ func TestPaymentRepo_MoneyRoundTrip_Fraction(t *testing.T) {
 	idem := "idem-frac"
 	mock.ExpectExec(`INSERT INTO payments`).
 		WithArgs("pay-frac", "inv-1", &idem, int64(100), int64(25),
-			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), state).
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), state, int64(0)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := repo.Save(context.Background(), p); err != nil {
 		t.Fatalf("Save: %v", err)

@@ -269,6 +269,17 @@ func (s *PostgresEventStore) LoadAll(ctx context.Context, fromPosition int64, li
 	return scanEvents(rows)
 }
 
+// Subscribe honours the core eventstore.Store.Subscribe contract (core#192):
+// it first backfills every event strictly after fromPosition (via catchUp,
+// which pages through LoadAll so replay memory stays bounded), then tails newly
+// appended events driven by LISTEN/NOTIFY on eventsChannel. Delivery is lossless
+// up to DB durability and at-least-once: a slow consumer back-pressures the
+// sender (the channel send blocks rather than dropping), and catch-up is keyed
+// off the last delivered global_position so a NOTIFY that races an in-flight
+// catch-up cannot skip an event. The channel is closed when ctx is cancelled
+// (runSubscription returns on ctx.Err() / ctx.Done() and defers close(ch)); an
+// abnormal termination is surfaced via the optional subscription error handler
+// (WithSubscriptionErrorHandler), since the bare channel return cannot.
 func (s *PostgresEventStore) Subscribe(ctx context.Context, fromPosition int64) (<-chan eventstore.Event, error) {
 	ch := make(chan eventstore.Event, subscriberBuffer)
 	go s.runSubscription(ctx, fromPosition, ch)

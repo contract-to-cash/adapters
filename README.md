@@ -313,13 +313,30 @@ verification level differs:
 
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
-dependency. The pin currently tracks core `main` at the PR #163–#181 series
-(pseudo-version `v0.1.1-0.20260706162330-b987fe17c84c`), which is the catch-up
-for `balance.Repository.FindExpired` (core#159), the
-`FindTrialsEndingSoon` → `FindTrialsEndingBefore` rename (core#162), the
-`(*T, error)` constructor signatures (core#148/#167), and the
-`ContractCreatedEvent` SchemaVersion 3 idempotency key (core#159) — see issue
-#46. To develop against a local core checkout, add a `replace` directive to
+dependency. The pin currently tracks core `main` at commit `82c7cfb`
+(pseudo-version `v0.1.1-0.20260711062854-82c7cfb3dd7b`), which absorbs the
+following core contract changes:
+
+- **payment optimistic locking (core#190)**: `payment.Payment` now carries
+  `Version()`/`LoadedVersion()`/`SetVersion()` and `payment.Repository.Save` must
+  reject a version-conflicting write with `tx.ErrVersionConflict`. Both payment
+  repos add a `lock_version` column (postgres migration 013 / mysql migration
+  012) and a version-guarded upsert, mirroring the invoice/balance repos.
+- **`balance.Repository.FindRefundsByInvoice` (core#184)**: new method plus
+  `BalanceRefund.InvoiceID`/`ApplicationID` fields for idempotent void
+  restoration. Both balance repos add the two columns (postgres migration 014 /
+  mysql migration 013), persist them in `SaveRefund`, and implement the lookup.
+- **`projection.CheckpointStore` port (core#192)**: the existing
+  `CheckpointStore` adapters now carry a compile-time `var _
+  projection.CheckpointStore` assertion.
+- **webhook transport-replay protection (core#191)**: `WebhookHandler.ParseAndVerify`
+  now owns replay defense. The stripe handler enforces the signed `Stripe-Signature`
+  `t=` timestamp against a clock-injected 5-minute tolerance
+  (`WebhookConfig.Tolerance`, `WithWebhookClock`). fincode exposes no HMAC-signed
+  transport timestamp, so it cannot implement this control — see the gap note in
+  `fincode/webhook.go`.
+
+To develop against a local core checkout, add a `replace` directive to
 `go.mod` (`go mod edit -replace github.com/contract-to-cash/core=/path/to/core`).
 
 ## Concurrency guarantees

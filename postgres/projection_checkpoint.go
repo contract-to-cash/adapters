@@ -5,14 +5,21 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/contract-to-cash/core/application/projection"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // CheckpointStore persists the last processed global_position for a named projector.
+//
+// It satisfies the core application/projection.CheckpointStore port (core#192):
+// Load returns 0 when no checkpoint exists, and Save upserts the position. The
+// additional Reset method is an adapter-local convenience outside the port.
 type CheckpointStore struct {
 	pool *pgxpool.Pool
 }
+
+var _ projection.CheckpointStore = (*CheckpointStore)(nil)
 
 func NewCheckpointStore(pool *pgxpool.Pool) *CheckpointStore {
 	return &CheckpointStore{pool: pool}

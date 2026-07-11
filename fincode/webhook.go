@@ -150,6 +150,25 @@ type webhookPayload struct {
 // ParseAndVerify verifies the signature of a raw fincode webhook request
 // (per the configured SignatureMode) and returns the parsed event. All
 // failures are reported as *port.WebhookError with an appropriate code.
+//
+// GAP — transport-level replay protection is NOT implemented (core#191).
+// The core WebhookHandler contract now requires ParseAndVerify to reject stale
+// or future-dated requests using the gateway's HMAC-SIGNED TRANSPORT TIMESTAMP.
+// fincode exposes no such value: there is no signed timestamp header, and the
+// webhook signature (a fixed string in SignatureModeStatic, or an HMAC over the
+// body in SignatureModeHMAC) does not cover a transport timestamp an attacker
+// could not also replay verbatim. The body's own process_date/created/updated
+// fields are the EVENT-BODY creation time, which the contract explicitly
+// forbids using as a replay control (gateways redeliver failed webhooks for
+// hours-to-days carrying the original timestamp — see core#191), so this
+// adapter deliberately does NOT gate on them.
+//
+// Consequence: a fincode integration must obtain replay protection from OUTSIDE
+// this adapter — enforce HTTPS, restrict the webhook endpoint to fincode's
+// source IPs, and rely on the core WebhookDeduplicator (keyed on the derived
+// event ID, see eventID) to suppress duplicates. If fincode later publishes a
+// signed transport timestamp, enforce it here to close this gap. The stripe
+// adapter DOES implement the control (signed Stripe-Signature t=).
 func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequest) (*port.WebhookEvent, error) {
 	if req == nil {
 		return nil, &port.WebhookError{

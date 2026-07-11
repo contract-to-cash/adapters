@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/shared"
 	driver "github.com/go-sql-driver/mysql"
@@ -44,13 +45,13 @@ func samplePayment(t *testing.T) *payment.Payment {
 // paymentColumns is the SELECT column set (order matters for sqlmock rows).
 var paymentColumns = []string{
 	"id", "invoice_id", "idempotency_key", "amount", "refunded_amount", "currency",
-	"status", "method", "gateway_transaction_id", "failure_reason", "processed_at", "metadata", "state",
+	"status", "method", "gateway_transaction_id", "failure_reason", "processed_at", "metadata", "state", "lock_version",
 }
 
 func paymentFindRow() *sqlmock.Rows {
 	return sqlmock.NewRows(paymentColumns).AddRow(
 		"pay-1", "inv-1", "idem-pay-1", int64(1100), int64(0), "JPY",
-		"completed", "credit_card", "txn-1", "", fixedTime, []byte(`{}`), nil,
+		"completed", "credit_card", "txn-1", "", fixedTime, []byte(`{}`), nil, int64(0),
 	)
 }
 
@@ -64,7 +65,7 @@ func TestPaymentRepo_Save_InsertNew(t *testing.T) {
 	idem := "idem-pay-1"
 	mock.ExpectExec(`INSERT INTO payments`).
 		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
-			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), p); err != nil {
@@ -76,7 +77,9 @@ func TestPaymentRepo_Save_InsertNew(t *testing.T) {
 }
 
 // A same-id re-save collides on the PRIMARY key; Save must fall through to a
-// guarded UPDATE keyed on id (the 3DS Pending -> Completed upgrade path).
+// version-guarded UPDATE keyed on id AND lock_version (the 3DS Pending ->
+// Completed upgrade path). The trailing args are the new lock_version (write)
+// and the LoadedVersion() guard (core#190).
 func TestPaymentRepo_Save_UpdateExisting(t *testing.T) {
 	repo, mock := newPaymentRepo(t)
 	p := samplePayment(t)
@@ -84,15 +87,41 @@ func TestPaymentRepo_Save_UpdateExisting(t *testing.T) {
 	idem := "idem-pay-1"
 	mock.ExpectExec(`INSERT INTO payments`).
 		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
-			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0)).
 		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'pay-1' for key 'payments.PRIMARY'"})
 	mock.ExpectExec(`UPDATE payments SET`).
 		WithArgs("inv-1", &idem, int64(1100), int64(0), "JPY", "completed", "credit_card",
-			"txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "pay-1").
+			"txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0), "pay-1", int64(0)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := repo.Save(context.Background(), p); err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A same-id re-save whose version-guarded UPDATE matches zero rows means a
+// concurrent writer already advanced lock_version: Save must report
+// tx.ErrVersionConflict rather than silently succeeding. This is what stops two
+// concurrent RecordRefund calls from both booking a refund (core#190).
+func TestPaymentRepo_Save_VersionConflict(t *testing.T) {
+	repo, mock := newPaymentRepo(t)
+	p := samplePayment(t)
+
+	idem := "idem-pay-1"
+	mock.ExpectExec(`INSERT INTO payments`).
+		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0)).
+		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'pay-1' for key 'payments.PRIMARY'"})
+	mock.ExpectExec(`UPDATE payments SET`).
+		WithArgs("inv-1", &idem, int64(1100), int64(0), "JPY", "completed", "credit_card",
+								"txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0), "pay-1", int64(0)).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // zero rows changed: version guard missed
+
+	if err := repo.Save(context.Background(), p); !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("expected tx.ErrVersionConflict, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
@@ -109,7 +138,7 @@ func TestPaymentRepo_Save_DuplicateIdempotencyKey(t *testing.T) {
 	idem := "idem-pay-1"
 	mock.ExpectExec(`INSERT INTO payments`).
 		WithArgs("pay-1", "inv-1", &idem, int64(1100), int64(0),
-			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			"JPY", "completed", "credit_card", "txn-1", "", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0)).
 		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'idem-pay-1' for key 'payments.idempotency_key'"})
 	// Best-effort lookup of the winner for operational debugging.
 	mock.ExpectQuery(`SELECT id FROM payments WHERE idempotency_key = \?`).

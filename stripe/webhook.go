@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,11 +14,18 @@ import (
 	"github.com/stripe/stripe-go/v82/webhook"
 
 	"github.com/contract-to-cash/core/application/port"
+	"github.com/contract-to-cash/core/domain/shared"
 )
 
 // DefaultSignatureHeader is the HTTP header Stripe uses to carry the webhook
 // signature.
 const DefaultSignatureHeader = "Stripe-Signature"
+
+// DefaultTolerance bounds how far the signed transport timestamp
+// (Stripe-Signature t=) may differ from the current time before ParseAndVerify
+// rejects the request as a replay. It matches Stripe's own default and the
+// Standard Webhooks recommendation (5 minutes).
+const DefaultTolerance = 5 * time.Minute
 
 // WebhookConfig configures the Stripe WebhookHandler.
 type WebhookConfig struct {
@@ -27,6 +35,23 @@ type WebhookConfig struct {
 	// SignatureHeader is the header carrying the signature. Defaults to
 	// DefaultSignatureHeader ("Stripe-Signature").
 	SignatureHeader string
+
+	// Tolerance bounds how far the signed transport timestamp may deviate from
+	// the current clock before the request is rejected as a replay. Zero selects
+	// DefaultTolerance (5 minutes). A negative value is rejected by the
+	// constructor.
+	Tolerance time.Duration
+}
+
+// WebhookOption configures optional dependencies of the WebhookHandler.
+type WebhookOption func(*WebhookHandler)
+
+// WithWebhookClock injects the clock used for transport-timestamp replay
+// validation. Defaults to shared.SystemClock. Tests inject a shared.FixedClock
+// so a payload signed at a fixed timestamp stays within tolerance
+// deterministically.
+func WithWebhookClock(clock shared.Clock) WebhookOption {
+	return func(h *WebhookHandler) { h.clock = clock }
 }
 
 // WebhookHandler implements port.WebhookHandler for Stripe webhooks.
@@ -35,11 +60,20 @@ type WebhookConfig struct {
 // which checks the HMAC-SHA256 signature (over "{timestamp}.{payload}") in the
 // Stripe-Signature header using a constant-time comparison.
 //
-// Timestamp/replay validation is intentionally NOT performed here: the SDK's
-// tolerance check reads the wall clock directly, which would break this
-// module's clock-injection testing convention. Freshness and deduplication
-// are the core port.WebhookProcessor's responsibility — it validates
-// event.CreatedAt against an injected shared.Clock and dedups on event.ID.
+// Transport-level replay protection (core#191): ParseAndVerify OWNS replay
+// defense. It enforces the HMAC-SIGNED transport timestamp — the `t=` value in
+// Stripe-Signature, which is covered by the signature and so cannot be forged —
+// against a short Tolerance (default 5 minutes) using an injected shared.Clock.
+// A request whose signed timestamp is stale or too far in the future is
+// rejected as invalid_signature. The check is done here rather than via the
+// SDK's own IgnoreTolerance path because the SDK reads the wall clock directly,
+// which would break this module's clock-injection convention; the manual check
+// runs AFTER signature verification, so the timestamp it reads is authenticated.
+//
+// NOTE: replay defense uses the signed TRANSPORT timestamp, not the event-body
+// CreatedAt. The core WebhookProcessor deliberately does NOT gate on CreatedAt
+// (gateways redeliver failed webhooks for hours-to-days carrying the ORIGINAL
+// CreatedAt); duplicates are suppressed by the WebhookDeduplicator.
 //
 // Event mapping: known Stripe event types are translated to
 // port.WebhookEventType constants (see toWebhookEventType). Unknown types are
@@ -48,23 +82,38 @@ type WebhookConfig struct {
 type WebhookHandler struct {
 	secret          string
 	signatureHeader string
+	tolerance       time.Duration
+	clock           shared.Clock
 }
 
 var _ port.WebhookHandler = (*WebhookHandler)(nil)
 
 // NewWebhookHandler creates a WebhookHandler. cfg.Secret is required.
-func NewWebhookHandler(cfg WebhookConfig) (*WebhookHandler, error) {
+func NewWebhookHandler(cfg WebhookConfig, opts ...WebhookOption) (*WebhookHandler, error) {
 	if cfg.Secret == "" {
 		return nil, &ValidationError{Field: "Secret", Message: "webhook signing secret must not be empty"}
+	}
+	if cfg.Tolerance < 0 {
+		return nil, &ValidationError{Field: "Tolerance", Message: "webhook timestamp tolerance must not be negative"}
 	}
 	header := cfg.SignatureHeader
 	if header == "" {
 		header = DefaultSignatureHeader
 	}
-	return &WebhookHandler{
+	tolerance := cfg.Tolerance
+	if tolerance == 0 {
+		tolerance = DefaultTolerance
+	}
+	h := &WebhookHandler{
 		secret:          cfg.Secret,
 		signatureHeader: header,
-	}, nil
+		tolerance:       tolerance,
+		clock:           shared.SystemClock{},
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h, nil
 }
 
 // ParseAndVerify verifies the Stripe-Signature of a raw webhook request and
@@ -86,13 +135,22 @@ func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequ
 	}
 
 	event, err := webhook.ConstructEventWithOptions(req.Body, sig, h.secret, webhook.ConstructEventOptions{
-		// Freshness is enforced by the core WebhookProcessor against an
-		// injected clock; the API version is not pinned by this adapter.
+		// The SDK's own tolerance check reads the wall clock directly, which
+		// would break this module's clock-injection convention; we run an
+		// equivalent check below against the injected shared.Clock instead. The
+		// API version is not pinned by this adapter.
 		IgnoreTolerance:          true,
 		IgnoreAPIVersionMismatch: true,
 	})
 	if err != nil {
 		return nil, classifyWebhookError(err)
+	}
+
+	// Transport-level replay protection (core#191). The signed `t=` timestamp is
+	// covered by the signature just verified, so it is authentic; reject it if it
+	// is outside tolerance in either direction (stale replay or forged-future).
+	if err := h.verifyTimestamp(sig); err != nil {
+		return nil, err
 	}
 
 	raw := rawEventData(&event)
@@ -103,6 +161,55 @@ func (h *WebhookHandler) ParseAndVerify(_ context.Context, req *port.WebhookRequ
 		Data:      raw,
 		RawData:   req.Body,
 	}, nil
+}
+
+// verifyTimestamp enforces transport-level replay protection (core#191) using
+// the signed `t=` value in the Stripe-Signature header. It must be called only
+// AFTER webhook.ConstructEventWithOptions has verified the signature, because
+// the signature covers "{t}.{payload}" — so a verified signature makes `t`
+// authentic and unforgeable. A missing/unparseable `t=` (should not happen once
+// the signature verifies, since Stripe always signs a timestamp) and a
+// timestamp outside tolerance in either direction are both rejected as
+// invalid_signature: the transport envelope, not the event body, is what failed.
+func (h *WebhookHandler) verifyTimestamp(sig string) error {
+	ts, ok := parseSignatureTimestamp(sig)
+	if !ok {
+		return &port.WebhookError{
+			Code:    port.WebhookErrorCodeInvalidSignature,
+			Message: "Stripe-Signature is missing a parseable timestamp",
+		}
+	}
+	signedAt := time.Unix(ts, 0)
+	skew := h.clock.Now().Sub(signedAt)
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > h.tolerance {
+		return &port.WebhookError{
+			Code: port.WebhookErrorCodeInvalidSignature,
+			Message: fmt.Sprintf("webhook transport timestamp outside tolerance: %v skew (max %v) — possible replay",
+				skew, h.tolerance),
+		}
+	}
+	return nil
+}
+
+// parseSignatureTimestamp extracts the unix-seconds `t=` element from a
+// Stripe-Signature header value ("t=1700000000,v1=...,v0=..."). Returns false
+// when no numeric t element is present.
+func parseSignatureTimestamp(sig string) (int64, bool) {
+	for _, part := range strings.Split(sig, ",") {
+		k, v, found := strings.Cut(strings.TrimSpace(part), "=")
+		if !found || k != "t" {
+			continue
+		}
+		ts, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return ts, true
+	}
+	return 0, false
 }
 
 // rawEventData returns the event's inner object JSON, falling back to nil when
