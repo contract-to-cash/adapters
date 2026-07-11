@@ -844,7 +844,7 @@ func TestBalanceRepo_FindExpired(t *testing.T) {
 	mk("live", 900, &future, 4*time.Hour)     // not expired -> excluded
 	mk("no-expiry", 900, nil, 5*time.Hour)    // no expiry -> excluded
 
-	got, err := repo.FindExpired(ctx, asOf)
+	got, err := repo.FindExpired(ctx, asOf, 0) // 0 = unbounded
 	if err != nil {
 		t.Fatalf("FindExpired: %v", err)
 	}
@@ -854,6 +854,18 @@ func TestBalanceRepo_FindExpired(t *testing.T) {
 	if got[0].ToSnapshot().ID != "exp-old" || got[1].ToSnapshot().ID != "exp-new" {
 		t.Errorf("expected FIFO order [exp-old exp-new], got [%s %s]",
 			got[0].ToSnapshot().ID, got[1].ToSnapshot().ID)
+	}
+
+	// limit bounds the result to the oldest-created eligible entries (core#197).
+	limited, err := repo.FindExpired(ctx, asOf, 1)
+	if err != nil {
+		t.Fatalf("FindExpired(limit=1): %v", err)
+	}
+	if len(limited) != 1 {
+		t.Fatalf("expected 1 entry with limit=1, got %d", len(limited))
+	}
+	if limited[0].ToSnapshot().ID != "exp-old" {
+		t.Errorf("expected oldest-first entry exp-old with limit=1, got %s", limited[0].ToSnapshot().ID)
 	}
 }
 

@@ -107,10 +107,21 @@ func (r *PostgresContractRepository) FindExpiring(ctx context.Context, before ti
 // strictly before the given time (renamed from FindTrialsEndingSoon to match
 // core#162 B4; the batch calls it with `now` to find trials that have ALREADY
 // ended).
-func (r *PostgresContractRepository) FindTrialsEndingBefore(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
-	return r.findManyFromReadModel(ctx,
-		`SELECT id FROM contract_read_models
-		 WHERE trial_end_date IS NOT NULL AND trial_end_date < $1 AND status = 'trialing'`, before)
+//
+// limit bounds the number of rows returned (core#197): a positive limit returns
+// at most that many, oldest-ending-first (ORDER BY trial_end_date ASC) so
+// repeated batch runs drain the backlog deterministically; a limit <= 0 means
+// "no limit". id is a stable tiebreaker for rows sharing a trial_end_date.
+func (r *PostgresContractRepository) FindTrialsEndingBefore(ctx context.Context, before time.Time, limit int) ([]*contract.ContractAggregate, error) {
+	sql := `SELECT id FROM contract_read_models
+		 WHERE trial_end_date IS NOT NULL AND trial_end_date < $1 AND status = 'trialing'
+		 ORDER BY trial_end_date ASC, id ASC`
+	args := []any{before}
+	if limit > 0 {
+		sql += ` LIMIT $2`
+		args = append(args, limit)
+	}
+	return r.findManyFromReadModel(ctx, sql, args...)
 }
 
 func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared.ContractID, asOf time.Time) (*contract.ContractAggregate, error) {
@@ -156,10 +167,23 @@ func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared
 	return agg, nil
 }
 
-func (r *PostgresContractRepository) FindDueForRenewal(ctx context.Context, asOf time.Time) ([]*contract.ContractAggregate, error) {
-	return r.findManyFromReadModel(ctx,
-		`SELECT id FROM contract_read_models
-		 WHERE renewal_date IS NOT NULL AND renewal_date <= $1 AND status = 'active'`, asOf)
+// FindDueForRenewal returns active contracts whose renewal_date is on or before
+// asOf.
+//
+// limit bounds the number of rows returned (core#197): a positive limit returns
+// at most that many, oldest-due-first (ORDER BY renewal_date ASC) so repeated
+// batch runs drain the backlog deterministically; a limit <= 0 means "no limit".
+// id is a stable tiebreaker for rows sharing a renewal_date.
+func (r *PostgresContractRepository) FindDueForRenewal(ctx context.Context, asOf time.Time, limit int) ([]*contract.ContractAggregate, error) {
+	sql := `SELECT id FROM contract_read_models
+		 WHERE renewal_date IS NOT NULL AND renewal_date <= $1 AND status = 'active'
+		 ORDER BY renewal_date ASC, id ASC`
+	args := []any{asOf}
+	if limit > 0 {
+		sql += ` LIMIT $2`
+		args = append(args, limit)
+	}
+	return r.findManyFromReadModel(ctx, sql, args...)
 }
 
 func (r *PostgresContractRepository) findManyFromReadModel(ctx context.Context, sql string, args ...any) ([]*contract.ContractAggregate, error) {

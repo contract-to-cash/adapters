@@ -313,9 +313,37 @@ verification level differs:
 
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
-dependency. The pin currently tracks core `main` at commit `82c7cfb`
-(pseudo-version `v0.1.1-0.20260711062854-82c7cfb3dd7b`), which absorbs the
-following core contract changes:
+dependency. The pin currently tracks core `main` at merge commit `6e621a1`
+(pseudo-version `v0.1.1-0.20260711071315-6e621a1b0d6b`), which absorbs the
+following core contract changes.
+
+Round 2 (core#196 / core#197, merge `6e621a1`):
+
+- **batch finder `limit` parameter (core#197)**: `contract.Repository.FindDueForRenewal`
+  / `FindTrialsEndingBefore` and `balance.Repository.FindExpired` gained a
+  trailing `limit int` argument. A positive limit returns at most that many rows,
+  **oldest-eligible first** (`ORDER BY renewal_date` / `trial_end_date` /
+  `created_at` ASC, with `id` as a stable tiebreaker) so repeated batch runs drain
+  the backlog deterministically; `limit <= 0` means unbounded. Both postgres and
+  mysql repos translate a positive limit to a `LIMIT ?`/`LIMIT $n` clause and add
+  the `ORDER BY` that makes "oldest first" genuine.
+- **`pricing.NewPrice`/`NewPriceWithInterval` now return `(*Price, error)`
+  (core#196)**: they validate negative amount, amount/declared-currency mismatch,
+  zero interval, and unknown billing cycle (strict). **No adapter code changes
+  were required**: the price repos reconstruct persisted rows through the
+  adapter-sanctioned `pricing.FromSnapshot` (the `ToSnapshot`/`FromSnapshot`
+  danger-zone API), not the validating constructor. `FromSnapshot` deliberately
+  bypasses business-rule re-validation (it only rejects an empty ID), which is the
+  correct load-path behaviour: a persisted Price is immutable and was validated at
+  its original construction, so reconstruction should be faithful rather than
+  re-run rules against historical rows. `FromSnapshot`'s error is already wrapped
+  as a scan/reconstruct error in `scanPriceRow`/`scanPriceRows`.
+- **`FindByID` not-found convention (core#197)**: the contract/invoice/payment/
+  credit-note/product repos already return a `shared.DomainError` with
+  `ErrCodeNotFound` on a missing row (never `(nil, nil)`), so no change was needed;
+  verified against the newly documented interface contracts.
+
+Round 1 (`82c7cfb`, `v0.1.1-0.20260711062854-82c7cfb3dd7b`):
 
 - **payment optimistic locking (core#190)**: `payment.Payment` now carries
   `Version()`/`LoadedVersion()`/`SetVersion()` and `payment.Repository.Save` must

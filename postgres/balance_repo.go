@@ -257,11 +257,25 @@ func (r *PostgresBalanceRepository) FindRefundsByInvoice(ctx context.Context, in
 //     still counts as forfeitable credit (same #11 filtering as FindAvailable).
 //   - Scanned across all accounts/currencies (the batch is global), ordered by
 //     created_at ASC for deterministic processing.
-func (r *PostgresBalanceRepository) FindExpired(ctx context.Context, asOf time.Time) ([]*balance.BalanceEntry, error) {
-	rows, err := r.q(ctx).Query(ctx,
-		selectBalanceEntrySQL+`
+//
+// FindExpired returns non-consumed entries whose expiry has passed as of asOf,
+// oldest-created first (ORDER BY created_at ASC) per the core#159 batch contract.
+//
+// limit bounds the number of rows returned (core#197): a positive limit returns
+// at most that many so repeated batch runs drain the expired backlog
+// deterministically; a limit <= 0 means "no limit". Note the SQL LIMIT is applied
+// before the post-scan filterExpiredBalance guard, which is consistent because
+// the WHERE clause already selects the expired set the guard re-checks.
+func (r *PostgresBalanceRepository) FindExpired(ctx context.Context, asOf time.Time, limit int) ([]*balance.BalanceEntry, error) {
+	sql := selectBalanceEntrySQL + `
 		 WHERE expires_at IS NOT NULL AND expires_at < $1
-		 ORDER BY created_at ASC`, asOf)
+		 ORDER BY created_at ASC, id ASC`
+	args := []any{asOf}
+	if limit > 0 {
+		sql += ` LIMIT $2`
+		args = append(args, limit)
+	}
+	rows, err := r.q(ctx).Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("find expired balance: %w", err)
 	}

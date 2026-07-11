@@ -164,16 +164,47 @@ func TestBalanceRepo_FindExpired(t *testing.T) {
 		"promo", "", "", "", expiredAt, 0, fixedTime, nil,
 	)
 
-	mock.ExpectQuery(`SELECT .* FROM balance_entries WHERE expires_at IS NOT NULL AND expires_at < \? ORDER BY created_at ASC`).
+	mock.ExpectQuery(`SELECT .* FROM balance_entries WHERE expires_at IS NOT NULL AND expires_at < \? ORDER BY created_at ASC, id ASC`).
 		WithArgs(asOf.UTC()).
 		WillReturnRows(rows)
 
-	got, err := repo.FindExpired(context.Background(), asOf)
+	got, err := repo.FindExpired(context.Background(), asOf, 0) // 0 = unbounded
 	if err != nil {
 		t.Fatalf("FindExpired: %v", err)
 	}
 	if len(got) != 1 || got[0].ToSnapshot().ID != "bal-live" {
 		t.Fatalf("expected only the non-consumed expired entry bal-live, got %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// FindExpired with a positive limit appends LIMIT ? and binds the limit arg
+// after asOf (core#197).
+func TestBalanceRepo_FindExpired_Limit(t *testing.T) {
+	repo, mock := newBalanceRepo(t)
+	asOf := fixedTime
+	expiredAt := fixedTime.Add(-time.Hour)
+
+	rows := sqlmock.NewRows([]string{
+		"id", "account_id", "original_amount", "remaining_amount", "currency",
+		"reason", "source_type", "source_id", "description", "expires_at", "version", "created_at", "state",
+	}).AddRow(
+		"bal-live", "acct-1", int64(1000), int64(400), "JPY",
+		"promo", "", "", "", expiredAt, 0, fixedTime, nil,
+	)
+
+	mock.ExpectQuery(`SELECT .* FROM balance_entries WHERE expires_at IS NOT NULL AND expires_at < \? ORDER BY created_at ASC, id ASC LIMIT \?`).
+		WithArgs(asOf.UTC(), 1).
+		WillReturnRows(rows)
+
+	got, err := repo.FindExpired(context.Background(), asOf, 1)
+	if err != nil {
+		t.Fatalf("FindExpired(limit=1): %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "bal-live" {
+		t.Fatalf("expected the single bal-live entry, got %+v", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

@@ -213,12 +213,21 @@ func TestIntegration_BalanceRepo_FindExpired(t *testing.T) {
 	mk("live", 900, &future, 4*time.Hour)
 	mk("no-expiry", 900, nil, 5*time.Hour)
 
-	got, err := repo.FindExpired(ctx, asOf)
+	got, err := repo.FindExpired(ctx, asOf, 0) // 0 = unbounded
 	if err != nil {
 		t.Fatalf("FindExpired: %v", err)
 	}
 	if len(got) != 2 || got[0].ToSnapshot().ID != "exp-old" || got[1].ToSnapshot().ID != "exp-new" {
 		t.Fatalf("expected [exp-old exp-new], got %+v", got)
+	}
+
+	// limit bounds the result to the oldest-created eligible entry (core#197).
+	limited, err := repo.FindExpired(ctx, asOf, 1)
+	if err != nil {
+		t.Fatalf("FindExpired(limit=1): %v", err)
+	}
+	if len(limited) != 1 || limited[0].ToSnapshot().ID != "exp-old" {
+		t.Fatalf("expected [exp-old] with limit=1, got %+v", limited)
 	}
 }
 

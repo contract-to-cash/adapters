@@ -267,11 +267,25 @@ func (r *MySQLBalanceRepository) FindRefundsByInvoice(ctx context.Context, invoi
 //     still counts as forfeitable credit (same #11 filtering as FindAvailable).
 //   - Scanned across all accounts/currencies (the batch is global), ordered by
 //     created_at ASC for deterministic processing.
-func (r *MySQLBalanceRepository) FindExpired(ctx context.Context, asOf time.Time) ([]*balance.BalanceEntry, error) {
-	rows, err := r.q(ctx).QueryContext(ctx,
-		selectBalanceEntrySQL+`
+//
+// FindExpired returns non-consumed entries whose expiry has passed as of asOf,
+// oldest-created first (ORDER BY created_at ASC) per the core#159 batch contract.
+//
+// limit bounds the number of rows returned (core#197): a positive limit returns
+// at most that many so repeated batch runs drain the expired backlog
+// deterministically; a limit <= 0 means "no limit". The SQL LIMIT is applied
+// before the post-scan filterExpiredBalance guard, which is consistent because
+// the WHERE clause already selects the expired set the guard re-checks.
+func (r *MySQLBalanceRepository) FindExpired(ctx context.Context, asOf time.Time, limit int) ([]*balance.BalanceEntry, error) {
+	query := selectBalanceEntrySQL + `
 		 WHERE expires_at IS NOT NULL AND expires_at < ?
-		 ORDER BY created_at ASC`, asOf.UTC())
+		 ORDER BY created_at ASC, id ASC`
+	args := []any{asOf.UTC()}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := r.q(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("find expired balance: %w", err)
 	}

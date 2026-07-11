@@ -107,10 +107,23 @@ func (r *MySQLContractRepository) FindExpiring(ctx context.Context, before time.
 // strictly before the given time (renamed from FindTrialsEndingSoon to match
 // core#162 B4; the batch calls it with `now` to find trials that have ALREADY
 // ended).
-func (r *MySQLContractRepository) FindTrialsEndingBefore(ctx context.Context, before time.Time) ([]*contract.ContractAggregate, error) {
-	return r.findManyFromReadModel(ctx,
-		`SELECT id FROM contract_read_models
-		 WHERE trial_end_date IS NOT NULL AND trial_end_date < ? AND status = 'trialing'`, before.UTC())
+// FindTrialsEndingBefore returns trialing contracts whose trial_end_date is
+// strictly before the given time.
+//
+// limit bounds the number of rows returned (core#197): a positive limit returns
+// at most that many, oldest-ending-first (ORDER BY trial_end_date ASC) so
+// repeated batch runs drain the backlog deterministically; a limit <= 0 means
+// "no limit". id is a stable tiebreaker for rows sharing a trial_end_date.
+func (r *MySQLContractRepository) FindTrialsEndingBefore(ctx context.Context, before time.Time, limit int) ([]*contract.ContractAggregate, error) {
+	query := `SELECT id FROM contract_read_models
+		 WHERE trial_end_date IS NOT NULL AND trial_end_date < ? AND status = 'trialing'
+		 ORDER BY trial_end_date ASC, id ASC`
+	args := []any{before.UTC()}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	return r.findManyFromReadModel(ctx, query, args...)
 }
 
 func (r *MySQLContractRepository) FindByIDAsOf(ctx context.Context, id shared.ContractID, asOf time.Time) (*contract.ContractAggregate, error) {
@@ -156,10 +169,23 @@ func (r *MySQLContractRepository) FindByIDAsOf(ctx context.Context, id shared.Co
 	return agg, nil
 }
 
-func (r *MySQLContractRepository) FindDueForRenewal(ctx context.Context, asOf time.Time) ([]*contract.ContractAggregate, error) {
-	return r.findManyFromReadModel(ctx,
-		`SELECT id FROM contract_read_models
-		 WHERE renewal_date IS NOT NULL AND renewal_date <= ? AND status = 'active'`, asOf.UTC())
+// FindDueForRenewal returns active contracts whose renewal_date is on or before
+// asOf.
+//
+// limit bounds the number of rows returned (core#197): a positive limit returns
+// at most that many, oldest-due-first (ORDER BY renewal_date ASC) so repeated
+// batch runs drain the backlog deterministically; a limit <= 0 means "no limit".
+// id is a stable tiebreaker for rows sharing a renewal_date.
+func (r *MySQLContractRepository) FindDueForRenewal(ctx context.Context, asOf time.Time, limit int) ([]*contract.ContractAggregate, error) {
+	query := `SELECT id FROM contract_read_models
+		 WHERE renewal_date IS NOT NULL AND renewal_date <= ? AND status = 'active'
+		 ORDER BY renewal_date ASC, id ASC`
+	args := []any{asOf.UTC()}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	return r.findManyFromReadModel(ctx, query, args...)
 }
 
 func (r *MySQLContractRepository) findManyFromReadModel(ctx context.Context, query string, args ...any) ([]*contract.ContractAggregate, error) {
