@@ -12,8 +12,10 @@ module provides production-oriented implementations of those interfaces.
 postgres/   PostgreSQL implementation of the full persistence stack
             (event store, all repositories, read-model projectors, tx manager)
 mysql/      MySQL 8.0 implementation of the same full persistence stack
-fincode/    fincode payment gateway adapter (port.PaymentGateway / webhooks)
-stripe/     Stripe payment gateway adapter (port.PaymentGateway / webhooks)
+fincode/    fincode payment gateway adapter
+            (port.PaymentGateway / port.CustomerGateway / webhooks)
+stripe/     Stripe payment gateway adapter
+            (port.PaymentGateway / port.CustomerGateway / webhooks)
 ```
 
 ## Coverage
@@ -35,7 +37,7 @@ Testing section for the difference in how each is verified).
 | `tx.TxManager` | ✅ | ✅ | — | — |
 | `projection.Projector` (contract + invoice) | ✅ | ✅ | — | — |
 | `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card; JPY/USD/EUR) |
-| `port.CustomerGateway` | — | — | — | ✅ |
+| `port.CustomerGateway` | — | — | ✅ | ✅ |
 | `port.WebhookHandler` | — | — | ✅ | ✅ |
 
 Event store semantics follow the core reference implementation
@@ -80,6 +82,19 @@ remainder still counts as forfeitable credit.
 - **IDs**: the port-level `TransactionID` / `AuthorizationID` is the fincode
   payment (order) ID; the adapter re-fetches `access_id` internally. Payment
   method IDs are composite `"<customer_id>/<card_id>"`.
+- **Customers**: the same `Gateway` implements `port.CustomerGateway`. Unlike
+  Stripe, fincode lets the caller choose the customer ID, so
+  `CreateCustomerRequest.InternalID` is sent as the fincode customer `id`
+  directly (no metadata round-trip; the returned `Customer.ID` *is* the
+  InternalID). fincode customers have no metadata or description fields:
+  non-empty `Metadata` / `Description` is rejected with a `*ValidationError`
+  rather than silently dropped. `Address.Country` maps to fincode's
+  `addr_country`, which is ISO 3166-1 **numeric** (e.g. `"392"` for Japan) and
+  is passed through unmodified. `Phone` maps to `phone_no`; `phone_cc` is never
+  set. `Customer.DefaultPaymentMethodID` is resolved via a second `ListCards`
+  call when the customer response reports `card_registration == "1"` (the
+  composite ID of the card with `default_flag == "1"`, nil if none); missing
+  customers surface as `port.GatewayError` with code `customer_not_found`.
 - **Idempotency**: when `IdempotencyKey` is set on Charge/Authorize, the
   fincode order ID is derived deterministically from the key
   (`"o" + base32(sha256(key))[:29]`, lowercase), so a retry re-registers the

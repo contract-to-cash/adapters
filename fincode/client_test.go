@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -489,4 +490,155 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+// --- Customer / card update client methods ---
+
+func TestClient_CreateCustomer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/customers" {
+			t.Errorf("path = %s, want /v1/customers", r.URL.Path)
+		}
+		var req CreateCustomerRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.ID != "cust_custom_1" {
+			t.Errorf("id = %q, want cust_custom_1", req.ID)
+		}
+		if req.Name != "Alice" {
+			t.Errorf("name = %q, want Alice", req.Name)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CustomerResponse{
+			ID: "cust_custom_1", Name: "Alice", Created: "2026/06/01 12:00:00.000",
+		})
+	}))
+	defer srv.Close()
+
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	resp, err := client.CreateCustomer(context.Background(), &CreateCustomerRequest{
+		ID: "cust_custom_1", Name: "Alice",
+	})
+	if err != nil {
+		t.Fatalf("CreateCustomer: %v", err)
+	}
+	if resp.ID != "cust_custom_1" {
+		t.Errorf("ID = %q, want cust_custom_1", resp.ID)
+	}
+}
+
+func TestClient_UpdateCustomer(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+		}
+		if r.URL.Path != "/v1/customers/cust_1" {
+			t.Errorf("path = %s, want /v1/customers/cust_1", r.URL.Path)
+		}
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CustomerResponse{ID: "cust_1", Name: "Bob"})
+	}))
+	defer srv.Close()
+
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	name := "Bob"
+	resp, err := client.UpdateCustomer(context.Background(), "cust_1", &UpdateCustomerRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("UpdateCustomer: %v", err)
+	}
+	if resp.Name != "Bob" {
+		t.Errorf("Name = %q, want Bob", resp.Name)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(gotBody, &raw); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	if _, ok := raw["email"]; ok {
+		t.Errorf("request body should not contain email, got %v", raw)
+	}
+	if got, ok := raw["name"]; !ok || got != "Bob" {
+		t.Errorf("request body name = %v, want Bob", raw["name"])
+	}
+}
+
+func TestClient_RetrieveCustomer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/customers/cust_1" {
+			t.Errorf("path = %s, want /v1/customers/cust_1", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CustomerResponse{ID: "cust_1", Email: "a@example.com"})
+	}))
+	defer srv.Close()
+
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	resp, err := client.RetrieveCustomer(context.Background(), "cust_1")
+	if err != nil {
+		t.Fatalf("RetrieveCustomer: %v", err)
+	}
+	if resp.Email != "a@example.com" {
+		t.Errorf("Email = %q, want a@example.com", resp.Email)
+	}
+}
+
+func TestClient_DeleteCustomer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+		}
+		if r.URL.Path != "/v1/customers/cust_1" {
+			t.Errorf("path = %s, want /v1/customers/cust_1", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(DeleteCustomerResponse{ID: "cust_1", DeleteFlag: "1"})
+	}))
+	defer srv.Close()
+
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	resp, err := client.DeleteCustomer(context.Background(), "cust_1")
+	if err != nil {
+		t.Fatalf("DeleteCustomer: %v", err)
+	}
+	if resp.DeleteFlag != "1" {
+		t.Errorf("DeleteFlag = %q, want 1", resp.DeleteFlag)
+	}
+}
+
+func TestClient_UpdateCard(t *testing.T) {
+	var gotReq UpdateCardRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+		}
+		if r.URL.Path != "/v1/customers/cust_1/cards/card_1" {
+			t.Errorf("path = %s, want /v1/customers/cust_1/cards/card_1", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CardResponse{
+			CustomerID: "cust_1", ID: "card_1", DefaultFlag: gotReq.DefaultFlag,
+		})
+	}))
+	defer srv.Close()
+
+	client := mustNewClient(Config{APIKey: "sk", BaseURL: srv.URL})
+	resp, err := client.UpdateCard(context.Background(), "cust_1", "card_1", &UpdateCardRequest{DefaultFlag: "1"})
+	if err != nil {
+		t.Fatalf("UpdateCard: %v", err)
+	}
+	if resp.DefaultFlag != "1" {
+		t.Errorf("DefaultFlag = %q, want 1", resp.DefaultFlag)
+	}
+	if gotReq.DefaultFlag != "1" {
+		t.Errorf("request default_flag = %q, want 1", gotReq.DefaultFlag)
+	}
 }
