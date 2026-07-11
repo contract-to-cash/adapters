@@ -314,7 +314,7 @@ verification level differs:
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
 dependency. The pin currently tracks core `main` at merge commit `6e621a1`
-(pseudo-version `v0.1.1-0.20260711071315-6e621a1b0d6b`), which absorbs the
+(pseudo-version `v0.2.0`), which absorbs the
 following core contract changes.
 
 Round 2 (core#196 / core#197, merge `6e621a1`):
