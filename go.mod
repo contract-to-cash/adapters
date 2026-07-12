@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
-	github.com/contract-to-cash/core v0.2.0
+	github.com/contract-to-cash/core v0.3.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/jackc/pgx/v5 v5.7.2
 	github.com/stripe/stripe-go/v82 v82.5.1

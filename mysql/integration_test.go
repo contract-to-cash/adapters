@@ -17,6 +17,8 @@ import (
 	"github.com/contract-to-cash/core/domain/balance"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/payment"
+	"github.com/contract-to-cash/core/domain/pricing"
+	"github.com/contract-to-cash/core/domain/product"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/domain/usage"
 	"github.com/contract-to-cash/core/eventstore"
@@ -791,6 +793,94 @@ func TestIntegration_PaymentRepo_DuplicateIdempotencyKey(t *testing.T) {
 	}
 	if reloaded.ToSnapshot().Status != payment.PaymentStatusRefunded {
 		t.Errorf("status = %q, want refunded", reloaded.ToSnapshot().Status)
+	}
+}
+
+// Issue #58: price metadata must round-trip through the real JSON column. This
+// is exactly what sqlmock cannot catch — migration 014's expression default
+// (DEFAULT (JSON_OBJECT())) has to be accepted by real MySQL 8, and the
+// driver-level []byte binding against the JSON column has to persist and read
+// back — so the whole "metadata silently dropped" regression gets a live test.
+func TestIntegration_PriceRepo_MetadataRoundTrip(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	ctx := context.Background()
+
+	// Parent product first: prices has an FK to products.
+	prodRepo := mysql.NewProductRepository(db)
+	prod, err := product.FromSnapshot(product.ProductSnapshot{
+		ID: "prod-price-meta", Name: "Product", Status: product.ProductStatusActive,
+		CreatedAt: integrationClock.Now(),
+	})
+	if err != nil {
+		t.Fatalf("product.FromSnapshot: %v", err)
+	}
+	if err := prodRepo.Save(ctx, prod); err != nil {
+		t.Fatalf("save product: %v", err)
+	}
+
+	repo := mysql.NewPriceRepository(db)
+	snap := pricing.PriceSnapshot{
+		ID: "price-meta", ProductID: "prod-price-meta",
+		Amount: jpy(1000), Currency: "JPY",
+		Status:       pricing.PriceStatusActive,
+		PricingModel: pricing.FlatPrice{Price: jpy(1000)},
+		Metadata:     map[string]string{"tier": "gold", "region": "jp"},
+		CreatedAt:    integrationClock.Now(),
+	}
+	price, err := pricing.FromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("pricing.FromSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, price); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	found, err := repo.FindByID(ctx, "price-meta")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if md := found.Metadata(); md["tier"] != "gold" || md["region"] != "jp" || len(md) != 2 {
+		t.Errorf("Metadata = %v, want map[region:jp tier:gold]", md)
+	}
+
+	// Re-save with changed metadata: the ON DUPLICATE KEY UPDATE branch must
+	// persist the change.
+	snap.Metadata = map[string]string{"tier": "silver"}
+	updated, err := pricing.FromSnapshot(snap)
+	if err != nil {
+		t.Fatalf("pricing.FromSnapshot (updated): %v", err)
+	}
+	if err := repo.Save(ctx, updated); err != nil {
+		t.Fatalf("re-Save: %v", err)
+	}
+	found, err = repo.FindByID(ctx, "price-meta")
+	if err != nil {
+		t.Fatalf("FindByID after upsert: %v", err)
+	}
+	if md := found.Metadata(); md["tier"] != "silver" || len(md) != 1 {
+		t.Errorf("Metadata after upsert = %v, want map[tier:silver]", md)
+	}
+
+	// A price saved without metadata round-trips as empty metadata, no error.
+	noMeta, err := pricing.FromSnapshot(pricing.PriceSnapshot{
+		ID: "price-no-meta", ProductID: "prod-price-meta",
+		Amount: jpy(500), Currency: "JPY",
+		Status:       pricing.PriceStatusActive,
+		PricingModel: pricing.FlatPrice{Price: jpy(500)},
+		CreatedAt:    integrationClock.Now(),
+	})
+	if err != nil {
+		t.Fatalf("pricing.FromSnapshot (no metadata): %v", err)
+	}
+	if err := repo.Save(ctx, noMeta); err != nil {
+		t.Fatalf("Save without metadata: %v", err)
+	}
+	found, err = repo.FindByID(ctx, "price-no-meta")
+	if err != nil {
+		t.Fatalf("FindByID without metadata: %v", err)
+	}
+	if md := found.Metadata(); len(md) != 0 {
+		t.Errorf("Metadata without WithMetadata = %v, want empty", md)
 	}
 }
 

@@ -167,9 +167,9 @@ func TestPriceRepo_MoneyRoundTrip_Fraction(t *testing.T) {
 		t.Fatalf("marshal state: %v", err)
 	}
 
-	row := sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state"}).
+	row := sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state", "metadata"}).
 		AddRow("price-frac", "prod-1", int64(100), "JPY",
-			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"403/4","currency":"JPY"}}}`), "active", fixedTime, state)
+			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"403/4","currency":"JPY"}}}`), "active", fixedTime, state, []byte(`{}`))
 
 	repo, mock := newPriceRepo(t)
 	mock.ExpectQuery(`SELECT .* FROM prices WHERE id = \?`).
@@ -197,7 +197,7 @@ func TestPriceRepo_MoneyRoundTrip_Fraction(t *testing.T) {
 	}
 	mock.ExpectExec(`INSERT INTO prices .* ON DUPLICATE KEY UPDATE`).
 		WithArgs("price-frac", "prod-1", int64(100), "JPY", "",
-			sqlmock.AnyArg(), sqlmock.AnyArg(), "active", state, fixedTime).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), "active", state, []byte(`{}`), fixedTime).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := repo.Save(context.Background(), p); err != nil {
 		t.Fatalf("Save: %v", err)

@@ -134,15 +134,27 @@ func (r *MySQLPriceRepository) Save(ctx context.Context, p *pricing.Price) error
 		return fmt.Errorf("marshal price json state: %w", err)
 	}
 
+	// A nil Metadata map (prices built without WithMetadata) marshals to JSON
+	// null, which the NOT NULL JSON_OBJECT()-defaulted column should not store;
+	// write an empty object instead.
+	metadataJSON := []byte(`{}`)
+	if s.Metadata != nil {
+		metadataJSON, err = json.Marshal(s.Metadata)
+		if err != nil {
+			return fmt.Errorf("marshal price metadata: %w", err)
+		}
+	}
+
 	_, err = r.q(ctx).ExecContext(ctx,
-		`INSERT INTO prices (id, product_id, amount, currency, billing_cycle, interval_data, pricing_model, status, state, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+		`INSERT INTO prices (id, product_id, amount, currency, billing_cycle, interval_data, pricing_model, status, state, metadata, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
 		 ON DUPLICATE KEY UPDATE
 		   amount = VALUES(amount), currency = VALUES(currency),
 		   interval_data = VALUES(interval_data), pricing_model = VALUES(pricing_model),
-		   status = VALUES(status), state = VALUES(state), updated_at = NOW(6)`,
+		   status = VALUES(status), state = VALUES(state),
+		   metadata = VALUES(metadata), updated_at = NOW(6)`,
 		string(s.ID), string(s.ProductID), s.Amount.Int64(), string(s.Currency),
-		"", intervalJSON, modelJSON, string(s.Status), jsonState, s.CreatedAt.UTC())
+		"", intervalJSON, modelJSON, string(s.Status), jsonState, metadataJSON, s.CreatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("save price: %w", err)
 	}
@@ -150,7 +162,7 @@ func (r *MySQLPriceRepository) Save(ctx context.Context, p *pricing.Price) error
 }
 
 const selectPriceSQL = `
-	SELECT id, product_id, amount, currency, interval_data, pricing_model, status, created_at, state
+	SELECT id, product_id, amount, currency, interval_data, pricing_model, status, created_at, state, metadata
 	FROM prices`
 
 func scanPriceRow(row *sql.Row, id shared.PriceID) (*pricing.Price, error) {
@@ -188,9 +200,9 @@ func scanPriceSnapshot(t scanTarget) (pricing.PriceSnapshot, error) {
 		currency, status              string
 		intervalJSON, pricingModelRaw json.RawMessage
 		createdAt                     utcTime
-		stateRaw                      []byte
+		stateRaw, metadataRaw         []byte
 	)
-	if err := t.Scan(&id, &productID, &amount, &currency, &intervalJSON, &pricingModelRaw, &status, &createdAt, &stateRaw); err != nil {
+	if err := t.Scan(&id, &productID, &amount, &currency, &intervalJSON, &pricingModelRaw, &status, &createdAt, &stateRaw, &metadataRaw); err != nil {
 		return pricing.PriceSnapshot{}, err
 	}
 
@@ -214,6 +226,11 @@ func scanPriceSnapshot(t scanTarget) (pricing.PriceSnapshot, error) {
 	if len(intervalJSON) > 0 {
 		if err := json.Unmarshal(intervalJSON, &s.Interval); err != nil {
 			return pricing.PriceSnapshot{}, fmt.Errorf("unmarshal price interval for %s: %w", id, err)
+		}
+	}
+	if len(metadataRaw) > 0 {
+		if err := json.Unmarshal(metadataRaw, &s.Metadata); err != nil {
+			return pricing.PriceSnapshot{}, fmt.Errorf("unmarshal price metadata for %s: %w", id, err)
 		}
 	}
 	model, err := unmarshalPricingModel(pricingModelRaw)

@@ -35,6 +35,7 @@ func samplePrice(t *testing.T) *pricing.Price {
 		Currency:     "JPY",
 		Status:       pricing.PriceStatusActive,
 		PricingModel: pricing.FlatPrice{Price: jpy(1000)},
+		Metadata:     map[string]string{"tier": "gold"},
 		CreatedAt:    fixedTime,
 	})
 	if err != nil {
@@ -44,9 +45,10 @@ func samplePrice(t *testing.T) *pricing.Price {
 }
 
 func priceRow() *sqlmock.Rows {
-	return sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state"}).
+	return sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state", "metadata"}).
 		AddRow("price-1", "prod-1", int64(1000), "JPY",
-			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"1000","currency":"JPY"}}}`), "active", fixedTime, nil)
+			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"1000","currency":"JPY"}}}`), "active", fixedTime, nil,
+			[]byte(`{"tier":"gold"}`))
 }
 
 func TestPriceRepo_Save_Upsert(t *testing.T) {
@@ -55,7 +57,8 @@ func TestPriceRepo_Save_Upsert(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO prices .* ON DUPLICATE KEY UPDATE`).
 		WithArgs("price-1", "prod-1", int64(1000), "JPY", "",
-			sqlmock.AnyArg(), sqlmock.AnyArg(), "active", sqlmock.AnyArg(), fixedTime).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), "active", sqlmock.AnyArg(),
+			[]byte(`{"tier":"gold"}`), fixedTime).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), p); err != nil {
@@ -85,6 +88,27 @@ func TestPriceRepo_FindByID_Found(t *testing.T) {
 	}
 	if _, ok := s.PricingModel.(pricing.FlatPrice); !ok {
 		t.Errorf("PricingModel type = %T, want pricing.FlatPrice", s.PricingModel)
+	}
+	if md := got.Metadata(); md["tier"] != "gold" || len(md) != 1 {
+		t.Errorf("Metadata = %v, want map[tier:gold]", md)
+	}
+}
+
+func TestPriceRepo_FindByID_NilMetadata(t *testing.T) {
+	repo, mock := newPriceRepo(t)
+	rows := sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state", "metadata"}).
+		AddRow("price-1", "prod-1", int64(1000), "JPY",
+			[]byte(`{}`), []byte(`{"kind":"flat","flat":{"Price":{"amount":"1000","currency":"JPY"}}}`), "active", fixedTime, nil, nil)
+	mock.ExpectQuery(`SELECT .* FROM prices WHERE id = \?`).
+		WithArgs("price-1").
+		WillReturnRows(rows)
+
+	got, err := repo.FindByID(context.Background(), "price-1")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if md := got.Metadata(); len(md) != 0 {
+		t.Errorf("Metadata = %v, want empty", md)
 	}
 }
 
