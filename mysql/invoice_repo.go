@@ -356,8 +356,19 @@ func (r *MySQLInvoiceRepository) FindByContractAndStatus(ctx context.Context, co
 }
 
 func (r *MySQLInvoiceRepository) FindByContractAndPeriod(ctx context.Context, contractID shared.ContractID, period shared.DateRange) ([]*invoice.Invoice, error) {
+	// Match on billing-period EQUALITY (start AND end), mirroring the core
+	// in-memory reference (infrastructure/inmemory/invoice_repository.go): an
+	// invoice belongs to the queried period iff its stored billing_period_from /
+	// billing_period_to equal the query period's start / end. Matching on
+	// issue_date instead is wrong — an arrears invoice for June issued on July 1
+	// has an issue_date OUTSIDE June, so it would be missed by the duplicate
+	// pre-check and the RegenerateInvoice voided-original lookup, and an
+	// unrelated invoice merely issued within the window would be falsely returned.
+	// billing_period_from/to are stored in UTC (see saveOn), so the query bounds
+	// are normalised to UTC for exact DATETIME(6) equality. Zero-period invoices
+	// store NULL and never match a non-zero query period.
 	rows, err := r.q(ctx).QueryContext(ctx,
-		selectInvoiceSQL+` WHERE contract_id = ? AND issue_date >= ? AND issue_date < ? ORDER BY issue_date ASC`,
+		selectInvoiceSQL+` WHERE contract_id = ? AND billing_period_from = ? AND billing_period_to = ? ORDER BY issue_date ASC`,
 		string(contractID), period.Start().UTC(), period.End().UTC())
 	if err != nil {
 		return nil, fmt.Errorf("find invoices by contract and period: %w", err)

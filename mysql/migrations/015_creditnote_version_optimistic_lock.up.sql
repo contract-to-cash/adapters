@@ -1,0 +1,33 @@
+-- 015: credit note optimistic-locking version column
+-- (issue adapters#30 / core#147). MySQL mirror of
+-- postgres/migrations/016_creditnote_version_optimistic_lock.up.sql.
+--
+-- Background. core#147 documents an optimistic-locking contract on
+-- invoice.CreditNoteRepository.Save: the CreditNote entity carries
+-- Version()/LoadedVersion()/SetVersion() like invoice.Invoice and
+-- payment.Payment, and every mutating transition (Issue, Apply, Refund, Void)
+-- bumps Version(). Save MUST reject a write whose stored version no longer
+-- matches the credit note's LoadedVersion, so a concurrent ApplyCreditNote vs
+-- RefundCreditNote on the same issued note cannot both persist last-writer-wins.
+--
+-- MySQL's INSERT ... ON DUPLICATE KEY UPDATE has no WHERE clause, so a
+-- single-statement version-guarded upsert is not possible. creditnote_repo.go
+-- attempts a plain INSERT and, on a PRIMARY-key duplicate, falls back to a
+-- version-guarded UPDATE ... WHERE id = ? AND lock_version = LoadedVersion();
+-- RowsAffected()==0 there is reported as tx.ErrVersionConflict. updated_at =
+-- NOW(6) always changes on a matching row, so the changed-rows count is 1 on a
+-- real match and 0 only on a genuine version miss — no spurious conflict on a
+-- no-op re-save. Mirrors the payments.lock_version column (migration 012) and
+-- invoices.lock_version (migration 010).
+--
+-- Backfill convergence (why DEFAULT 0 is safe). Existing rows get lock_version
+-- 0. CreditNoteFromSnapshot restores both version and loadedVersion from this
+-- column, so the first load after deploy makes 0 the loaded baseline; the next
+-- transition bumps it to 1 and the guarded UPDATE (WHERE lock_version = 0)
+-- matches. A brand-new credit note INSERTs, keyed off the PRIMARY-key collision,
+-- never off the lock_version value.
+--
+-- Forward-only runner (no .down files); a mid-file failure is caught by the
+-- 'pending' status marker.
+ALTER TABLE credit_notes
+    ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;

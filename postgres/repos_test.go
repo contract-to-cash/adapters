@@ -1288,3 +1288,142 @@ func TestContractProjector_Rebuild(t *testing.T) {
 		t.Error("checkpoint should be > 0 after rebuild")
 	}
 }
+
+// Finding 5 / core#149: FindByContractAndPeriod matches on billing-period
+// EQUALITY, not on issue_date. An arrears invoice for June issued on July 1
+// (issue_date OUTSIDE the June period) must still be found by
+// FindByContractAndPeriod(June) — otherwise the BillingService duplicate
+// pre-check and the RegenerateInvoice voided-original lookup silently miss it.
+// Conversely, an unrelated invoice for a DIFFERENT period whose issue_date falls
+// WITHIN the queried June window must NOT be returned.
+func TestInvoiceRepo_FindByContractAndPeriod_MatchesBillingPeriodNotIssueDate(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-per', 'acc-per', 'active')`); err != nil {
+		t.Fatal(err)
+	}
+	repo := postgres.NewInvoiceRepository(pool)
+
+	june, err := shared.NewDateRange(
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("june range: %v", err)
+	}
+	may, err := shared.NewDateRange(
+		time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("may range: %v", err)
+	}
+
+	mk := func(id string, period shared.DateRange, issueDate time.Time) *invoice.Invoice {
+		t.Helper()
+		inv, err := invoice.InvoiceFromSnapshot(invoice.InvoiceSnapshot{
+			ID: shared.InvoiceID(id), AccountID: "acc-per", ContractID: "c-per",
+			Status: invoice.InvoiceStatusFinalized, Subtotal: jpy(1000), TaxAmount: jpy(0),
+			DiscountAmount: jpy(0), Total: jpy(1000), AppliedBalance: jpy(0), AmountDue: jpy(1000),
+			PaidAmount: jpy(0), Balance: jpy(1000), BillingPeriod: period, IssueDate: issueDate,
+		})
+		if err != nil {
+			t.Fatalf("build %s: %v", id, err)
+		}
+		return inv
+	}
+
+	// Arrears June invoice, issued July 1 (issue_date OUTSIDE the June period).
+	if err := repo.Save(ctx, mk("inv-june", june, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))); err != nil {
+		t.Fatalf("save june invoice: %v", err)
+	}
+	// Unrelated May invoice, issued June 15 (issue_date INSIDE the June window
+	// the buggy issue_date query would have scanned).
+	if err := repo.Save(ctx, mk("inv-may", may, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC))); err != nil {
+		t.Fatalf("save may invoice: %v", err)
+	}
+
+	got, err := repo.FindByContractAndPeriod(ctx, "c-per", june)
+	if err != nil {
+		t.Fatalf("FindByContractAndPeriod: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 invoice for June, got %d: %+v", len(got), got)
+	}
+	if got[0].ID() != "inv-june" {
+		t.Errorf("expected inv-june (arrears, matched by billing period), got %s", got[0].ID())
+	}
+}
+
+// J1 / core#147: a concurrent ApplyCreditNote vs RefundCreditNote on the same
+// issued credit note must not both persist. Optimistic locking lets exactly one
+// Save win; the other is rejected with tx.ErrVersionConflict — otherwise the
+// account would be credited AND the gateway refunded while only one outcome is
+// booked.
+func TestCreditNoteRepo_ConcurrentApplyVsRefund_VersionConflict(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO contract_read_models (id, account_id, status) VALUES ('c-cn', 'acc-cn', 'active')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO invoices (id, account_id, contract_id, status, subtotal, tax_amount, discount_amount, total, applied_balance, amount_due, paid_amount, balance) VALUES ('inv-cn', 'acc-cn', 'c-cn', 'issued', 0, 0, 0, 0, 0, 0, 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	repo := postgres.NewCreditNoteRepository(pool)
+
+	// Seed a fresh issued credit note (persisted lock_version 0).
+	seed, err := invoice.CreditNoteFromSnapshot(invoice.CreditNoteSnapshot{
+		ID: "cn-race", Number: "CN-RACE", InvoiceID: "inv-cn", AccountID: "acc-cn", ContractID: "c-cn",
+		Status: invoice.CreditNoteStatusIssued, Reason: invoice.CreditNoteReasonOrderChange,
+		Items:    []invoice.CreditNoteItemSnapshot{{InvoiceLineItemID: "li-1", Description: "adj", Amount: jpy(1000), TaxAmount: jpy(0)}},
+		Subtotal: jpy(1000), TaxAmount: jpy(0), Total: jpy(1000),
+	})
+	if err != nil {
+		t.Fatalf("build seed: %v", err)
+	}
+	if err := repo.Save(ctx, seed); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	// Two independent loads, each observing lock_version 0.
+	opApply, err := repo.FindByID(ctx, "cn-race")
+	if err != nil {
+		t.Fatalf("load apply: %v", err)
+	}
+	opRefund, err := repo.FindByID(ctx, "cn-race")
+	if err != nil {
+		t.Fatalf("load refund: %v", err)
+	}
+
+	if err := opApply.Apply(jpy(1000)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := opRefund.Refund(jpy(1000)); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+
+	// Apply wins.
+	if err := repo.Save(ctx, opApply); err != nil {
+		t.Fatalf("Save apply should succeed: %v", err)
+	}
+	// Refund loses: its LoadedVersion (0) no longer matches the stored version.
+	if err := repo.Save(ctx, opRefund); !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("Save refund: expected tx.ErrVersionConflict, got %v", err)
+	}
+
+	// Exactly one outcome is booked: applied, not refunded.
+	got, err := repo.FindByID(ctx, "cn-race")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status() != invoice.CreditNoteStatusApplied {
+		t.Errorf("status = %s, want applied (winner persisted)", got.Status())
+	}
+	if got.RefundAmount().Int64() != 0 {
+		t.Errorf("refund_amount = %d, want 0 (loser rejected)", got.RefundAmount().Int64())
+	}
+	if got.Version() != 1 {
+		t.Errorf("persisted version = %d, want 1", got.Version())
+	}
+}

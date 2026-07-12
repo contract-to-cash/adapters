@@ -8,8 +8,10 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/shared"
+	driver "github.com/go-sql-driver/mysql"
 )
 
 func newCreditNoteRepo(t *testing.T) (*MySQLCreditNoteRepository, sqlmock.Sqlmock) {
@@ -65,26 +67,75 @@ func creditNoteFindRow(t *testing.T) *sqlmock.Rows {
 	}
 	return sqlmock.NewRows([]string{
 		"id", "number", "invoice_id", "account_id", "contract_id", "status", "reason", "memo",
-		"items", "issued_at", "created_at",
+		"items", "issued_at", "created_at", "lock_version",
 	}).AddRow(
 		"cn-1", "CN-0001", "inv-1", "acct-1", "contract-1", "issued", "order_change", "partial credit",
-		js, fixedTime, fixedTime,
+		js, fixedTime, fixedTime, int64(0),
 	)
 }
 
-func TestCreditNoteRepo_Save_Upsert(t *testing.T) {
+// A brand-new credit note INSERTs (lock_version carried directly). See issue #147.
+func TestCreditNoteRepo_Save_InsertNew(t *testing.T) {
 	repo, mock := newCreditNoteRepo(t)
 	cn := sampleCreditNote(t)
 
-	mock.ExpectExec(`INSERT INTO credit_notes .* ON DUPLICATE KEY UPDATE`).
+	mock.ExpectExec(`INSERT INTO credit_notes`).
 		WithArgs("cn-1", "CN-0001", "inv-1", "contract-1", "acct-1",
 			"issued", "order_change", "partial credit",
 			sqlmock.AnyArg(), int64(500), int64(50), int64(550),
-			int64(550), int64(0), "JPY", fixedTime).
+			int64(550), int64(0), "JPY", fixedTime, int64(0)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Save(context.Background(), cn); err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// An existing credit note (PRIMARY-key duplicate on INSERT) is routed to a
+// version-guarded UPDATE. One changed row means the guard passed. See issue #147.
+func TestCreditNoteRepo_Save_UpdateExisting(t *testing.T) {
+	repo, mock := newCreditNoteRepo(t)
+	cn := sampleCreditNote(t)
+
+	mock.ExpectExec(`INSERT INTO credit_notes`).
+		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'cn-1' for key 'credit_notes.PRIMARY'"})
+	mock.ExpectExec(`UPDATE credit_notes SET`).
+		WithArgs("CN-0001", "inv-1", "contract-1", "acct-1",
+			"issued", "order_change", "partial credit",
+			sqlmock.AnyArg(), int64(500), int64(50), int64(550),
+			int64(550), int64(0), "JPY", fixedTime, int64(0), "cn-1", int64(0)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Save(context.Background(), cn); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A concurrent writer already advanced lock_version: the guarded UPDATE changes
+// zero rows and Save must return tx.ErrVersionConflict rather than silently
+// succeeding (last-writer-wins). This is what stops a concurrent Apply-vs-Refund
+// on the same issued note from both persisting. See issue #147.
+func TestCreditNoteRepo_Save_VersionConflict(t *testing.T) {
+	repo, mock := newCreditNoteRepo(t)
+	cn := sampleCreditNote(t)
+
+	mock.ExpectExec(`INSERT INTO credit_notes`).
+		WillReturnError(&driver.MySQLError{Number: 1062, Message: "Duplicate entry 'cn-1' for key 'credit_notes.PRIMARY'"})
+	mock.ExpectExec(`UPDATE credit_notes SET`).
+		WithArgs("CN-0001", "inv-1", "contract-1", "acct-1",
+			"issued", "order_change", "partial credit",
+			sqlmock.AnyArg(), int64(500), int64(50), int64(550),
+								int64(550), int64(0), "JPY", fixedTime, int64(0), "cn-1", int64(0)).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // zero rows changed: version guard missed
+
+	if err := repo.Save(context.Background(), cn); !errors.Is(err, tx.ErrVersionConflict) {
+		t.Fatalf("expected tx.ErrVersionConflict, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
