@@ -1135,6 +1135,7 @@ func TestPriceRepo_SaveAndFindByID(t *testing.T) {
 		Amount: jpy(1000), Currency: "JPY",
 		Status:       pricing.PriceStatusActive,
 		PricingModel: pricing.FlatPrice{Price: jpy(1000)},
+		Metadata:     map[string]string{"tier": "gold", "region": "jp"},
 		CreatedAt:    time.Now().UTC().Truncate(time.Microsecond),
 	}
 	price, err := pricing.FromSnapshot(snap)
@@ -1157,6 +1158,50 @@ func TestPriceRepo_SaveAndFindByID(t *testing.T) {
 		t.Error("PricingModel is nil")
 	} else if _, ok := fs.PricingModel.(pricing.FlatPrice); !ok {
 		t.Errorf("PricingModel type = %T, want pricing.FlatPrice", fs.PricingModel)
+	}
+	if md := found.Metadata(); md["tier"] != "gold" || md["region"] != "jp" || len(md) != 2 {
+		t.Errorf("Metadata = %v, want map[region:jp tier:gold]", md)
+	}
+
+	// Upsert path: re-save the same price with changed metadata and verify the
+	// ON CONFLICT branch updates the column.
+	snap.Metadata = map[string]string{"tier": "silver"}
+	updated, err := pricing.FromSnapshot(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, updated); err != nil {
+		t.Fatalf("re-Save: %v", err)
+	}
+	found, err = repo.FindByID(ctx, "price-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md := found.Metadata(); md["tier"] != "silver" || len(md) != 1 {
+		t.Errorf("Metadata after upsert = %v, want map[tier:silver]", md)
+	}
+
+	// A price saved without metadata round-trips as empty metadata (no error).
+	noMetaSnap := pricing.PriceSnapshot{
+		ID: "price-no-meta", ProductID: "prod-price",
+		Amount: jpy(500), Currency: "JPY",
+		Status:       pricing.PriceStatusActive,
+		PricingModel: pricing.FlatPrice{Price: jpy(500)},
+		CreatedAt:    time.Now().UTC().Truncate(time.Microsecond),
+	}
+	noMeta, err := pricing.FromSnapshot(noMetaSnap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, noMeta); err != nil {
+		t.Fatalf("Save without metadata: %v", err)
+	}
+	found, err = repo.FindByID(ctx, "price-no-meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md := found.Metadata(); len(md) != 0 {
+		t.Errorf("Metadata without WithMetadata = %v, want empty", md)
 	}
 }
 

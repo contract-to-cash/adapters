@@ -1,0 +1,15 @@
+-- 015: prices.metadata column (issue adapters#58 / core#219).
+--
+-- Background. core v0.3.0's pricing.Price carries integrator-defined metadata
+-- (Metadata() map[string]string, surfaced as PriceSnapshot.Metadata). The
+-- adapter previously dropped it: Save never wrote it and reads returned a
+-- price with empty metadata. This adds a metadata column mirroring the one
+-- products already has, so the price repository can round-trip it.
+--
+-- The column defaults to '{}' so existing rows (and prices built without
+-- WithMetadata) read back as empty metadata; pricing.FromSnapshot tolerates
+-- a nil/empty map.
+--
+-- Forward-only runner (no .down files); applied files are tracked in
+-- schema_migrations, so re-running skips this file.
+ALTER TABLE prices ADD COLUMN metadata JSONB NOT NULL DEFAULT '{}';
