@@ -1,0 +1,32 @@
+-- 016: credit note optimistic-locking version column
+-- (issue adapters#30 / core#147).
+--
+-- Background. core#147 documents an optimistic-locking contract on
+-- invoice.CreditNoteRepository.Save: the CreditNote entity carries
+-- Version()/LoadedVersion()/SetVersion() like invoice.Invoice and
+-- payment.Payment, and every mutating transition (Issue, Apply, Refund, Void)
+-- bumps Version(). Save MUST reject a write whose stored version no longer
+-- matches the credit note's LoadedVersion, so a concurrent ApplyCreditNote vs
+-- RefundCreditNote on the same issued note cannot both persist last-writer-wins
+-- (crediting the account AND refunding the gateway while booking only one
+-- outcome).
+--
+-- This migration adds the lock_version column; the accompanying
+-- creditnote_repo.go change implements option 1 of the Save concurrency contract
+-- (a version-guarded upsert: ON CONFLICT (id) DO UPDATE ... WHERE
+-- credit_notes.lock_version = LoadedVersion(), reporting RowsAffected()==0 as
+-- tx.ErrVersionConflict). It mirrors the payments.lock_version column added in
+-- migration 013 and invoices.lock_version in migration 011.
+--
+-- Backfill convergence (why DEFAULT 0 is safe). Existing rows get lock_version
+-- 0. CreditNoteFromSnapshot restores both version and loadedVersion from this
+-- column, so the first load after deploy makes 0 the loaded baseline; the next
+-- transition bumps it to 1 and the guarded UPDATE (WHERE lock_version = 0)
+-- matches, advancing cleanly. A brand-new credit note (LoadedVersion 0) INSERTs,
+-- so it is never mistaken for a conflicting update — the INSERT-vs-UPDATE
+-- decision keys off row existence, never off the lock_version value.
+--
+-- Forward-only runner (no .down files); applied files are tracked in
+-- schema_migrations, so re-running skips this file.
+ALTER TABLE credit_notes
+    ADD COLUMN lock_version BIGINT NOT NULL DEFAULT 0;

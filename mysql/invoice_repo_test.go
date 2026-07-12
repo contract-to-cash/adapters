@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/contract-to-cash/core/application/tx"
@@ -515,5 +516,36 @@ func TestInvoiceRepo_FindByIDAsOf_NotFound(t *testing.T) {
 	var de *shared.DomainError
 	if !errors.As(err, &de) || de.Code != shared.ErrCodeNotFound {
 		t.Fatalf("expected not_found DomainError, got %v", err)
+	}
+}
+
+// FindByContractAndPeriod must filter on billing-period EQUALITY
+// (billing_period_from / billing_period_to), NOT on issue_date. Matching on
+// issue_date breaks arrears billing (a June invoice issued July 1 falls outside
+// the June window) and can falsely return an unrelated invoice merely issued
+// within the queried window. This asserts the query shape and bound arguments.
+func TestInvoiceRepo_FindByContractAndPeriod_MatchesBillingPeriod(t *testing.T) {
+	repo, mock := newInvoiceRepo(t)
+
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	period, err := shared.NewDateRange(start, end)
+	if err != nil {
+		t.Fatalf("NewDateRange: %v", err)
+	}
+
+	mock.ExpectQuery(`SELECT .* FROM invoices WHERE contract_id = \? AND billing_period_from = \? AND billing_period_to = \? ORDER BY issue_date ASC`).
+		WithArgs("c-1", start, end).
+		WillReturnRows(invoiceFindRow(t))
+
+	got, err := repo.FindByContractAndPeriod(context.Background(), "c-1", period)
+	if err != nil {
+		t.Fatalf("FindByContractAndPeriod: %v", err)
+	}
+	if len(got) != 1 || got[0].ToSnapshot().ID != "inv-1" {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }

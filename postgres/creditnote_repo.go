@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/jackc/pgx/v5"
@@ -46,24 +47,45 @@ func (r *PostgresCreditNoteRepository) Save(ctx context.Context, cn *invoice.Cre
 		return fmt.Errorf("marshal credit note json state: %w", err)
 	}
 
-	_, err = r.q(ctx).Exec(ctx,
+	// Optimistic-lock guarded upsert (issue #147). lock_version holds the domain
+	// optimistic-locking version (cn.Version()); the ON CONFLICT DO UPDATE only
+	// fires when the stored lock_version still equals LoadedVersion(). A concurrent
+	// writer that already advanced it leaves the update skipped and RowsAffected()
+	// == 0, which we report as tx.ErrVersionConflict. This is what stops a
+	// concurrent ApplyCreditNote vs RefundCreditNote on the same issued note from
+	// both persisting last-writer-wins (crediting the account AND refunding the
+	// gateway while booking only one outcome). A brand-new credit note (id absent)
+	// INSERTs regardless of lock_version, so a version-0 note is never mistaken for
+	// a conflict — the INSERT-vs-UPDATE decision keys off row existence, never off
+	// the lock_version value. Mirrors the payments/invoices repos.
+	tag, err := r.q(ctx).Exec(ctx,
 		`INSERT INTO credit_notes (id, number, invoice_id, contract_id, account_id, status, reason, memo,
-			items, subtotal, tax_amount, total, credit_amount, refund_amount, currency, issued_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
+			items, subtotal, tax_amount, total, credit_amount, refund_amount, currency, issued_at, lock_version, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
 		 ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status, reason = EXCLUDED.reason, memo = EXCLUDED.memo,
 			items = EXCLUDED.items, subtotal = EXCLUDED.subtotal, tax_amount = EXCLUDED.tax_amount,
 			total = EXCLUDED.total, credit_amount = EXCLUDED.credit_amount,
 			refund_amount = EXCLUDED.refund_amount, currency = EXCLUDED.currency,
-			issued_at = EXCLUDED.issued_at, updated_at = NOW()`,
+			issued_at = EXCLUDED.issued_at, lock_version = EXCLUDED.lock_version, updated_at = NOW()
+		 WHERE credit_notes.lock_version = $18`,
 		string(s.ID), s.Number, string(s.InvoiceID), string(s.ContractID), string(s.AccountID),
 		string(s.Status), string(s.Reason), s.Memo,
 		jsonState, s.Subtotal.Int64(), s.TaxAmount.Int64(), s.Total.Int64(),
 		s.CreditAmount.Int64(), s.RefundAmount.Int64(),
-		string(s.Total.Currency()), s.IssuedAt)
+		string(s.Total.Currency()), s.IssuedAt, s.Version, cn.LoadedVersion())
 	if err != nil {
 		return fmt.Errorf("save credit note: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		// The row exists but its stored lock_version no longer equals
+		// LoadedVersion() (a concurrent writer advanced it). A brand-new row would
+		// have inserted, so 0 unambiguously means an optimistic-lock conflict.
+		return tx.ErrVersionConflict
+	}
+	// Record the persisted optimistic-lock version as the new loaded baseline so a
+	// subsequent Save of this same in-memory entity compares against the right one.
+	cn.SetVersion(s.Version)
 	return nil
 }
 
@@ -123,7 +145,7 @@ func (r *PostgresCreditNoteRepository) findMany(ctx context.Context, where strin
 
 const selectCreditNoteSQL = `
 	SELECT id, number, invoice_id, account_id, contract_id, status, reason, memo,
-	       items, issued_at, created_at
+	       items, issued_at, created_at, lock_version
 	FROM credit_notes`
 
 func scanCreditNoteSnapshot(t scanTarget) (invoice.CreditNoteSnapshot, error) {
@@ -135,10 +157,11 @@ func scanCreditNoteSnapshot(t scanTarget) (invoice.CreditNoteSnapshot, error) {
 		itemsJSON                        json.RawMessage
 		issuedAt                         *time.Time
 		createdAt                        time.Time
+		lockVersion                      int
 	)
 	if err := t.Scan(
 		&id, &number, &invoiceID, &accountID, &contractID,
-		&status, &reason, &memo, &itemsJSON, &issuedAt, &createdAt,
+		&status, &reason, &memo, &itemsJSON, &issuedAt, &createdAt, &lockVersion,
 	); err != nil {
 		return invoice.CreditNoteSnapshot{}, err
 	}
@@ -166,5 +189,10 @@ func scanCreditNoteSnapshot(t scanTarget) (invoice.CreditNoteSnapshot, error) {
 	s.RefundAmount = js.RefundAmount
 	s.IssuedAt = issuedAt
 	s.CreatedAt = createdAt
+	// The credit_notes.lock_version column is authoritative for the
+	// optimistic-locking version (issue #147). CreditNoteFromSnapshot restores
+	// both version and loadedVersion from it, so the next Save guards on the right
+	// baseline.
+	s.Version = lockVersion
 	return s, nil
 }
