@@ -173,6 +173,95 @@ type DeleteCardResponse struct {
 	DeleteFlag string `json:"delete_flag"`
 }
 
+// --- Customer types ---
+//
+// Field names below are grounded in fincode's officially published Node SDK
+// type definitions (github.com/fincode-byGMO/fincode-sdk-node,
+// src/types/customer.ts and src/types/card.ts), fetched during
+// implementation, since the interactive API reference at
+// https://docs.fincode.jp/api is a client-rendered SPA that could not be
+// scraped directly. The SDK types are the authoritative wire shapes fincode's
+// own client library sends/receives, so they are treated as primary-source
+// confirmation rather than an assumption.
+
+// CreateCustomerRequest is the request body for POST /v1/customers.
+// ID is optional: fincode assigns a customer ID when it is omitted, and
+// otherwise uses the caller-supplied value verbatim (fincode does not
+// document an ID character-set/length constraint reachable from primary
+// sources during implementation; an invalid value is rejected by fincode
+// itself with an HTTPError rather than validated client-side here).
+type CreateCustomerRequest struct {
+	ID           string `json:"id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Email        string `json:"email,omitempty"`
+	PhoneCC      string `json:"phone_cc,omitempty"`
+	PhoneNo      string `json:"phone_no,omitempty"`
+	AddrCity     string `json:"addr_city,omitempty"`
+	AddrCountry  string `json:"addr_country,omitempty"` // ISO 3166-1 numeric, e.g. "392" for Japan.
+	AddrLine1    string `json:"addr_line_1,omitempty"`
+	AddrLine2    string `json:"addr_line_2,omitempty"`
+	AddrLine3    string `json:"addr_line_3,omitempty"`
+	AddrPostCode string `json:"addr_post_code,omitempty"`
+	AddrState    string `json:"addr_state,omitempty"` // ISO 3166-2 state code.
+}
+
+// UpdateCustomerRequest is the request body for PUT /v1/customers/{id}.
+// Every field is a pointer so a nil field is omitted from the request body
+// (fincode's update endpoint per the official SDK's UpdatingCustomerRequest
+// type only touches fields present in the body) while a non-nil pointer to
+// "" is still marshaled as an explicit empty string, requesting fincode clear
+// that field.
+type UpdateCustomerRequest struct {
+	Name         *string `json:"name,omitempty"`
+	Email        *string `json:"email,omitempty"`
+	PhoneCC      *string `json:"phone_cc,omitempty"`
+	PhoneNo      *string `json:"phone_no,omitempty"`
+	AddrCity     *string `json:"addr_city,omitempty"`
+	AddrCountry  *string `json:"addr_country,omitempty"`
+	AddrLine1    *string `json:"addr_line_1,omitempty"`
+	AddrLine2    *string `json:"addr_line_2,omitempty"`
+	AddrLine3    *string `json:"addr_line_3,omitempty"`
+	AddrPostCode *string `json:"addr_post_code,omitempty"`
+	AddrState    *string `json:"addr_state,omitempty"`
+}
+
+// CustomerResponse represents a fincode customer, returned by the create,
+// update, and retrieve customer endpoints.
+type CustomerResponse struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	PhoneCC      string `json:"phone_cc"`
+	PhoneNo      string `json:"phone_no"`
+	AddrCity     string `json:"addr_city"`
+	AddrCountry  string `json:"addr_country"`
+	AddrLine1    string `json:"addr_line_1"`
+	AddrLine2    string `json:"addr_line_2"`
+	AddrLine3    string `json:"addr_line_3"`
+	AddrPostCode string `json:"addr_post_code"`
+	AddrState    string `json:"addr_state"`
+	// CardRegistration is "1" when the customer has at least one registered
+	// card, "0" (or absent) otherwise.
+	CardRegistration string `json:"card_registration"`
+	Created          string `json:"created"`
+	Updated          string `json:"updated"`
+}
+
+// DeleteCustomerResponse is the response body for DELETE /v1/customers/{id}.
+type DeleteCustomerResponse struct {
+	ID         string `json:"id"`
+	DeleteFlag string `json:"delete_flag"`
+}
+
+// UpdateCardRequest is the request body for
+// PUT /v1/customers/{customer_id}/cards/{id}. Only DefaultFlag is wired by
+// this adapter (used by Gateway.SetDefaultPaymentMethod); fincode's update
+// card endpoint additionally accepts token/holder_name/expire to replace the
+// stored card data, which this adapter does not expose.
+type UpdateCardRequest struct {
+	DefaultFlag string `json:"default_flag,omitempty"` // "0" or "1"
+}
+
 // APIError represents a single error from fincode API.
 type APIError struct {
 	ErrorCode    string `json:"error_code"`

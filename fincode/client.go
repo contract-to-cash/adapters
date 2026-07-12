@@ -188,6 +188,35 @@ func (c *Client) DeleteCard(ctx context.Context, customerID, cardID string) (*De
 		"/v1/customers/"+url.PathEscape(customerID)+"/cards/"+url.PathEscape(cardID), nil)
 }
 
+// --- Customer API ---
+
+// CreateCustomer registers a new customer (POST /v1/customers).
+func (c *Client) CreateCustomer(ctx context.Context, req *CreateCustomerRequest) (*CustomerResponse, error) {
+	return doJSON[CustomerResponse](c, ctx, http.MethodPost, "/v1/customers", req)
+}
+
+// UpdateCustomer updates an existing customer (PUT /v1/customers/{id}).
+func (c *Client) UpdateCustomer(ctx context.Context, customerID string, req *UpdateCustomerRequest) (*CustomerResponse, error) {
+	return doJSON[CustomerResponse](c, ctx, http.MethodPut, "/v1/customers/"+url.PathEscape(customerID), req)
+}
+
+// RetrieveCustomer gets a customer by ID (GET /v1/customers/{id}).
+func (c *Client) RetrieveCustomer(ctx context.Context, customerID string) (*CustomerResponse, error) {
+	return doJSON[CustomerResponse](c, ctx, http.MethodGet, "/v1/customers/"+url.PathEscape(customerID), nil)
+}
+
+// DeleteCustomer deletes a customer (DELETE /v1/customers/{id}).
+func (c *Client) DeleteCustomer(ctx context.Context, customerID string) (*DeleteCustomerResponse, error) {
+	return doJSON[DeleteCustomerResponse](c, ctx, http.MethodDelete, "/v1/customers/"+url.PathEscape(customerID), nil)
+}
+
+// UpdateCard updates a stored card, e.g. to change its default_flag
+// (PUT /v1/customers/{customer_id}/cards/{id}).
+func (c *Client) UpdateCard(ctx context.Context, customerID, cardID string, req *UpdateCardRequest) (*CardResponse, error) {
+	return doJSON[CardResponse](c, ctx, http.MethodPut,
+		"/v1/customers/"+url.PathEscape(customerID)+"/cards/"+url.PathEscape(cardID), req)
+}
+
 // doJSON sends an HTTP request and decodes a JSON response.
 //
 // On success it returns a pointer to a freshly decoded T.
