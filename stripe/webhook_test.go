@@ -98,12 +98,17 @@ func TestWebhook_UnknownEventPassthrough(t *testing.T) {
 
 func TestWebhook_EventMapping(t *testing.T) {
 	cases := map[string]port.WebhookEventType{
-		"payment_intent.succeeded":      port.WebhookEventPaymentSucceeded,
-		"payment_intent.payment_failed": port.WebhookEventPaymentFailed,
-		"charge.refunded":               port.WebhookEventRefundSucceeded,
-		"charge.dispute.created":        port.WebhookEventChargebackCreated,
-		"payment_method.attached":       port.WebhookEventPaymentMethodAttached,
-		"customer.subscription.deleted": port.WebhookEventSubscriptionCanceled,
+		// payment_intent.succeeded covers card charges and, for async methods
+		// (konbini / customer_balance), the later settlement webhook;
+		// requires_action carries the voucher / bank-transfer instructions and
+		// processing means funds in flight.
+		"payment_intent.succeeded":       port.WebhookEventPaymentSucceeded,
+		"payment_intent.payment_failed":  port.WebhookEventPaymentFailed,
+		"payment_intent.processing":      port.WebhookEventPaymentPending,
+		"payment_intent.requires_action": port.WebhookEventPaymentInstructionCreated,
+		"charge.dispute.created":         port.WebhookEventChargebackCreated,
+		"payment_method.attached":        port.WebhookEventPaymentMethodAttached,
+		"customer.subscription.deleted":  port.WebhookEventSubscriptionCanceled,
 	}
 	h := newHandler(t)
 	for stripeType, want := range cases {
@@ -155,6 +160,58 @@ func TestWebhook_RefundStatusClassification(t *testing.T) {
 			}
 			if event.Type != tc.want {
 				t.Errorf("%s/%s → %q, want %q", tc.eventType, tc.status, event.Type, tc.want)
+			}
+		})
+	}
+}
+
+// chargeRefundedEventBody builds a charge.refunded event whose data.object is
+// a Charge embedding a refunds list (older API versions expand it by default).
+// An empty status produces a charge with no refunds list at all.
+func chargeRefundedEventBody(id, status string) []byte {
+	refunds := ""
+	if status != "" {
+		refunds = fmt.Sprintf(`,"refunds":{"object":"list","data":[{"id":"re_1","object":"refund","status":%q}]}`, status)
+	}
+	return []byte(fmt.Sprintf(
+		`{"id":%q,"object":"event","type":"charge.refunded","created":1700000000,"data":{"object":{"id":"ch_1","object":"charge","status":"succeeded"%s}}}`,
+		id, refunds))
+}
+
+// TestWebhook_ChargeRefundedStatusClassification verifies charge.refunded gets
+// the same status inspection as the Refund-object events: on async methods
+// (konbini / customer_balance bank transfers) Stripe can fire it while the
+// refund is still pending, and booking that as refund.succeeded would record
+// an unsettled refund as completed.
+func TestWebhook_ChargeRefundedStatusClassification(t *testing.T) {
+	h := newHandler(t)
+	cases := []struct {
+		name   string
+		status string
+		want   port.WebhookEventType
+	}{
+		{"succeeded refund classifies", "succeeded", port.WebhookEventRefundSucceeded},
+		{"pending refund passes through", "pending", port.WebhookEventType("charge.refunded")},
+		{"failed refund classifies", "failed", port.WebhookEventRefundFailed},
+		{"canceled refund classifies", "canceled", port.WebhookEventRefundFailed},
+		// API versions 2022-11-15+ omit the refunds list from the Charge:
+		// the status cannot be inspected, so the event is not guessed as
+		// succeeded — consumers use refund.created/updated instead.
+		{"no refunds list passes through", "", port.WebhookEventType("charge.refunded")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := chargeRefundedEventBody("evt_cr", tc.status)
+			sig := signStripe(testWebhookSecret, 1_700_000_000, body)
+			event, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+				Headers: map[string]string{"Stripe-Signature": sig},
+				Body:    body,
+			})
+			if err != nil {
+				t.Fatalf("ParseAndVerify: %v", err)
+			}
+			if event.Type != tc.want {
+				t.Errorf("charge.refunded/%s → %q, want %q", tc.status, event.Type, tc.want)
 			}
 		})
 	}

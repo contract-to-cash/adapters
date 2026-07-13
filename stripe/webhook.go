@@ -248,26 +248,32 @@ func classifyWebhookError(err error) *port.WebhookError {
 // Only confidently-mappable events are listed; anything else passes through
 // with its raw Stripe name (see toWebhookEventType).
 var stripeEventMap = map[string]port.WebhookEventType{
-	"payment_intent.succeeded":      port.WebhookEventPaymentSucceeded,
-	"payment_intent.payment_failed": port.WebhookEventPaymentFailed,
-	"payment_intent.processing":     port.WebhookEventPaymentPending,
+	// The payment_intent lifecycle events cover both synchronous card charges
+	// and asynchronous methods (konbini, customer_balance bank transfers):
+	// requires_action fires when the customer must act — a 3DS challenge, a
+	// konbini voucher, or bank-transfer instructions (payment_instruction.created);
+	// processing while funds are in flight (payment.pending); succeeded when the
+	// funds have settled (payment.succeeded — for async methods this is the
+	// settlement webhook, arriving hours-to-days after the charge call returned
+	// requires_action); payment_failed when the intent fails (e.g. a konbini
+	// voucher or bank-transfer instructions expire unpaid).
+	"payment_intent.succeeded":       port.WebhookEventPaymentSucceeded,
+	"payment_intent.payment_failed":  port.WebhookEventPaymentFailed,
+	"payment_intent.processing":      port.WebhookEventPaymentPending,
+	"payment_intent.requires_action": port.WebhookEventPaymentInstructionCreated,
 	// payment_intent.canceled is deliberately NOT mapped to payment.failed: a
 	// canceled PaymentIntent (a voided/abandoned authorization or a
 	// customer-requested cancel) is not a failed payment, and mapping it there
 	// would trigger the core's dunning / past-due handling for a payment that
 	// was never even attempted. It passes through with its raw Stripe name.
 	//
-	// charge.refunded is mapped directly because for card refunds — the only
-	// payment method this adapter supports (see SupportedMethods) — it fires
-	// after the refund has been recorded on the charge. For asynchronous
-	// payment methods (e.g. bank transfers), charge.refunded can fire while
-	// the refund is still pending, so if this adapter ever supports non-card
-	// methods this event needs the same status inspection as the Refund-object
-	// events. Those events (refund.created / refund.updated /
-	// charge.refund.updated) are async and must be classified from their
-	// status — see refundEventTypes / classifyRefundEvent — so they are
-	// intentionally NOT listed here.
-	"charge.refunded":               port.WebhookEventRefundSucceeded,
+	// charge.refunded is NOT listed here: it needs the same status inspection
+	// as the Refund-object events, because for asynchronous payment methods
+	// (konbini, customer_balance bank transfers) it can fire while the refund
+	// is still pending — see classifyChargeRefundedEvent. The Refund-object
+	// events (refund.created / refund.updated / charge.refund.updated) are
+	// likewise classified from their status — see refundEventTypes /
+	// classifyRefundEvent — so they are intentionally NOT listed either.
 	"refund.failed":                 port.WebhookEventRefundFailed,
 	"charge.dispute.created":        port.WebhookEventChargebackCreated,
 	"charge.dispute.updated":        port.WebhookEventChargebackUpdated,
@@ -300,6 +306,9 @@ func toWebhookEventType(stripeType string, data []byte) port.WebhookEventType {
 	if _, ok := refundEventTypes[stripeType]; ok {
 		return classifyRefundEvent(stripeType, data)
 	}
+	if stripeType == "charge.refunded" {
+		return classifyChargeRefundedEvent(stripeType, data)
+	}
 	if t, ok := stripeEventMap[stripeType]; ok {
 		return t
 	}
@@ -321,6 +330,44 @@ func classifyRefundEvent(stripeType string, data []byte) port.WebhookEventType {
 		return port.WebhookEventType(stripeType)
 	}
 	switch refund.Status {
+	case stripego.RefundStatusSucceeded:
+		return port.WebhookEventRefundSucceeded
+	case stripego.RefundStatusFailed, stripego.RefundStatusCanceled:
+		return port.WebhookEventRefundFailed
+	default:
+		return port.WebhookEventType(stripeType)
+	}
+}
+
+// classifyChargeRefundedEvent classifies a charge.refunded event from the
+// refund statuses embedded in the Charge object. Card refunds are created as
+// "succeeded" (Stripe books them optimistically), but for asynchronous
+// methods — konbini, customer_balance bank transfers — charge.refunded can
+// fire while the refund is still "pending"; mapping it unconditionally to
+// RefundSucceeded would book an unsettled refund as completed in the
+// consumer's ledger (same failure mode as issue #13 for the Refund-object
+// events). The newest refund (refunds.data[0]; Stripe sorts most-recent-first)
+// is the one that triggered the event, and its status is classified with the
+// same rules as classifyRefundEvent.
+//
+// When the Charge payload embeds no refunds list — API versions 2022-11-15
+// and later no longer expand charge.refunds by default — the status cannot be
+// inspected, and the event passes through with its raw Stripe name rather
+// than being guessed as succeeded. Consumers on such API versions should rely
+// on the Refund-object events (refund.created / refund.updated /
+// refund.failed) for classified refund outcomes.
+func classifyChargeRefundedEvent(stripeType string, data []byte) port.WebhookEventType {
+	var charge struct {
+		Refunds struct {
+			Data []struct {
+				Status stripego.RefundStatus `json:"status"`
+			} `json:"data"`
+		} `json:"refunds"`
+	}
+	if err := json.Unmarshal(data, &charge); err != nil || len(charge.Refunds.Data) == 0 {
+		return port.WebhookEventType(stripeType)
+	}
+	switch charge.Refunds.Data[0].Status {
 	case stripego.RefundStatusSucceeded:
 		return port.WebhookEventRefundSucceeded
 	case stripego.RefundStatusFailed, stripego.RefundStatusCanceled:

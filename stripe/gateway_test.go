@@ -114,6 +114,25 @@ func usd(cents int64) shared.Money {
 
 var fixedClock = shared.FixedClock{FixedTime: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)}
 
+// pmJSON builds a PaymentMethod response body of the given Stripe type, with
+// optional extra top-level fields (e.g. "card": {...}).
+func pmJSON(id, typ string, extra map[string]any) string {
+	obj := map[string]any{"id": id, "object": "payment_method", "type": typ, "created": 1_700_000_000}
+	for k, v := range extra {
+		obj[k] = v
+	}
+	b, _ := json.Marshal(obj)
+	return string(b)
+}
+
+// onCardPM registers the payment-method type lookup that Charge/Authorize
+// perform before creating the PaymentIntent, answering with a plain card.
+func (f *fakeStripe) onCardPM(id string) {
+	f.on("GET /v1/payment_methods/"+id, pmJSON(id, "card", map[string]any{
+		"card": map[string]any{"brand": "visa", "last4": "4242", "funding": "credit"},
+	}))
+}
+
 func piJSON(id, status string, amount int64, currency string) string {
 	obj := map[string]any{
 		"id":       id,
@@ -129,6 +148,7 @@ func piJSON(id, status string, amount int64, currency string) string {
 
 func TestGateway_Charge_Success(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -176,6 +196,7 @@ func TestGateway_Charge_Success(t *testing.T) {
 
 func TestGateway_Charge_USDMinorUnits(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_usd", "succeeded", 2599, "usd"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -236,6 +257,7 @@ func TestGateway_Charge_MissingPaymentMethod(t *testing.T) {
 
 func TestGateway_Charge_RequiresAction3DS(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	obj := map[string]any{
 		"id": "pi_3ds", "object": "payment_intent", "amount": 1000,
 		"currency": "jpy", "status": "requires_action", "created": 1_700_000_000,
@@ -279,6 +301,7 @@ func TestGateway_Charge_RequiresAction3DS(t *testing.T) {
 // default challenge policy).
 func TestGateway_Charge_ThreeDSNotRequested(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -302,6 +325,7 @@ func TestGateway_Charge_ThreeDSNotRequested(t *testing.T) {
 // applied on the Authorize path.
 func TestGateway_Authorize_ThreeDSRequested(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_auth", "requires_capture", 5000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -324,6 +348,7 @@ func TestGateway_Authorize_ThreeDSRequested(t *testing.T) {
 // (issue #51).
 func TestGateway_Charge_AutomaticPaymentMethodsNoRedirect(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -348,6 +373,7 @@ func TestGateway_Charge_AutomaticPaymentMethodsNoRedirect(t *testing.T) {
 // omitted on that path.
 func TestGateway_Charge_AutomaticPaymentMethodsWithReturnURL(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -372,6 +398,7 @@ func TestGateway_Charge_AutomaticPaymentMethodsWithReturnURL(t *testing.T) {
 // pinning applies on the Authorize path.
 func TestGateway_Authorize_AutomaticPaymentMethodsNoRedirect(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_auth", "requires_capture", 5000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -392,6 +419,7 @@ func TestGateway_Authorize_AutomaticPaymentMethodsNoRedirect(t *testing.T) {
 
 func TestGateway_Charge_CardDeclined(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.onStatus("POST /v1/payment_intents", http.StatusPaymentRequired, `{
 		"error": {"type": "card_error", "code": "card_declined",
 		"decline_code": "generic_decline", "message": "Your card was declined."}}`)
@@ -413,6 +441,7 @@ func TestGateway_Charge_CardDeclined(t *testing.T) {
 
 func TestGateway_Authorize_And_Capture(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	f.on("POST /v1/payment_intents", piJSON("pi_auth", "requires_capture", 5000, "jpy"))
 	g := f.gateway(WithClock(fixedClock))
 
@@ -616,8 +645,19 @@ func TestGateway_IDAndSupportedMethods(t *testing.T) {
 		t.Errorf("ID = %q", g.ID())
 	}
 	methods := g.SupportedMethods()
-	if len(methods) == 0 || methods[0] != port.PaymentMethodTypeCreditCard {
-		t.Errorf("SupportedMethods = %v", methods)
+	want := []port.PaymentMethodType{
+		port.PaymentMethodTypeCreditCard,
+		port.PaymentMethodTypeDebitCard,
+		port.PaymentMethodTypeConvenienceStore,
+		port.PaymentMethodTypeBankTransfer,
+	}
+	if len(methods) != len(want) {
+		t.Fatalf("SupportedMethods = %v, want %v", methods, want)
+	}
+	for i := range want {
+		if methods[i] != want[i] {
+			t.Errorf("SupportedMethods[%d] = %q, want %q", i, methods[i], want[i])
+		}
 	}
 }
 
@@ -642,10 +682,14 @@ func TestNewClient_RequiresSecret(t *testing.T) {
 // silently ignored. The fake server blocks until the request context is done.
 func TestGateway_ContextPropagated(t *testing.T) {
 	f := newFakeStripe(t)
-	f.routes["POST /v1/payment_intents"] = func(w http.ResponseWriter, r *http.Request) {
+	block := func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done() // block until the caller cancels
 		http.Error(w, "context canceled", http.StatusRequestTimeout)
 	}
+	// The payment-method lookup now precedes the intent creation; both hang
+	// until the context is canceled so either request exercises propagation.
+	f.routes["GET /v1/payment_methods/pm_card"] = block
+	f.routes["POST /v1/payment_intents"] = block
 	g := f.gateway(WithClock(fixedClock))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -663,6 +707,9 @@ func TestGateway_ContextPropagated(t *testing.T) {
 
 func TestGateway_Charge_DebitCardType(t *testing.T) {
 	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_d", pmJSON("pm_d", "card", map[string]any{
+		"card": map[string]any{"brand": "visa", "funding": "debit"},
+	}))
 	obj := map[string]any{
 		"id": "pi_d", "object": "payment_intent", "amount": 1000, "currency": "jpy",
 		"status": "succeeded", "created": 1_700_000_000,
@@ -690,6 +737,7 @@ func TestGateway_Charge_DebitCardType(t *testing.T) {
 // silently read at a zero exponent (which would misreport the amount by 100x).
 func TestGateway_Charge_UnknownResponseCurrency(t *testing.T) {
 	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
 	// Request in a supported currency; response comes back in GBP (unsupported).
 	f.on("POST /v1/payment_intents", piJSON("pi_gbp", "succeeded", 2599, "gbp"))
 	g := f.gateway(WithClock(fixedClock))
@@ -806,6 +854,7 @@ func TestGateway_ErrorCodeMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.code, func(t *testing.T) {
 			f := newFakeStripe(t)
+			f.onCardPM("pm_card")
 			f.onStatus("POST /v1/payment_intents", http.StatusPaymentRequired,
 				`{"error":{"type":"card_error","code":"`+tc.code+`","message":"x"}}`)
 			g := f.gateway()
@@ -835,5 +884,318 @@ func TestGateway_GetPaymentMethod_DefaultResolved(t *testing.T) {
 	}
 	if !detail.IsDefault {
 		t.Errorf("pm_1 should be reported as default")
+	}
+}
+
+// --- Multi payment method support (konbini / JP bank transfer) ---
+
+// TestGateway_Charge_Konbini verifies a konbini charge names the type
+// explicitly in payment_method_types (instead of the card-pinned
+// automatic_payment_methods path), surfaces the hosted voucher URL through the
+// requires-action channel, and reports the real method type.
+func TestGateway_Charge_Konbini(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_konbini", pmJSON("pm_konbini", "konbini", nil))
+	obj := map[string]any{
+		"id": "pi_k", "object": "payment_intent", "amount": 5000, "currency": "jpy",
+		"status": "requires_action", "created": 1_700_000_000,
+		"next_action": map[string]any{
+			"type": "konbini_display_details",
+			"konbini_display_details": map[string]any{
+				"hosted_voucher_url": "https://payments.stripe.com/konbini/voucher/abc",
+				"expires_at":         1_700_300_000,
+			},
+		},
+	}
+	b, _ := json.Marshal(obj)
+	f.on("POST /v1/payment_intents", string(b))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_konbini"
+	resp, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(5000), CustomerID: "cus_1", PaymentMethodID: &pmID,
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if got := f.lastForm.Get("payment_method_types[0]"); got != "konbini" {
+		t.Errorf("payment_method_types[0] = %q, want konbini", got)
+	}
+	if _, ok := f.lastForm["automatic_payment_methods[enabled]"]; ok {
+		t.Errorf("automatic_payment_methods must not be sent with explicit payment_method_types")
+	}
+	if resp.Status != port.TransactionStatusRequiresAction {
+		t.Errorf("Status = %q, want requires_action", resp.Status)
+	}
+	if resp.PaymentMethodType != port.PaymentMethodTypeConvenienceStore {
+		t.Errorf("PaymentMethodType = %q, want convenience_store", resp.PaymentMethodType)
+	}
+	if resp.ThreeDSecure == nil || resp.ThreeDSecure.RedirectURL == nil {
+		t.Fatalf("expected voucher URL in the requires-action result")
+	}
+	if *resp.ThreeDSecure.RedirectURL != "https://payments.stripe.com/konbini/voucher/abc" {
+		t.Errorf("voucher URL = %q", *resp.ThreeDSecure.RedirectURL)
+	}
+}
+
+// TestGateway_Charge_BankTransfer verifies a customer_balance charge pins the
+// type and configures jp_bank_transfer funding, and surfaces the hosted
+// bank-transfer instructions URL through the requires-action channel.
+func TestGateway_Charge_BankTransfer(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_cb", pmJSON("pm_cb", "customer_balance", nil))
+	obj := map[string]any{
+		"id": "pi_bt", "object": "payment_intent", "amount": 120000, "currency": "jpy",
+		"status": "requires_action", "created": 1_700_000_000,
+		"next_action": map[string]any{
+			"type": "display_bank_transfer_instructions",
+			"display_bank_transfer_instructions": map[string]any{
+				"type":                    "jp_bank_transfer",
+				"hosted_instructions_url": "https://payments.stripe.com/instructions/xyz",
+			},
+		},
+	}
+	b, _ := json.Marshal(obj)
+	f.on("POST /v1/payment_intents", string(b))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_cb"
+	resp, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(120000), CustomerID: "cus_1", PaymentMethodID: &pmID,
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if got := f.lastForm.Get("payment_method_types[0]"); got != "customer_balance" {
+		t.Errorf("payment_method_types[0] = %q, want customer_balance", got)
+	}
+	if got := f.lastForm.Get("payment_method_options[customer_balance][funding_type]"); got != "bank_transfer" {
+		t.Errorf("funding_type = %q, want bank_transfer", got)
+	}
+	if got := f.lastForm.Get("payment_method_options[customer_balance][bank_transfer][type]"); got != "jp_bank_transfer" {
+		t.Errorf("bank_transfer type = %q, want jp_bank_transfer", got)
+	}
+	if _, ok := f.lastForm["automatic_payment_methods[enabled]"]; ok {
+		t.Errorf("automatic_payment_methods must not be sent with explicit payment_method_types")
+	}
+	if resp.Status != port.TransactionStatusRequiresAction {
+		t.Errorf("Status = %q, want requires_action", resp.Status)
+	}
+	if resp.PaymentMethodType != port.PaymentMethodTypeBankTransfer {
+		t.Errorf("PaymentMethodType = %q, want bank_transfer", resp.PaymentMethodType)
+	}
+	if resp.ThreeDSecure == nil || resp.ThreeDSecure.RedirectURL == nil ||
+		*resp.ThreeDSecure.RedirectURL != "https://payments.stripe.com/instructions/xyz" {
+		t.Fatalf("expected hosted instructions URL, got %+v", resp.ThreeDSecure)
+	}
+}
+
+// TestGateway_Charge_BankTransfer_RequiresCustomer verifies customer_balance
+// charges are rejected client-side without a Stripe customer (the received
+// funds are tracked on the customer's cash balance).
+func TestGateway_Charge_BankTransfer_RequiresCustomer(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_cb", pmJSON("pm_cb", "customer_balance", nil))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_cb"
+	_, err := g.Charge(context.Background(), &port.ChargeRequest{Amount: jpy(1000), PaymentMethodID: &pmID})
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("want ValidationError, got %v", err)
+	}
+}
+
+// TestGateway_Charge_AsyncMethodNonJPYRejected verifies the JPY-only guard for
+// konbini and JP bank transfer fires before any PaymentIntent is created.
+func TestGateway_Charge_AsyncMethodNonJPYRejected(t *testing.T) {
+	for _, typ := range []string{"konbini", "customer_balance"} {
+		t.Run(typ, func(t *testing.T) {
+			f := newFakeStripe(t)
+			f.on("GET /v1/payment_methods/pm_a", pmJSON("pm_a", typ, nil))
+			g := f.gateway(WithClock(fixedClock))
+
+			pmID := "pm_a"
+			_, err := g.Charge(context.Background(), &port.ChargeRequest{
+				Amount: usd(2599), CustomerID: "cus_1", PaymentMethodID: &pmID,
+			})
+			var ge *port.GatewayError
+			if !errors.As(err, &ge) || ge.Code != port.ErrorCodeCurrencyNotSupported {
+				t.Fatalf("want currency_not_supported GatewayError, got %v", err)
+			}
+		})
+	}
+}
+
+// TestGateway_Authorize_AsyncMethodsRejected verifies Authorize refuses
+// konbini / customer_balance (Stripe has no manual capture for them) with a
+// method_not_supported GatewayError instead of silently mis-charging.
+func TestGateway_Authorize_AsyncMethodsRejected(t *testing.T) {
+	for _, typ := range []string{"konbini", "customer_balance"} {
+		t.Run(typ, func(t *testing.T) {
+			f := newFakeStripe(t)
+			f.on("GET /v1/payment_methods/pm_a", pmJSON("pm_a", typ, nil))
+			g := f.gateway(WithClock(fixedClock))
+
+			pmID := "pm_a"
+			_, err := g.Authorize(context.Background(), &port.AuthorizeRequest{
+				Amount: jpy(1000), CustomerID: "cus_1", PaymentMethodID: &pmID,
+			})
+			var ge *port.GatewayError
+			if !errors.As(err, &ge) || ge.Code != port.ErrorCodeMethodNotSupported {
+				t.Fatalf("want method_not_supported GatewayError, got %v", err)
+			}
+		})
+	}
+}
+
+// TestGateway_Charge_CardKeepsAllowRedirectsNever is the issue #51 regression
+// guard for the method-aware branch: a card charge with no ReturnURL must
+// still pin automatic_payment_methods with allow_redirects=never, must not
+// send payment_method_types, and must still report a card type.
+func TestGateway_Charge_CardKeepsAllowRedirectsNever(t *testing.T) {
+	f := newFakeStripe(t)
+	f.onCardPM("pm_card")
+	f.on("POST /v1/payment_intents", piJSON("pi_1", "succeeded", 1000, "jpy"))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_card"
+	resp, err := g.Charge(context.Background(), &port.ChargeRequest{Amount: jpy(1000), PaymentMethodID: &pmID})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if got := f.lastForm.Get("automatic_payment_methods[allow_redirects]"); got != "never" {
+		t.Errorf("allow_redirects = %q, want never", got)
+	}
+	if _, ok := f.lastForm["payment_method_types[0]"]; ok {
+		t.Errorf("payment_method_types must not be sent for card charges")
+	}
+	if resp.PaymentMethodType != port.PaymentMethodTypeCreditCard {
+		t.Errorf("PaymentMethodType = %q, want credit_card", resp.PaymentMethodType)
+	}
+}
+
+// TestGateway_RegisterPaymentMethod_TypeHonored verifies req.Type gates the
+// attach: cards (and the unspecified backward-compat default) attach,
+// single-use async types and unimplemented types are rejected with
+// method_not_supported before any API call.
+func TestGateway_RegisterPaymentMethod_TypeHonored(t *testing.T) {
+	t.Run("credit_card attaches", func(t *testing.T) {
+		f := newFakeStripe(t)
+		f.on("POST /v1/payment_methods/pm_1/attach", pmJSON("pm_1", "card", map[string]any{
+			"customer": map[string]any{"id": "cus_1"},
+			"card":     map[string]any{"brand": "visa", "last4": "4242"},
+		}))
+		g := f.gateway(WithClock(fixedClock))
+
+		detail, err := g.RegisterPaymentMethod(context.Background(), &port.RegisterPaymentMethodRequest{
+			CustomerID: "cus_1", Token: "pm_1", Type: port.PaymentMethodTypeCreditCard,
+		})
+		if err != nil {
+			t.Fatalf("RegisterPaymentMethod: %v", err)
+		}
+		if detail.Type != port.PaymentMethodTypeCreditCard {
+			t.Errorf("Type = %q, want credit_card", detail.Type)
+		}
+	})
+
+	rejected := []port.PaymentMethodType{
+		port.PaymentMethodTypeConvenienceStore,
+		port.PaymentMethodTypeBankTransfer,
+		port.PaymentMethodTypeQRCode,
+	}
+	for _, typ := range rejected {
+		t.Run(string(typ)+" rejected", func(t *testing.T) {
+			// No routes registered: a rejected type must not hit the API at all
+			// (the fake fatals on any unexpected request).
+			f := newFakeStripe(t)
+			g := f.gateway(WithClock(fixedClock))
+
+			_, err := g.RegisterPaymentMethod(context.Background(), &port.RegisterPaymentMethodRequest{
+				CustomerID: "cus_1", Token: "pm_1", Type: typ,
+			})
+			var ge *port.GatewayError
+			if !errors.As(err, &ge) || ge.Code != port.ErrorCodeMethodNotSupported {
+				t.Fatalf("want method_not_supported GatewayError, got %v", err)
+			}
+		})
+	}
+}
+
+// TestGateway_ListPaymentMethods_MultiType verifies the list no longer
+// hard-filters to card: no type param is sent, and every attached method is
+// returned with its mapped port type (unknown types pass through by raw name).
+func TestGateway_ListPaymentMethods_MultiType(t *testing.T) {
+	f := newFakeStripe(t)
+	list := map[string]any{
+		"object": "list", "has_more": false, "url": "/v1/payment_methods",
+		"data": []any{
+			map[string]any{"id": "pm_card1", "object": "payment_method", "type": "card", "created": 1_700_000_000,
+				"card": map[string]any{"brand": "visa", "last4": "4242", "funding": "credit"}},
+			map[string]any{"id": "pm_usb", "object": "payment_method", "type": "us_bank_account", "created": 1_700_000_000,
+				"billing_details": map[string]any{"name": "Taro Yamada"},
+				"us_bank_account": map[string]any{
+					"bank_name": "STRIPE TEST BANK", "routing_number": "110000000",
+					"account_type": "checking", "last4": "6789",
+				}},
+			map[string]any{"id": "pm_link", "object": "payment_method", "type": "link", "created": 1_700_000_000},
+		},
+	}
+	lb, _ := json.Marshal(list)
+	f.routes["GET /v1/payment_methods"] = func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("type"); got != "" {
+			t.Errorf("type query param = %q, want none (all attached types)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(lb)
+	}
+	f.on("GET /v1/customers/cus_1", `{"id":"cus_1","object":"customer"}`)
+	g := f.gateway(WithClock(fixedClock))
+
+	methods, err := g.ListPaymentMethods(context.Background(), "cus_1")
+	if err != nil {
+		t.Fatalf("ListPaymentMethods: %v", err)
+	}
+	if len(methods) != 3 {
+		t.Fatalf("len = %d, want 3", len(methods))
+	}
+	if methods[0].Type != port.PaymentMethodTypeCreditCard || methods[0].Card == nil {
+		t.Errorf("card method = %+v", methods[0])
+	}
+	if methods[1].Type != port.PaymentMethodTypeDirectDebit {
+		t.Errorf("us_bank_account Type = %q, want direct_debit", methods[1].Type)
+	}
+	ba := methods[1].BankAccount
+	if ba == nil {
+		t.Fatalf("us_bank_account should populate BankAccount details")
+	}
+	if ba.BankName != "STRIPE TEST BANK" || ba.BankCode != "110000000" ||
+		ba.AccountType != "checking" || ba.AccountNumber != "6789" || ba.AccountHolder != "Taro Yamada" {
+		t.Errorf("BankAccount = %+v", ba)
+	}
+	// Unknown Stripe types degrade to a typed pass-through, not a fake card.
+	if methods[2].Type != port.PaymentMethodType("link") {
+		t.Errorf("link Type = %q, want raw pass-through", methods[2].Type)
+	}
+	if methods[2].Card != nil || methods[2].BankAccount != nil {
+		t.Errorf("link method should carry no card/bank details")
+	}
+}
+
+// TestGateway_GetPaymentMethod_Konbini verifies non-card detail mapping on the
+// single-get path.
+func TestGateway_GetPaymentMethod_Konbini(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_k", pmJSON("pm_k", "konbini", nil))
+	g := f.gateway(WithClock(fixedClock))
+
+	detail, err := g.GetPaymentMethod(context.Background(), "pm_k")
+	if err != nil {
+		t.Fatalf("GetPaymentMethod: %v", err)
+	}
+	if detail.Type != port.PaymentMethodTypeConvenienceStore {
+		t.Errorf("Type = %q, want convenience_store", detail.Type)
+	}
+	if detail.Card != nil {
+		t.Errorf("konbini detail should carry no card details")
 	}
 }

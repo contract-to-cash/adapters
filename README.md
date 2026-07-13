@@ -36,7 +36,7 @@ Testing section for the difference in how each is verified).
 | `usage.Repository` | ✅ | ✅ | — | — |
 | `tx.TxManager` | ✅ | ✅ | — | — |
 | `projection.Projector` (contract + invoice) | ✅ | ✅ | — | — |
-| `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card; JPY/USD/EUR) |
+| `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card JPY/USD/EUR; konbini + JP bank transfer, JPY / charge-only) |
 | `port.CustomerGateway` | — | — | ✅ | ✅ |
 | `port.WebhookHandler` | — | — | ✅ | ✅ |
 
@@ -204,16 +204,39 @@ remainder still counts as forfeitable credit.
 ### stripe scope and conventions
 
 Built on the official `github.com/stripe/stripe-go/v82` SDK. Unlike fincode,
-Stripe maps almost one-to-one onto `port.PaymentGateway` — every method is
-implemented; nothing is rejected as unsupported except by currency. The same
-`Gateway` also implements `port.CustomerGateway`
+Stripe maps almost one-to-one onto `port.PaymentGateway` — every interface
+method is implemented. The same `Gateway` also implements
+`port.CustomerGateway`
 (`CreateCustomer` / `GetCustomer` / `UpdateCustomer` / `DeleteCustomer`).
 
-- **Cards; JPY / USD / EUR.** `SupportedMethods()` reports `credit_card` and
-  `debit_card` (Stripe's single `card` PaymentMethod type). Only the
-  currencies defined in `domain/shared` are supported; any other currency is
-  rejected with a typed `port.GatewayError` (`currency_not_supported`). Extend
-  `currencyExponent` in `stripe/types.go` when core adds more currencies.
+- **Payment methods.** `SupportedMethods()` reports `credit_card` /
+  `debit_card` (Stripe's single `card` PaymentMethod type; JPY / USD / EUR),
+  plus two **async-settling, JPY-only** methods: `convenience_store` (Stripe
+  `konbini`) and `bank_transfer` (Stripe `customer_balance` configured for
+  `jp_bank_transfer` funding). Only the currencies defined in `domain/shared`
+  are supported; any other currency is rejected with a typed
+  `port.GatewayError` (`currency_not_supported`). Extend `currencyExponent`
+  in `stripe/types.go` when core adds more currencies.
+- **Async settlement (konbini / JP bank transfer)**: `Charge` looks up the
+  PaymentMethod's type first (one extra API call per charge — a bare `pm_...`
+  ID does not reveal its type), then names it explicitly in
+  `payment_method_types` (with
+  `payment_method_options[customer_balance][funding_type]=bank_transfer` +
+  `[bank_transfer][type]=jp_bank_transfer` for bank transfers) instead of the
+  card-pinned `automatic_payment_methods` path. The confirm returns
+  `TransactionStatusRequiresAction` with the hosted **konbini voucher URL** /
+  **bank-transfer instructions URL** in `ThreeDSecureResult.RedirectURL` — the
+  same requires-action channel the 3DS redirect flow uses — and the payment
+  settles later via webhook (`payment_intent.succeeded`;
+  `payment_intent.processing` while funds are in flight).
+  `ChargeResponse.PaymentMethodType` reports the real method type. Caveats:
+  both methods are **charge-only** (`Authorize` rejects them with
+  `method_not_supported` — Stripe has no manual capture for them, so nothing
+  is silently mis-charged); `customer_balance` requires a Stripe customer
+  (`ChargeRequest.CustomerID`); konbini requires the PaymentMethod to carry
+  billing details (email/name) when it is created client-side; refunds of
+  async charges settle asynchronously too (see Webhooks below). Everything
+  else — Capture, Void, per-method 3DS — remains card-only.
 - **Amounts**: Stripe amounts are integers in the currency's smallest unit
   (cents for USD/EUR, whole yen for zero-decimal JPY). `shared.Money` is
   converted using each currency's exponent; an amount that is not exactly
@@ -242,7 +265,12 @@ implemented; nothing is rejected as unsupported except by currency. The same
   authentication then surfaces as a **successful** response with
   `TransactionStatusRequiresAction` and a `ThreeDSecureResult.RedirectURL`
   (from the PaymentIntent's `next_action.redirect_to_url`), not an error — the
-  caller redirects the customer and completes the flow.
+  caller redirects the customer and completes the flow. 3DS is card-only: on
+  the konbini / customer_balance paths the `ThreeDSecure` request is ignored
+  (no `return_url` is involved) and the same result field instead carries the
+  hosted voucher / instructions URL from
+  `next_action.konbini_display_details.hosted_voucher_url` /
+  `next_action.display_bank_transfer_instructions.hosted_instructions_url`.
 - **Customers**: Stripe only accepts its own customer IDs (`cus_...`), so a
   charge that references an unknown customer fails with `No such customer` —
   internal account IDs (e.g. core `AccountID` ULIDs) must never be passed as
@@ -255,11 +283,22 @@ implemented; nothing is rejected as unsupported except by currency. The same
   payment-method APIs. A get/update/delete of a customer Stripe does not know
   (or a get of a deleted customer — Stripe returns a deleted stub, not a 404)
   surfaces as a `port.GatewayError` with code `customer_not_found`.
-- **Payment methods**: `RegisterPaymentMethod` attaches an existing
+- **Payment method storage**: `RegisterPaymentMethod` attaches an existing
   Stripe PaymentMethod (created client-side with Stripe.js/Elements and passed
   as `Token`) to the customer, optionally setting it as the customer's default
   invoice payment method. Card storage/vaulting itself is done client-side;
-  the adapter never handles raw PANs.
+  the adapter never handles raw PANs. `RegisterPaymentMethodRequest.Type` is
+  honored: cards (or an unspecified `Type`, for backward compatibility)
+  attach; `convenience_store` / `bank_transfer` are rejected with
+  `method_not_supported` — konbini and customer_balance PaymentMethods are
+  single-use on Stripe, so a fresh one is created client-side per charge — as
+  is any other type this adapter does not implement. `ListPaymentMethods`
+  returns **all** attached methods (no card filter); each entry's `Type` is
+  mapped from the Stripe type (`card` → credit/debit by funding, `konbini` →
+  `convenience_store`, `customer_balance` → `bank_transfer`,
+  `us_bank_account` → `direct_debit` with `BankAccount` details populated),
+  and unrecognized Stripe types degrade gracefully to a typed pass-through of
+  their raw name rather than masquerading as cards.
 - **Idempotency**: `IdempotencyKey` on Charge/Authorize/Capture/Refund is
   forwarded verbatim as Stripe's `Idempotency-Key` header. **Stripe expires
   idempotency keys after ~24h**, so a retry beyond that window is no longer
@@ -287,16 +326,23 @@ implemented; nothing is rejected as unsupported except by currency. The same
   `event.ID`), because the SDK's own tolerance check reads the wall clock and
   would break this module's clock-injection convention. Known Stripe event
   types map to `port.WebhookEventType` constants; unknown types pass through
-  with their raw Stripe name. Refund-object events (`refund.created` /
-  `refund.updated` / `charge.refund.updated`) are classified from the refund's
-  `status` (`succeeded` → `refund.succeeded`, `failed`/`canceled` →
-  `refund.failed`, anything else passes through unclassified), because card
-  refunds are asynchronous and typically arrive as `pending` first.
-  `charge.refunded` maps directly to `refund.succeeded`, which is correct for
-  card refunds (the adapter's only supported method) — note that for
-  asynchronous payment methods (e.g. bank transfers) Stripe can fire
-  `charge.refunded` while the refund is still pending, so supporting non-card
-  methods would require the same status inspection there.
+  with their raw Stripe name. The PaymentIntent lifecycle maps to
+  `payment.succeeded` / `payment.failed` / `payment.pending`
+  (`payment_intent.processing`), and `payment_intent.requires_action` maps to
+  `payment_instruction.created` — for konbini / bank transfer this is the
+  "voucher / wire instructions issued" signal, with `payment_intent.succeeded`
+  arriving as the settlement webhook hours-to-days later. Refund-object
+  events (`refund.created` / `refund.updated` / `charge.refund.updated`) are
+  classified from the refund's `status` (`succeeded` → `refund.succeeded`,
+  `failed`/`canceled` → `refund.failed`, anything else passes through
+  unclassified), because refunds are asynchronous and can arrive as `pending`
+  first. `charge.refunded` gets the **same status inspection** — it is
+  classified from the newest refund embedded in the Charge's `refunds` list —
+  instead of mapping unconditionally to `refund.succeeded`, so a pending
+  refund on an async method is never booked as completed; on API versions
+  2022-11-15+ (which no longer embed `charge.refunds` by default) the status
+  cannot be inspected and the event passes through with its raw name — rely
+  on the Refund-object events for classified outcomes there.
 
 ## Testing
 
