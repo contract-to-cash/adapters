@@ -140,6 +140,65 @@ func TestPriceRepo_FindByProductID(t *testing.T) {
 	}
 }
 
+// Core issue #218: pricing.NewOneTimePrice produces a Price with a zero
+// Interval() (json.Marshal renders "null", not omitted), an empty
+// BillingCycle(), and a nil PricingModel(). Save must issue interval_data as
+// JSON null and pricing_model as the {"kind":""} envelope -- no schema change
+// is required for the zero-interval one_time case.
+func TestPriceRepo_Save_OneTimePrice_NullIntervalData(t *testing.T) {
+	repo, mock := newPriceRepo(t)
+	p, err := pricing.NewOneTimePrice("prod-1", jpy(5000), "JPY", fixedTime)
+	if err != nil {
+		t.Fatalf("NewOneTimePrice: %v", err)
+	}
+	if !p.Interval().IsZero() {
+		t.Fatalf("precondition: interval not zero: %+v", p.Interval())
+	}
+
+	mock.ExpectExec(`INSERT INTO prices .* ON DUPLICATE KEY UPDATE`).
+		WithArgs(string(p.ID()), "prod-1", int64(5000), "JPY", "",
+			[]byte("null"), []byte(`{"kind":""}`), "active", sqlmock.AnyArg(),
+			[]byte(`{}`), fixedTime).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := repo.Save(context.Background(), p); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A row persisted with interval_data NULL/empty and the nil-pricing-model
+// envelope (as a zero-interval one_time price would be) reconstructs to a
+// Price with a zero Interval(), empty BillingCycle(), and nil PricingModel().
+func TestPriceRepo_FindByID_OneTimePrice_ReconstructsZeroInterval(t *testing.T) {
+	repo, mock := newPriceRepo(t)
+	rows := sqlmock.NewRows([]string{"id", "product_id", "amount", "currency", "interval_data", "pricing_model", "status", "created_at", "state", "metadata"}).
+		AddRow("price-onetime", "prod-1", int64(5000), "JPY",
+			[]byte(`null`), []byte(`{"kind":""}`), "active", fixedTime, nil, nil)
+	mock.ExpectQuery(`SELECT .* FROM prices WHERE id = \?`).
+		WithArgs("price-onetime").
+		WillReturnRows(rows)
+
+	got, err := repo.FindByID(context.Background(), "price-onetime")
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if !got.Interval().IsZero() {
+		t.Errorf("Interval() = %+v, want zero", got.Interval())
+	}
+	if got.BillingCycle() != "" {
+		t.Errorf("BillingCycle() = %q, want empty", got.BillingCycle())
+	}
+	if got.PricingModel() != nil {
+		t.Errorf("PricingModel() = %#v, want nil", got.PricingModel())
+	}
+	if got.Amount().Int64() != 5000 {
+		t.Errorf("Amount = %d, want 5000", got.Amount().Int64())
+	}
+}
+
 func TestPriceRepo_FindActiveByProductID(t *testing.T) {
 	repo, mock := newPriceRepo(t)
 	mock.ExpectQuery(`SELECT .* FROM prices WHERE product_id = \? AND status = 'active' ORDER BY created_at DESC`).

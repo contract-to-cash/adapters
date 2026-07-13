@@ -328,9 +328,42 @@ verification level differs:
 
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
-dependency. The pin currently tracks core `main` at merge commit `6e621a1`
-(pseudo-version `v0.2.0`), which absorbs the
-following core contract changes.
+dependency. The pin is now core **v0.4.0**.
+
+Round 3 (core v0.4.0):
+
+- **zero-interval `one_time` contracts (core#218)**: a `one_time` contract may
+  now `Activate` with an unset (zero-value) `CurrentPeriod`. The event's
+  `current_period` field still marshals as
+  `{"start":"0001-01-01T00:00:00Z","end":"0001-01-01T00:00:00Z"}` (never
+  null/omitted — see core `domain/shared/datetime.go` `DateRange.MarshalJSON`),
+  and the projector's `parseTime` previously turned that year-0001 timestamp
+  into a non-nil pointer, so `contract_read_models.renewal_date`/`end_date`
+  ended up set to `0001-01-01` — which made `FindDueForRenewal` wrongly return
+  a one_time contract that has no recurring billing at all. **Fixed** in both
+  `postgres/contract_projector.go` and `mysql/contract_projector.go`:
+  `parseTime` now returns `nil` when the parsed time `.IsZero()`, so the
+  `COALESCE` in the `contract.activated` handler leaves `renewal_date`/
+  `end_date` `NULL` for a zero-interval activation (verified by
+  `TestContractRepo_FindDueForRenewal_ExcludesZeroIntervalOneTime` /
+  `TestContractProjector_Project_Activated_ZeroPeriod_LeavesRenewalDateNull`,
+  with regression coverage for the normal-subscription case alongside them).
+- **`pricing.NewOneTimePrice` round-trip (core#218)**: the corresponding Price
+  constructor produces a zero `Interval()`, empty `BillingCycle()`, and nil
+  `PricingModel()`. This already round-trips through the existing `prices`
+  schema with no migration needed (`interval_data` JSONB/JSON stores JSON
+  `null`, `billing_cycle` keeps its `''` default, `pricing_model`'s
+  `{"kind":""}` envelope deserializes back to `nil`) — locked in by
+  `TestPriceRepo_SaveAndFindByID_OneTimePrice` (postgres) and
+  `TestPriceRepo_Save_OneTimePrice_NullIntervalData` /
+  `TestPriceRepo_FindByID_OneTimePrice_ReconstructsZeroInterval` (mysql).
+- **transactional outbox writer ports (core#248)** and **new contract
+  lifecycle hooks (core#227)** are integrator (platform) concerns: `core`
+  added `port.PaymentOutboxWriter`/`port.InvoiceOutboxWriter` and new hook
+  interfaces that the *integrator* implements and fires (or, for the outbox
+  ports, wires via `WithPaymentOutboxWriter`/`WithInvoiceOutboxWriter` on
+  core's own services). Neither touches a repository/port signature this
+  adapter implements, so **no adapter code change was required**.
 
 Round 2 (core#196 / core#197, merge `6e621a1`):
 

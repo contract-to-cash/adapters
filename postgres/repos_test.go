@@ -1246,6 +1246,67 @@ func TestPriceRepo_FindActiveByProductID(t *testing.T) {
 	}
 }
 
+// Core issue #218: pricing.NewOneTimePrice produces a Price with a zero
+// Interval() (marshals to interval_data JSON null), an empty BillingCycle(),
+// and a nil PricingModel(). This must round-trip through Save/FindByID without
+// a schema change: interval_data is JSONB NOT NULL storing JSON `null`,
+// billing_cycle keeps its empty-string default, and pricing_model's {"kind":""} envelope
+// deserializes back to a nil PricingModel (see unmarshalPricingModel).
+func TestPriceRepo_SaveAndFindByID_OneTimePrice(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	ctx := context.Background()
+
+	prodRepo := postgres.NewProductRepository(pool)
+	prod, err := product.FromSnapshot(product.ProductSnapshot{
+		ID: "prod-onetime", Name: "One-Time Product", Status: product.ProductStatusActive,
+		CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prodRepo.Save(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := postgres.NewPriceRepository(pool)
+	price, err := pricing.NewOneTimePrice("prod-onetime", jpy(5000), "JPY", time.Now().UTC().Truncate(time.Microsecond))
+	if err != nil {
+		t.Fatalf("NewOneTimePrice: %v", err)
+	}
+	if !price.Interval().IsZero() {
+		t.Fatalf("precondition: NewOneTimePrice interval not zero: %+v", price.Interval())
+	}
+	if err := repo.Save(ctx, price); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	found, err := repo.FindByID(ctx, price.ID())
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if found.ID() != price.ID() {
+		t.Errorf("ID = %q, want %q", found.ID(), price.ID())
+	}
+	if found.ProductID() != "prod-onetime" {
+		t.Errorf("ProductID = %q, want prod-onetime", found.ProductID())
+	}
+	if found.Amount().Int64() != 5000 {
+		t.Errorf("Amount = %d, want 5000", found.Amount().Int64())
+	}
+	if found.Currency() != "JPY" {
+		t.Errorf("Currency = %q, want JPY", found.Currency())
+	}
+	if !found.Interval().IsZero() {
+		t.Errorf("Interval() = %+v, want zero", found.Interval())
+	}
+	if found.BillingCycle() != "" {
+		t.Errorf("BillingCycle() = %q, want empty", found.BillingCycle())
+	}
+	if found.PricingModel() != nil {
+		t.Errorf("PricingModel() = %#v, want nil", found.PricingModel())
+	}
+}
+
 // --- Contract Projector ---
 
 func TestContractProjector_Rebuild(t *testing.T) {

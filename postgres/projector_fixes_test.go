@@ -9,6 +9,8 @@ import (
 	"github.com/contract-to-cash/adapters/postgres"
 	"github.com/contract-to-cash/adapters/postgres/postgrestest"
 	"github.com/contract-to-cash/core/domain/contract"
+	"github.com/contract-to-cash/core/domain/pricing"
+	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/eventstore"
 )
 
@@ -246,5 +248,125 @@ func TestContractProjector_Rebuild_CheckpointStopsAtUntil(t *testing.T) {
 	}
 	if status != "suspended" {
 		t.Errorf("post-incremental status = %q, want 'suspended'", status)
+	}
+}
+
+// --- Core #218: zero-interval one_time contracts must not be due for renewal ---
+
+// activateContract runs Create+Activate through the real aggregate (so the
+// event payloads exactly match core's ContractCreatedEvent/ContractActivatedEvent
+// schemas), saves via the repo, and projects the resulting events into
+// contract_read_models.
+func activateContract(t *testing.T, ctx context.Context, repo *postgres.PostgresContractRepository, es *postgres.PostgresEventStore, proj *postgres.ContractProjector, id shared.ContractID, contractType contract.ContractType, interval pricing.BillingInterval, clock shared.Clock) {
+	t.Helper()
+	agg := contract.NewContractAggregate(id, clock)
+	if err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: "idem-" + string(id),
+		AccountID:      shared.AccountID("acc-" + string(id)),
+		PriceID:        shared.PriceID("price-" + string(id)),
+		ContractType:   contractType,
+		Interval:       interval,
+		Price:          jpy(1000),
+	}, eventstore.EventMetadata{UserID: "test-user"}); err != nil {
+		t.Fatalf("Create %s: %v", id, err)
+	}
+	if err := agg.Activate(eventstore.EventMetadata{UserID: "test-user"}); err != nil {
+		t.Fatalf("Activate %s: %v", id, err)
+	}
+	if err := repo.Save(ctx, agg); err != nil {
+		t.Fatalf("Save %s: %v", id, err)
+	}
+	events, err := es.Load(ctx, string(id))
+	if err != nil {
+		t.Fatalf("Load events %s: %v", id, err)
+	}
+	for _, e := range events {
+		if err := proj.Project(ctx, e); err != nil {
+			t.Fatalf("Project %s: %v", id, err)
+		}
+	}
+}
+
+// A zero-interval one_time contract (core issue #218) activates with a zero
+// CurrentPeriod. The event's current_period marshals as
+// {"start":"0001-01-01T00:00:00Z","end":"0001-01-01T00:00:00Z"} (never
+// null/omitted — see core domain/shared/datetime.go DateRange.MarshalJSON), so
+// the projector's parseTime must treat that year-0001 timestamp as "no value"
+// and leave renewal_date/end_date NULL. Otherwise FindDueForRenewal would
+// wrongly return a one_time contract that has no recurring billing.
+func TestContractRepo_FindDueForRenewal_ExcludesZeroIntervalOneTime(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	repo := postgres.NewContractRepository(pool, es, clock)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	activateContract(t, ctx, repo, es, proj, "c-onetime-zero", contract.ContractTypeOneTime, pricing.BillingInterval{}, clock)
+
+	future := clock.Now().Add(365 * 24 * time.Hour)
+	due, err := repo.FindDueForRenewal(ctx, future, 0)
+	if err != nil {
+		t.Fatalf("FindDueForRenewal: %v", err)
+	}
+	for _, c := range due {
+		if c.ID() == "c-onetime-zero" {
+			t.Fatalf("zero-interval one_time contract %s wrongly returned as due for renewal", c.ID())
+		}
+	}
+
+	var renewalDate, endDate any
+	if err := pool.QueryRow(ctx, `SELECT renewal_date, end_date FROM contract_read_models WHERE id = 'c-onetime-zero'`).
+		Scan(&renewalDate, &endDate); err != nil {
+		t.Fatal(err)
+	}
+	if renewalDate != nil {
+		t.Errorf("renewal_date = %v, want NULL", renewalDate)
+	}
+	if endDate != nil {
+		t.Errorf("end_date = %v, want NULL", endDate)
+	}
+}
+
+// A normal subscription activation (real, non-zero interval) must still be
+// returned by FindDueForRenewal once its renewal date is on/before asOf — no
+// regression from the parseTime zero-time guard.
+func TestContractRepo_FindDueForRenewal_IncludesNormalSubscription(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	repo := postgres.NewContractRepository(pool, es, clock)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	activateContract(t, ctx, repo, es, proj, "c-sub-normal", contract.ContractTypeSubscription, pricing.Monthly(), clock)
+
+	future := clock.Now().Add(60 * 24 * time.Hour)
+	due, err := repo.FindDueForRenewal(ctx, future, 0)
+	if err != nil {
+		t.Fatalf("FindDueForRenewal: %v", err)
+	}
+	var found bool
+	for _, c := range due {
+		if c.ID() == "c-sub-normal" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("normal subscription contract not returned as due for renewal")
+	}
+
+	var renewalDate, endDate any
+	if err := pool.QueryRow(ctx, `SELECT renewal_date, end_date FROM contract_read_models WHERE id = 'c-sub-normal'`).
+		Scan(&renewalDate, &endDate); err != nil {
+		t.Fatal(err)
+	}
+	if renewalDate == nil {
+		t.Error("renewal_date = NULL, want set")
+	}
+	if endDate == nil {
+		t.Error("end_date = NULL, want set")
 	}
 }
