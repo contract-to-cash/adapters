@@ -329,6 +329,34 @@ func TestContractRepo_FindDueForRenewal_ExcludesZeroIntervalOneTime(t *testing.T
 	}
 }
 
+// FindExpiring must likewise exclude a zero-interval one_time contract (core
+// issue #218). Its predicate is `end_date IS NOT NULL AND end_date < $1`, so
+// the same parseTime zero-time guard (which leaves end_date NULL for a
+// zero-interval activation) keeps such a contract out of the expiry sweep — a
+// one_time contract with no billing period never "expires" on a schedule.
+func TestContractRepo_FindExpiring_ExcludesZeroIntervalOneTime(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	clock := shared.FixedClock{FixedTime: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	repo := postgres.NewContractRepository(pool, es, clock)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	activateContract(t, ctx, repo, es, proj, "c-onetime-zero-exp", contract.ContractTypeOneTime, pricing.BillingInterval{}, clock)
+
+	future := clock.Now().Add(365 * 24 * time.Hour)
+	expiring, err := repo.FindExpiring(ctx, future)
+	if err != nil {
+		t.Fatalf("FindExpiring: %v", err)
+	}
+	for _, c := range expiring {
+		if c.ID() == "c-onetime-zero-exp" {
+			t.Fatalf("zero-interval one_time contract %s wrongly returned as expiring", c.ID())
+		}
+	}
+}
+
 // A normal subscription activation (real, non-zero interval) must still be
 // returned by FindDueForRenewal once its renewal date is on/before asOf — no
 // regression from the parseTime zero-time guard.
