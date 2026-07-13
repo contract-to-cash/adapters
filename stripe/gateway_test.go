@@ -566,6 +566,68 @@ func TestGateway_GetTransaction(t *testing.T) {
 	if tx.Status != port.TransactionStatusSucceeded {
 		t.Errorf("Status = %q", tx.Status)
 	}
+	// No next_action on the intent → no requires-action URL (regression).
+	if tx.ThreeDSecure != nil {
+		t.Errorf("ThreeDSecure = %+v, want nil without next_action", tx.ThreeDSecure)
+	}
+}
+
+// TestGateway_GetTransaction_PendingActionURL verifies that reading back a
+// requires_action intent surfaces the pending customer-action URL on
+// Transaction.ThreeDSecure — the platform's only read-back surface for the
+// voucher / instructions / approval / 3DS URL of a pending charge.
+func TestGateway_GetTransaction_PendingActionURL(t *testing.T) {
+	cases := []struct {
+		name       string
+		nextAction map[string]any
+		wantURL    string
+	}{
+		{
+			name: "konbini voucher",
+			nextAction: map[string]any{
+				"type": "konbini_display_details",
+				"konbini_display_details": map[string]any{
+					"hosted_voucher_url": "https://payments.stripe.com/konbini/voucher/abc",
+				},
+			},
+			wantURL: "https://payments.stripe.com/konbini/voucher/abc",
+		},
+		{
+			name: "redirect approval (PayPay / 3DS)",
+			nextAction: map[string]any{
+				"type":            "redirect_to_url",
+				"redirect_to_url": map[string]any{"url": "https://hooks.stripe.com/redirect/xyz"},
+			},
+			wantURL: "https://hooks.stripe.com/redirect/xyz",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeStripe(t)
+			obj := map[string]any{
+				"id": "pi_pending", "object": "payment_intent", "amount": 1000,
+				"currency": "jpy", "status": "requires_action", "created": 1_700_000_000,
+				"next_action": tc.nextAction,
+			}
+			b, _ := json.Marshal(obj)
+			f.on("GET /v1/payment_intents/pi_pending", string(b))
+			g := f.gateway(WithClock(fixedClock))
+
+			tx, err := g.GetTransaction(context.Background(), "pi_pending")
+			if err != nil {
+				t.Fatalf("GetTransaction: %v", err)
+			}
+			if tx.Status != port.TransactionStatusRequiresAction {
+				t.Errorf("Status = %q, want requires_action", tx.Status)
+			}
+			if tx.ThreeDSecure == nil || tx.ThreeDSecure.RedirectURL == nil {
+				t.Fatalf("expected pending action URL on ThreeDSecure, got %+v", tx.ThreeDSecure)
+			}
+			if *tx.ThreeDSecure.RedirectURL != tc.wantURL {
+				t.Errorf("RedirectURL = %q, want %q", *tx.ThreeDSecure.RedirectURL, tc.wantURL)
+			}
+		})
+	}
 }
 
 func TestGateway_RegisterPaymentMethod_Default(t *testing.T) {

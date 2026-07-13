@@ -568,6 +568,11 @@ func (g *Gateway) toTransaction(pi *stripego.PaymentIntent) (*port.Transaction, 
 		Metadata:        pi.Metadata,
 		CreatedAt:       unixTime(pi.Created),
 		UpdatedAt:       unixTime(pi.Created),
+		// Surface any pending customer-action URL (3DS redirect, konbini
+		// voucher, bank-transfer instructions, PayPay approval) so integrators
+		// reading back a requires_action intent via GetTransaction get the
+		// same URL the original ChargeResponse carried.
+		ThreeDSecure: nextActionResult(pi),
 	}
 	if pi.Customer != nil {
 		t.CustomerID = pi.Customer.ID

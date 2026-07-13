@@ -269,6 +269,12 @@ method is implemented. The same `Gateway` also implements
   separate access token). `RefundResponse.RefundID` is the Stripe refund ID
   (`re_...`); the refund request's `TransactionID` is the PaymentIntent ID.
   Payment method IDs are the flat Stripe PaymentMethod ID (`pm_...`).
+  `GetTransaction` on a pending (`requires_action`) intent also surfaces the
+  outstanding customer-action URL — 3DS redirect, konbini voucher,
+  bank-transfer instructions, or PayPay approval — on
+  `Transaction.ThreeDSecure.RedirectURL`, the same channel the original
+  `ChargeResponse` used, so a pending charge can be read back later without
+  losing its action URL.
 - **Charge / Authorize / Capture**: Charge creates a confirmed PaymentIntent
   with automatic capture; Authorize uses manual capture (status
   `requires_capture`) and Capture (optionally partial via `amount_to_capture`)
