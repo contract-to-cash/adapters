@@ -250,17 +250,20 @@ func classifyWebhookError(err error) *port.WebhookError {
 var stripeEventMap = map[string]port.WebhookEventType{
 	// The payment_intent lifecycle events cover both synchronous card charges
 	// and asynchronous methods (konbini, customer_balance bank transfers):
-	// requires_action fires when the customer must act — a 3DS challenge, a
-	// konbini voucher, or bank-transfer instructions (payment_instruction.created);
 	// processing while funds are in flight (payment.pending); succeeded when the
 	// funds have settled (payment.succeeded — for async methods this is the
 	// settlement webhook, arriving hours-to-days after the charge call returned
 	// requires_action); payment_failed when the intent fails (e.g. a konbini
 	// voucher or bank-transfer instructions expire unpaid).
-	"payment_intent.succeeded":       port.WebhookEventPaymentSucceeded,
-	"payment_intent.payment_failed":  port.WebhookEventPaymentFailed,
-	"payment_intent.processing":      port.WebhookEventPaymentPending,
-	"payment_intent.requires_action": port.WebhookEventPaymentInstructionCreated,
+	//
+	// payment_intent.requires_action is NOT listed here: it is classified from
+	// the intent's payment method (see classifyRequiresActionEvent), because
+	// "payment instructions issued" only describes the async instruction
+	// methods (konbini, customer_balance) — for a card the same event is a 3DS
+	// authentication prompt, which keeps its raw pass-through.
+	"payment_intent.succeeded":      port.WebhookEventPaymentSucceeded,
+	"payment_intent.payment_failed": port.WebhookEventPaymentFailed,
+	"payment_intent.processing":     port.WebhookEventPaymentPending,
 	// payment_intent.canceled is deliberately NOT mapped to payment.failed: a
 	// canceled PaymentIntent (a voided/abandoned authorization or a
 	// customer-requested cancel) is not a failed payment, and mapping it there
@@ -301,13 +304,18 @@ var refundEventTypes = map[string]struct{}{
 // toWebhookEventType maps a Stripe event type to a port.WebhookEventType,
 // passing unknown types through unchanged (typed pass-through) so new Stripe
 // event kinds remain observable rather than rejected. Refund-object events are
-// classified from their status via classifyRefundEvent.
+// classified from their status via classifyRefundEvent, and
+// payment_intent.requires_action from its payment method via
+// classifyRequiresActionEvent.
 func toWebhookEventType(stripeType string, data []byte) port.WebhookEventType {
 	if _, ok := refundEventTypes[stripeType]; ok {
 		return classifyRefundEvent(stripeType, data)
 	}
 	if stripeType == "charge.refunded" {
 		return classifyChargeRefundedEvent(stripeType, data)
+	}
+	if stripeType == "payment_intent.requires_action" {
+		return classifyRequiresActionEvent(stripeType, data)
 	}
 	if t, ok := stripeEventMap[stripeType]; ok {
 		return t
@@ -375,6 +383,47 @@ func classifyChargeRefundedEvent(stripeType string, data []byte) port.WebhookEve
 	default:
 		return port.WebhookEventType(stripeType)
 	}
+}
+
+// classifyRequiresActionEvent classifies a payment_intent.requires_action
+// event from the PaymentIntent's payment method. Only when the intent
+// indicates an async instruction method — konbini or customer_balance, via
+// the expanded payment_method.type or the payment_method_types list — does it
+// become payment_instruction.created ("voucher / bank-transfer instructions
+// issued"). For a card the same Stripe event is a 3DS authentication prompt,
+// not an instruction issuance, so it keeps the raw pass-through it had before
+// this adapter supported async methods; an unreadable or ambiguous payload is
+// likewise NOT guessed and passes through with its raw Stripe name.
+func classifyRequiresActionEvent(stripeType string, data []byte) port.WebhookEventType {
+	var intent struct {
+		PaymentMethodTypes []string `json:"payment_method_types"`
+		// payment_method is a bare "pm_..." string unless expanded; try the
+		// expanded object shape and ignore it otherwise.
+		PaymentMethod struct {
+			Type string `json:"type"`
+		} `json:"payment_method"`
+	}
+	if err := json.Unmarshal(data, &intent); err != nil {
+		// Retry without the payment_method object: when payment_method is an
+		// unexpanded "pm_..." string the whole unmarshal above fails, but the
+		// payment_method_types list may still identify the method.
+		var fallback struct {
+			PaymentMethodTypes []string `json:"payment_method_types"`
+		}
+		if err := json.Unmarshal(data, &fallback); err != nil {
+			return port.WebhookEventType(stripeType)
+		}
+		intent.PaymentMethodTypes = fallback.PaymentMethodTypes
+	}
+	if isAsyncSettlementType(stripego.PaymentMethodType(intent.PaymentMethod.Type)) {
+		return port.WebhookEventPaymentInstructionCreated
+	}
+	for _, t := range intent.PaymentMethodTypes {
+		if isAsyncSettlementType(stripego.PaymentMethodType(t)) {
+			return port.WebhookEventPaymentInstructionCreated
+		}
+	}
+	return port.WebhookEventType(stripeType)
 }
 
 // lookupHeader finds a header value case-insensitively; port.WebhookRequest

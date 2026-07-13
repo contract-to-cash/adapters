@@ -100,15 +100,14 @@ func TestWebhook_EventMapping(t *testing.T) {
 	cases := map[string]port.WebhookEventType{
 		// payment_intent.succeeded covers card charges and, for async methods
 		// (konbini / customer_balance), the later settlement webhook;
-		// requires_action carries the voucher / bank-transfer instructions and
-		// processing means funds in flight.
-		"payment_intent.succeeded":       port.WebhookEventPaymentSucceeded,
-		"payment_intent.payment_failed":  port.WebhookEventPaymentFailed,
-		"payment_intent.processing":      port.WebhookEventPaymentPending,
-		"payment_intent.requires_action": port.WebhookEventPaymentInstructionCreated,
-		"charge.dispute.created":         port.WebhookEventChargebackCreated,
-		"payment_method.attached":        port.WebhookEventPaymentMethodAttached,
-		"customer.subscription.deleted":  port.WebhookEventSubscriptionCanceled,
+		// processing means funds in flight. requires_action is classified from
+		// the payload instead — see TestWebhook_RequiresActionClassification.
+		"payment_intent.succeeded":      port.WebhookEventPaymentSucceeded,
+		"payment_intent.payment_failed": port.WebhookEventPaymentFailed,
+		"payment_intent.processing":     port.WebhookEventPaymentPending,
+		"charge.dispute.created":        port.WebhookEventChargebackCreated,
+		"payment_method.attached":       port.WebhookEventPaymentMethodAttached,
+		"customer.subscription.deleted": port.WebhookEventSubscriptionCanceled,
 	}
 	h := newHandler(t)
 	for stripeType, want := range cases {
@@ -358,5 +357,58 @@ func TestWebhook_WithinToleranceAccepted(t *testing.T) {
 		Body:    body,
 	}); err != nil {
 		t.Fatalf("ParseAndVerify within tolerance: %v", err)
+	}
+}
+
+// requiresActionEventBody builds a payment_intent.requires_action event whose
+// data.object is a PaymentIntent with the given raw JSON fragment spliced into
+// the object (e.g. a payment_method_types list or an expanded payment_method).
+func requiresActionEventBody(id, intentExtra string) []byte {
+	if intentExtra != "" {
+		intentExtra = "," + intentExtra
+	}
+	return []byte(fmt.Sprintf(
+		`{"id":%q,"object":"event","type":"payment_intent.requires_action","created":1700000000,"data":{"object":{"id":"pi_1","object":"payment_intent","status":"requires_action"%s}}}`,
+		id, intentExtra))
+}
+
+// TestWebhook_RequiresActionClassification verifies that
+// payment_intent.requires_action only becomes payment_instruction.created for
+// async instruction methods (konbini / customer_balance). For a card the same
+// Stripe event is a 3DS authentication prompt — not an instruction issuance —
+// and it keeps the raw pass-through it had before this adapter supported async
+// methods; an uninspectable payload is not guessed either.
+func TestWebhook_RequiresActionClassification(t *testing.T) {
+	h := newHandler(t)
+	raw := port.WebhookEventType("payment_intent.requires_action")
+	cases := []struct {
+		name        string
+		intentExtra string
+		want        port.WebhookEventType
+	}{
+		{"konbini types classify", `"payment_method_types":["konbini"]`, port.WebhookEventPaymentInstructionCreated},
+		{"customer_balance types classify", `"payment_method_types":["customer_balance"]`, port.WebhookEventPaymentInstructionCreated},
+		{"expanded konbini payment_method classifies", `"payment_method":{"id":"pm_1","object":"payment_method","type":"konbini"}`, port.WebhookEventPaymentInstructionCreated},
+		{"konbini types with unexpanded pm string classify", `"payment_method_types":["konbini"],"payment_method":"pm_1"`, port.WebhookEventPaymentInstructionCreated},
+		{"card 3DS passes through", `"payment_method_types":["card"]`, raw},
+		{"card with unexpanded pm string passes through", `"payment_method_types":["card"],"payment_method":"pm_1"`, raw},
+		{"missing payment_method_types passes through", ``, raw},
+		{"unparseable payment_method_types passes through", `"payment_method_types":"konbini"`, raw},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := requiresActionEventBody("evt_ra", tc.intentExtra)
+			sig := signStripe(testWebhookSecret, 1_700_000_000, body)
+			event, err := h.ParseAndVerify(context.Background(), &port.WebhookRequest{
+				Headers: map[string]string{"Stripe-Signature": sig},
+				Body:    body,
+			})
+			if err != nil {
+				t.Fatalf("ParseAndVerify: %v", err)
+			}
+			if event.Type != tc.want {
+				t.Errorf("requires_action(%s) → %q, want %q", tc.intentExtra, event.Type, tc.want)
+			}
+		})
 	}
 }

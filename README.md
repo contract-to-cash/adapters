@@ -328,10 +328,14 @@ method is implemented. The same `Gateway` also implements
   types map to `port.WebhookEventType` constants; unknown types pass through
   with their raw Stripe name. The PaymentIntent lifecycle maps to
   `payment.succeeded` / `payment.failed` / `payment.pending`
-  (`payment_intent.processing`), and `payment_intent.requires_action` maps to
-  `payment_instruction.created` — for konbini / bank transfer this is the
-  "voucher / wire instructions issued" signal, with `payment_intent.succeeded`
-  arriving as the settlement webhook hours-to-days later. Refund-object
+  (`payment_intent.processing`). `payment_intent.requires_action` is
+  classified from the intent's payment method (its `payment_method_types` /
+  expanded `payment_method.type`): only konbini / customer_balance become
+  `payment_instruction.created` — the "voucher / wire instructions issued"
+  signal, with `payment_intent.succeeded` arriving as the settlement webhook
+  hours-to-days later — while a card 3DS challenge (or an uninspectable
+  payload) passes through with its raw Stripe name, since an authentication
+  prompt is not a payment instruction. Refund-object
   events (`refund.created` / `refund.updated` / `charge.refund.updated`) are
   classified from the refund's `status` (`succeeded` → `refund.succeeded`,
   `failed`/`canceled` → `refund.failed`, anything else passes through
