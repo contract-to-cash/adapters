@@ -921,13 +921,14 @@ func cardFundingToMethodType(funding stripego.CardFunding) port.PaymentMethodTyp
 // the 3DS redirect flow uses, so the core's existing requires_action handling
 // covers every method:
 //
-//   - card 3DS challenge: next_action.redirect_to_url.url
+//   - card 3DS challenge or PayPay approval: next_action.redirect_to_url.url
 //   - konbini: next_action.konbini_display_details.hosted_voucher_url
 //   - customer_balance (JP bank transfer):
 //     next_action.display_bank_transfer_instructions.hosted_instructions_url
 //
-// In all three cases the caller sends the customer to the URL to complete the
-// payment (authenticate / print the voucher / read the wire instructions).
+// In every case the caller sends the customer to the URL to complete the
+// payment (authenticate / approve in PayPay / print the voucher / read the
+// wire instructions).
 func nextActionResult(pi *stripego.PaymentIntent) *port.ThreeDSecureResult {
 	na := pi.NextAction
 	if na == nil {
