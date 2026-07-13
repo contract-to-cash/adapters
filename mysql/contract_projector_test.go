@@ -113,6 +113,63 @@ func TestContractProjector_Project_TrialEnded_Converted(t *testing.T) {
 	}
 }
 
+// A zero-interval one_time contract (core issue #218) activates with a zero
+// CurrentPeriod, which serializes as {"start":"0001-01-01T00:00:00Z","end":"0001-01-01T00:00:00Z"}
+// (core domain/shared/datetime.go DateRange.MarshalJSON never omits the field).
+// parseTime must treat that year-0001 timestamp as "no value" so the UPDATE binds
+// nil for end_date/renewal_date, leaving them NULL via COALESCE — otherwise the
+// contract would wrongly show up in FindDueForRenewal.
+func TestContractProjector_Project_Activated_ZeroPeriod_LeavesRenewalDateNull(t *testing.T) {
+	proj, mock := newContractProjector(t)
+
+	ev := eventstore.Event{
+		StreamID: "contract-1",
+		Type:     "contract.activated",
+		Version:  2,
+		Data:     []byte(`{"current_period":{"start":"0001-01-01T00:00:00Z","end":"0001-01-01T00:00:00Z"}}`),
+	}
+
+	mock.ExpectExec(`UPDATE contract_read_models\s+SET status = 'active', end_date = COALESCE\(\?, end_date\), renewal_date = COALESCE\(\?, renewal_date\)`).
+		WithArgs(nil, nil, sqlmock.AnyArg(), 2, "contract-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project activated (zero period): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A normal subscription activation (real, non-zero current_period) must still
+// set end_date/renewal_date — no regression from the parseTime zero-time guard.
+func TestContractProjector_Project_Activated_NormalPeriod_SetsRenewalDate(t *testing.T) {
+	proj, mock := newContractProjector(t)
+
+	ev := eventstore.Event{
+		StreamID: "contract-1",
+		Type:     "contract.activated",
+		Version:  2,
+		Data:     []byte(`{"current_period":{"start":"2026-06-01T00:00:00Z","end":"2026-07-01T00:00:00Z"}}`),
+	}
+
+	want, err := time.Parse(time.RFC3339, "2026-07-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("parse want: %v", err)
+	}
+
+	mock.ExpectExec(`UPDATE contract_read_models\s+SET status = 'active', end_date = COALESCE\(\?, end_date\), renewal_date = COALESCE\(\?, renewal_date\)`).
+		WithArgs(&want, &want, sqlmock.AnyArg(), 2, "contract-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project activated (normal period): %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // An immediate price change updates the read model's price_id.
 func TestContractProjector_Project_PriceChanged(t *testing.T) {
 	proj, mock := newContractProjector(t)

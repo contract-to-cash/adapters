@@ -272,5 +272,8 @@ func parseTime(s string) *time.Time {
 	if err != nil {
 		return nil
 	}
+	if t.IsZero() {
+		return nil
+	}
 	return &t
 }
