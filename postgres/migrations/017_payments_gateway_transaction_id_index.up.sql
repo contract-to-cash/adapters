@@ -22,6 +22,15 @@
 -- statement caching, custom plans are kept and the index is used — verified
 -- empirically.
 --
+-- Operational note (non-concurrent build). The migration runner applies each
+-- file inside one transaction, and CREATE INDEX CONCURRENTLY cannot run in a
+-- transaction, so this is a plain (locking) CREATE INDEX: writes to payments
+-- block while the index builds. On deployments where payments is large,
+-- build the index manually BEFORE applying this migration:
+--   CREATE INDEX CONCURRENTLY idx_payments_gateway_transaction_id
+--       ON payments (gateway_transaction_id) WHERE gateway_transaction_id <> '';
+-- The IF NOT EXISTS guard below then makes this migration a fast no-op.
+--
 -- Not unique. A single column is sufficient: in practice more than one row
 -- sharing the same gateway_transaction_id essentially never happens, but this
 -- migration does not promote that into a UNIQUE constraint — it only adds the

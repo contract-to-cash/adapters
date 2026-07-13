@@ -693,6 +693,20 @@ created_at)` that the planner still uses for the same lookup — it is not dead.
 forward-only (no `.down` files); the file's header documents the exact
 `CREATE INDEX` to restore it by hand.
 
+**017_payments_gateway_transaction_id_index** (postgres; mysql 016 is the
+mirror) indexes `payments.gateway_transaction_id` for the webhook settlement
+lookup (issue #72). The postgres runner wraps each file in a transaction and
+`CREATE INDEX CONCURRENTLY` cannot run inside one, so this is a plain
+(locking) index build: writes to `payments` block while it runs. On
+deployments where `payments` is large, run
+`CREATE INDEX CONCURRENTLY idx_payments_gateway_transaction_id ON payments
+(gateway_transaction_id) WHERE gateway_transaction_id <> '';` by hand **before**
+applying the migration — its `IF NOT EXISTS` guard then makes the migration a
+fast no-op. The mysql 016 build is generally less disruptive: MySQL 8's InnoDB
+`CREATE INDEX` is online DDL (typically `ALGORITHM=INPLACE`), which normally
+permits concurrent writes during the build, though brief locks around the
+start/end phases still apply.
+
 ## MySQL schema & connection
 
 Apply the DDL in `mysql/migrations/` before use; `mysql/schema.sql`
