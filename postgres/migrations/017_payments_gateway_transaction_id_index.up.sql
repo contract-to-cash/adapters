@@ -5,8 +5,8 @@
 -- an inbound gateway callback to a payment row with:
 --   SELECT id FROM payments WHERE gateway_transaction_id = $1
 --     ORDER BY created_at DESC LIMIT 1
--- payments carries only idx_payments_invoice_id (003), so this lookup is a
--- full table scan.
+-- the only secondary index on payments relevant to this lookup was
+-- idx_payments_invoice_id (003), so it was a full table scan.
 --
 -- Partial index. gateway_transaction_id is NOT NULL DEFAULT '' (003):
 -- payments that never go through a gateway (e.g. zero-amount settlements)
@@ -15,8 +15,15 @@
 -- when the incoming transaction id is empty. A partial index excluding
 -- empty-string rows serves every real lookup while keeping the index small.
 --
+-- Generic-plan caveat. The planner cannot prove `gateway_transaction_id = $1`
+-- implies `<> ''` for an unknown parameter, so a generic plan (e.g.
+-- plan_cache_mode=force_generic_plan) cannot use this partial index and falls
+-- back to a seq scan. Under the default plan_cache_mode=auto with pgx's
+-- statement caching, custom plans are kept and the index is used — verified
+-- empirically.
+--
 -- Not unique. A single column is sufficient: in practice more than one row
--- shares the same gateway_transaction_id essentially never happens, but this
+-- sharing the same gateway_transaction_id essentially never happens, but this
 -- migration does not promote that into a UNIQUE constraint — it only adds the
 -- index the lookup needs.
 CREATE INDEX IF NOT EXISTS idx_payments_gateway_transaction_id

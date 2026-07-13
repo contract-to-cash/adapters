@@ -80,10 +80,9 @@ func TestMigrate_Idempotent(t *testing.T) {
 
 // TestMigration017_PaymentsGatewayTransactionIdPartialIndex checks the
 // embedded 017 migration (issue #72) creates a partial index on
-// payments.gateway_transaction_id, guarded by IF EXISTS/IF NOT EXISTS for
-// idempotency, and excludes empty-string rows (payments that never touch a
-// gateway) via the WHERE predicate. This is a content assertion and needs no
-// database.
+// payments.gateway_transaction_id, guarded by IF NOT EXISTS for idempotency,
+// and excludes empty-string rows (payments that never touch a gateway) via
+// the WHERE predicate. This is a content assertion and needs no database.
 func TestMigration017_PaymentsGatewayTransactionIdPartialIndex(t *testing.T) {
 	data, err := postgres.Migrations.ReadFile("migrations/017_payments_gateway_transaction_id_index.up.sql")
 	if err != nil {

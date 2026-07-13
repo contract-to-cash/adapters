@@ -6,7 +6,8 @@
 -- platform#65 webhook settlement handler's
 -- `SELECT id FROM payments WHERE gateway_transaction_id = ? ORDER BY
 -- created_at DESC LIMIT 1` was a full table scan against payments, whose only
--- index was idx_payments_invoice_id from 003).
+-- secondary index relevant to this lookup was idx_payments_invoice_id from
+-- 003).
 --
 -- Partial-index WHERE predicate dropped (MySQL): full index on
 -- gateway_transaction_id. gateway_transaction_id is NOT NULL DEFAULT '' (003)
