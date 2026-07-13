@@ -884,6 +884,27 @@ func TestIntegration_PriceRepo_MetadataRoundTrip(t *testing.T) {
 	}
 }
 
+// TestIntegration_Migrate_PaymentsGatewayTransactionIdIndexExists verifies
+// migration 016 actually creates the index against a real database (issue
+// #72).
+func TestIntegration_Migrate_PaymentsGatewayTransactionIdIndexExists(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	ctx := context.Background()
+
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.statistics
+		 WHERE table_schema = DATABASE() AND table_name = 'payments'
+		   AND index_name = ? AND column_name = 'gateway_transaction_id'`,
+		"idx_payments_gateway_transaction_id").Scan(&count)
+	if err != nil {
+		t.Fatalf("query information_schema.statistics: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("idx_payments_gateway_transaction_id on payments.gateway_transaction_id not found (count=%d)", count)
+	}
+}
+
 func mustPayment(t *testing.T, id, invoiceID, idempotencyKey string, status payment.PaymentStatus, amount int64) *payment.Payment {
 	t.Helper()
 	p, err := payment.FromSnapshot(payment.PaymentSnapshot{
