@@ -1,0 +1,40 @@
+-- 017: index on payments.gateway_transaction_id for webhook settlement
+-- lookups (issue adapters#72).
+--
+-- Background. The platform webhook settlement handler (platform#65) resolves
+-- an inbound gateway callback to a payment row with:
+--   SELECT id FROM payments WHERE gateway_transaction_id = $1
+--     ORDER BY created_at DESC LIMIT 1
+-- the only secondary index on payments relevant to this lookup was
+-- idx_payments_invoice_id (003), so it was a full table scan.
+--
+-- Partial index. gateway_transaction_id is NOT NULL DEFAULT '' (003):
+-- payments that never go through a gateway (e.g. zero-amount settlements)
+-- keep the column empty and accumulate as a large slice of the table that the
+-- webhook lookup never targets — it short-circuits before issuing the query
+-- when the incoming transaction id is empty. A partial index excluding
+-- empty-string rows serves every real lookup while keeping the index small.
+--
+-- Generic-plan caveat. The planner cannot prove `gateway_transaction_id = $1`
+-- implies `<> ''` for an unknown parameter, so a generic plan (e.g.
+-- plan_cache_mode=force_generic_plan) cannot use this partial index and falls
+-- back to a seq scan. Under the default plan_cache_mode=auto with pgx's
+-- statement caching, custom plans are kept and the index is used — verified
+-- empirically.
+--
+-- Operational note (non-concurrent build). The migration runner applies each
+-- file inside one transaction, and CREATE INDEX CONCURRENTLY cannot run in a
+-- transaction, so this is a plain (locking) CREATE INDEX: writes to payments
+-- block while the index builds. On deployments where payments is large,
+-- build the index manually BEFORE applying this migration:
+--   CREATE INDEX CONCURRENTLY idx_payments_gateway_transaction_id
+--       ON payments (gateway_transaction_id) WHERE gateway_transaction_id <> '';
+-- The IF NOT EXISTS guard below then makes this migration a fast no-op.
+--
+-- Not unique. A single column is sufficient: in practice more than one row
+-- sharing the same gateway_transaction_id essentially never happens, but this
+-- migration does not promote that into a UNIQUE constraint — it only adds the
+-- index the lookup needs.
+CREATE INDEX IF NOT EXISTS idx_payments_gateway_transaction_id
+    ON payments (gateway_transaction_id)
+    WHERE gateway_transaction_id <> '';

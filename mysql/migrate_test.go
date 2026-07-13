@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -159,6 +160,41 @@ func TestSplitStatements(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMigration016_PaymentsGatewayTransactionIdIndex checks the embedded 016
+// migration (issue #72) creates a plain (non-partial) index on
+// payments.gateway_transaction_id, mirroring postgres migration 017. MySQL
+// has no partial indexes, so this must NOT carry a WHERE predicate. This is a
+// content assertion and needs no database.
+func TestMigration016_PaymentsGatewayTransactionIdIndex(t *testing.T) {
+	data, err := Migrations.ReadFile("migrations/016_payments_gateway_transaction_id_index.up.sql")
+	if err != nil {
+		t.Fatalf("read migration 016: %v", err)
+	}
+	sql := string(data)
+
+	// Ignore comment lines so prose mentioning the statement does not satisfy
+	// the assertion; only executable statements count.
+	var exec strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		exec.WriteString(line)
+		exec.WriteString("\n")
+	}
+	stmt := strings.ToUpper(exec.String())
+
+	if !strings.Contains(stmt, "CREATE INDEX IDX_PAYMENTS_GATEWAY_TRANSACTION_ID") {
+		t.Errorf("016 must create idx_payments_gateway_transaction_id, got:\n%s", sql)
+	}
+	if !strings.Contains(stmt, "ON PAYMENTS (GATEWAY_TRANSACTION_ID)") {
+		t.Errorf("016 must index payments.gateway_transaction_id, got:\n%s", sql)
+	}
+	if strings.Contains(stmt, "WHERE") {
+		t.Errorf("016 must not use a WHERE predicate (MySQL has no partial indexes), got:\n%s", sql)
 	}
 }
 

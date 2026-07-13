@@ -1,0 +1,22 @@
+-- 016: index on payments.gateway_transaction_id for webhook settlement
+-- lookups (issue adapters#72). MySQL mirror of
+-- postgres/migrations/017_payments_gateway_transaction_id_index.up.sql.
+--
+-- Background: see the postgres migration for the full rationale (the
+-- platform#65 webhook settlement handler's
+-- `SELECT id FROM payments WHERE gateway_transaction_id = ? ORDER BY
+-- created_at DESC LIMIT 1` was a full table scan against payments, whose only
+-- secondary index relevant to this lookup was idx_payments_invoice_id from
+-- 003).
+--
+-- Partial-index WHERE predicate dropped (MySQL): full index on
+-- gateway_transaction_id. gateway_transaction_id is NOT NULL DEFAULT '' (003)
+-- and payments that never go through a gateway keep it empty, but MySQL has
+-- no partial indexes, so unlike the postgres migration this index cannot
+-- exclude those rows. The settlement lookup never queries on an empty
+-- string, so the extra empty-string entries are unused but harmless.
+--
+-- MySQL has no CREATE INDEX IF NOT EXISTS; migrations are applied once in
+-- order.
+CREATE INDEX idx_payments_gateway_transaction_id
+    ON payments (gateway_transaction_id);
