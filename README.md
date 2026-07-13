@@ -36,7 +36,7 @@ Testing section for the difference in how each is verified).
 | `usage.Repository` | ✅ | ✅ | — | — |
 | `tx.TxManager` | ✅ | ✅ | — | — |
 | `projection.Projector` (contract + invoice) | ✅ | ✅ | — | — |
-| `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card JPY/USD/EUR; konbini + JP bank transfer, JPY / charge-only) |
+| `port.PaymentGateway` | — | — | ✅ (card / JPY only) | ✅ (card JPY/USD/EUR; konbini + JP bank transfer + PayPay, JPY / charge-only) |
 | `port.CustomerGateway` | — | — | ✅ | ✅ |
 | `port.WebhookHandler` | — | — | ✅ | ✅ |
 
@@ -211,10 +211,11 @@ method is implemented. The same `Gateway` also implements
 
 - **Payment methods.** `SupportedMethods()` reports `credit_card` /
   `debit_card` (Stripe's single `card` PaymentMethod type; JPY / USD / EUR),
-  plus two **async-settling, JPY-only** methods: `convenience_store` (Stripe
+  two **async-settling, JPY-only** methods — `convenience_store` (Stripe
   `konbini`) and `bank_transfer` (Stripe `customer_balance` configured for
-  `jp_bank_transfer` funding). Only the currencies defined in `domain/shared`
-  are supported; any other currency is rejected with a typed
+  `jp_bank_transfer` funding) — plus `qr_code` (Stripe `paypay`, a JPY-only
+  **redirect-approval** method). Only the currencies defined in
+  `domain/shared` are supported; any other currency is rejected with a typed
   `port.GatewayError` (`currency_not_supported`). Extend `currencyExponent`
   in `stripe/types.go` when core adds more currencies.
 - **Async settlement (konbini / JP bank transfer)**: `Charge` looks up the
@@ -237,6 +238,22 @@ method is implemented. The same `Gateway` also implements
   billing details (email/name) when it is created client-side; refunds of
   async charges settle asynchronously too (see Webhooks below). Everything
   else — Capture, Void, per-method 3DS — remains card-only.
+- **PayPay (`qr_code`)**: a JPY-only redirect-approval method — the customer
+  approves the payment in the PayPay app/web and is redirected back. `Charge`
+  pins `payment_method_types=["paypay"]` and **requires a return URL**,
+  sourced from `ThreeDSecureRequest.ReturnURL` (the port's only return-URL
+  carrier, shared with the card 3DS flow); without one the charge is rejected
+  client-side with a `ValidationError` rather than creating an unconfirmable
+  intent. The approval URL surfaces from `next_action.redirect_to_url`
+  through the same `ThreeDSecureResult.RedirectURL` channel, and
+  `ChargeResponse.PaymentMethodType` reports `qr_code`. PayPay is
+  **charge-only** (`Authorize` rejects it — stripe-go v82 exposes no
+  manual-capture surface for it, so the adapter is conservative) and
+  **single-use per charge**: `RegisterPaymentMethod` rejects `qr_code`
+  (Stripe's off-session / reusable PayPay is out of scope for now — future
+  work). Note stripe-go v82.5.1 does not enumerate `paypay`; the adapter
+  sends the type as a raw string, which the string-driven Stripe API and the
+  SDK's string-typed fields handle fine.
 - **Amounts**: Stripe amounts are integers in the currency's smallest unit
   (cents for USD/EUR, whole yen for zero-decimal JPY). `shared.Money` is
   converted using each currency's exponent; an amount that is not exactly
@@ -289,16 +306,19 @@ method is implemented. The same `Gateway` also implements
   invoice payment method. Card storage/vaulting itself is done client-side;
   the adapter never handles raw PANs. `RegisterPaymentMethodRequest.Type` is
   honored: cards (or an unspecified `Type`, for backward compatibility)
-  attach; `convenience_store` / `bank_transfer` are rejected with
-  `method_not_supported` — konbini and customer_balance PaymentMethods are
-  single-use on Stripe, so a fresh one is created client-side per charge — as
-  is any other type this adapter does not implement. `ListPaymentMethods`
+  attach; `convenience_store` / `bank_transfer` / `qr_code` are rejected with
+  `method_not_supported` — konbini, customer_balance and paypay
+  PaymentMethods are single-use in this adapter, so a fresh one is created
+  client-side per charge — as is any other type this adapter does not
+  implement. `ListPaymentMethods`
   returns **all** attached methods (no card filter); each entry's `Type` is
   mapped from the Stripe type (`card` → credit/debit by funding, `konbini` →
   `convenience_store`, `customer_balance` → `bank_transfer`,
-  `us_bank_account` → `direct_debit` with `BankAccount` details populated),
-  and unrecognized Stripe types degrade gracefully to a typed pass-through of
-  their raw name rather than masquerading as cards.
+  `us_bank_account` → `direct_debit` with `BankAccount` details populated,
+  `paypay` → `qr_code` with `QRCode.Provider` set to `paypay` — the SDK
+  exposes no further PayPay details), and unrecognized Stripe types degrade
+  gracefully to a typed pass-through of their raw name rather than
+  masquerading as cards.
 - **Idempotency**: `IdempotencyKey` on Charge/Authorize/Capture/Refund is
   forwarded verbatim as Stripe's `Idempotency-Key` header. **Stripe expires
   idempotency keys after ~24h**, so a retry beyond that window is no longer
@@ -333,9 +353,10 @@ method is implemented. The same `Gateway` also implements
   expanded `payment_method.type`): only konbini / customer_balance become
   `payment_instruction.created` — the "voucher / wire instructions issued"
   signal, with `payment_intent.succeeded` arriving as the settlement webhook
-  hours-to-days later — while a card 3DS challenge (or an uninspectable
-  payload) passes through with its raw Stripe name, since an authentication
-  prompt is not a payment instruction. Refund-object
+  hours-to-days later — while a card 3DS challenge, a PayPay redirect
+  approval (the same nature as 3DS), or an uninspectable payload passes
+  through with its raw Stripe name, since an authentication/approval prompt
+  is not a payment instruction. Refund-object
   events (`refund.created` / `refund.updated` / `charge.refund.updated`) are
   classified from the refund's `status` (`succeeded` → `refund.succeeded`,
   `failed`/`canceled` → `refund.failed`, anything else passes through

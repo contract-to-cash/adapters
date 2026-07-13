@@ -391,6 +391,9 @@ func TestWebhook_RequiresActionClassification(t *testing.T) {
 		{"expanded konbini payment_method classifies", `"payment_method":{"id":"pm_1","object":"payment_method","type":"konbini"}`, port.WebhookEventPaymentInstructionCreated},
 		{"konbini types with unexpanded pm string classify", `"payment_method_types":["konbini"],"payment_method":"pm_1"`, port.WebhookEventPaymentInstructionCreated},
 		{"card 3DS passes through", `"payment_method_types":["card"]`, raw},
+		// PayPay's requires_action is a redirect approval (same nature as card
+		// 3DS), not an issued payment instruction — it must stay raw.
+		{"paypay redirect approval passes through", `"payment_method_types":["paypay"]`, raw},
 		{"card with unexpanded pm string passes through", `"payment_method_types":["card"],"payment_method":"pm_1"`, raw},
 		{"missing payment_method_types passes through", ``, raw},
 		{"unparseable payment_method_types passes through", `"payment_method_types":"konbini"`, raw},
