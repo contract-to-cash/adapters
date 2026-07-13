@@ -56,15 +56,18 @@ func (g *Gateway) ID() string { return GatewayID }
 // synchronously. Konbini (convenience_store) and JP bank transfer via
 // customer_balance (bank_transfer) are asynchronous: Charge returns
 // requires_action with a hosted voucher / bank-transfer-instructions URL, and
-// settlement arrives later via webhook (payment_intent.succeeded). Both async
-// methods are one-step-charge only — Authorize rejects them (Stripe does not
-// support manual capture for either) — and JPY-only.
+// settlement arrives later via webhook (payment_intent.succeeded). PayPay
+// (qr_code) is a redirect-approval method: Charge returns requires_action
+// with the PayPay approval redirect URL and requires a return URL. All three
+// non-card methods are one-step-charge only — Authorize rejects them — and
+// JPY-only.
 func (g *Gateway) SupportedMethods() []port.PaymentMethodType {
 	return []port.PaymentMethodType{
 		port.PaymentMethodTypeCreditCard,
 		port.PaymentMethodTypeDebitCard,
 		port.PaymentMethodTypeConvenienceStore,
 		port.PaymentMethodTypeBankTransfer,
+		port.PaymentMethodTypeQRCode,
 	}
 }
 
@@ -72,17 +75,19 @@ func (g *Gateway) SupportedMethods() []port.PaymentMethodType {
 
 // Charge performs a one-step charge: it creates and confirms a PaymentIntent
 // with automatic capture. A required customer action — a 3D Secure challenge
-// for cards, a hosted konbini voucher, or hosted bank-transfer instructions
-// for customer_balance — surfaces as a response with
-// TransactionStatusRequiresAction and a ThreeDSecure redirect/instructions URL
-// rather than an error. Async methods (konbini, customer_balance) then settle
-// later via webhook (payment_intent.succeeded).
+// for cards, a hosted konbini voucher, hosted bank-transfer instructions for
+// customer_balance, or the PayPay approval redirect — surfaces as a response
+// with TransactionStatusRequiresAction and a ThreeDSecure redirect/instructions
+// URL rather than an error. Non-card methods then settle via webhook
+// (payment_intent.succeeded).
 //
 // The payment method's type is looked up first (one extra API call per
 // charge): a bare "pm_..." ID does not reveal its type, and Stripe requires
-// konbini / customer_balance intents to name their type in
+// konbini / customer_balance / paypay intents to name their type in
 // payment_method_types instead of the card-pinned automatic_payment_methods
-// configuration (issue #51) used for cards.
+// configuration (issue #51) used for cards. PayPay additionally requires
+// ThreeDSecure.ReturnURL (the customer approves in the PayPay app/web and is
+// redirected back).
 func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.ChargeResponse, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -135,8 +140,10 @@ func (g *Gateway) Charge(ctx context.Context, req *port.ChargeRequest) (*port.Ch
 // Konbini and customer_balance (JP bank transfer) do not support manual
 // capture on Stripe — there is nothing to place a hold on until the customer
 // pays at the register / wires the funds — so Authorize rejects them with a
-// method_not_supported GatewayError instead of silently issuing a
-// one-step charge. Use Charge for those methods.
+// method_not_supported GatewayError instead of silently issuing a one-step
+// charge. PayPay is rejected likewise: stripe-go v82 exposes no manual-capture
+// surface for it, so this adapter conservatively treats it as charge-only.
+// Use Charge for those methods.
 func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*port.AuthorizeResponse, error) {
 	if req == nil {
 		return nil, &ValidationError{Field: "req", Message: "must not be nil"}
@@ -153,11 +160,11 @@ func (g *Gateway) Authorize(ctx context.Context, req *port.AuthorizeRequest) (*p
 	if err != nil {
 		return nil, err
 	}
-	if isAsyncSettlementType(spm.Type) {
+	if isChargeOnlyType(spm.Type) {
 		return nil, &port.GatewayError{
 			Code: port.ErrorCodeMethodNotSupported,
 			Message: fmt.Sprintf(
-				"stripe: %s does not support authorize (manual capture); it settles asynchronously — use Charge",
+				"stripe: %s does not support authorize (manual capture) — use Charge",
 				spm.Type),
 		}
 	}
@@ -372,11 +379,12 @@ func (g *Gateway) RegisterPaymentMethod(ctx context.Context, req *port.RegisterP
 	switch req.Type {
 	case "", port.PaymentMethodTypeCreditCard, port.PaymentMethodTypeDebitCard:
 		// Cards (Stripe's single "card" type) attach below.
-	case port.PaymentMethodTypeConvenienceStore, port.PaymentMethodTypeBankTransfer:
+	case port.PaymentMethodTypeConvenienceStore, port.PaymentMethodTypeBankTransfer,
+		port.PaymentMethodTypeQRCode:
 		return nil, &port.GatewayError{
 			Code: port.ErrorCodeMethodNotSupported,
 			Message: fmt.Sprintf(
-				"stripe: %q payment methods (konbini / customer_balance) are single-use and cannot be stored on a customer; create one per charge instead",
+				"stripe: %q payment methods (konbini / customer_balance / paypay) are single-use in this adapter and cannot be stored on a customer; create one per charge instead",
 				req.Type),
 		}
 	default:
@@ -560,6 +568,11 @@ func (g *Gateway) toTransaction(pi *stripego.PaymentIntent) (*port.Transaction, 
 		Metadata:        pi.Metadata,
 		CreatedAt:       unixTime(pi.Created),
 		UpdatedAt:       unixTime(pi.Created),
+		// Surface any pending customer-action URL (3DS redirect, konbini
+		// voucher, bank-transfer instructions, PayPay approval) so integrators
+		// reading back a requires_action intent via GetTransaction get the
+		// same URL the original ChargeResponse carried.
+		ThreeDSecure: nextActionResult(pi),
 	}
 	if pi.Customer != nil {
 		t.CustomerID = pi.Customer.ID
@@ -593,6 +606,12 @@ func toPaymentMethodDetail(pm *stripego.PaymentMethod, isDefault bool) *port.Pay
 			Funding:     string(pm.Card.Funding),
 		}
 	}
+	// PayPay: stripe-go v82 exposes no PayPay detail struct on PaymentMethod,
+	// so only the provider (known from the type itself) is populated — no data
+	// is invented.
+	if pm.Type == stripePaymentMethodTypePayPay {
+		d.QRCode = &port.QRCodeDetails{Provider: string(stripePaymentMethodTypePayPay)}
+	}
 	// Stripe surfaces bank account details on us_bank_account PaymentMethods;
 	// konbini and customer_balance carry no reusable account details.
 	if pm.USBankAccount != nil {
@@ -613,9 +632,9 @@ func toPaymentMethodDetail(pm *stripego.PaymentMethod, isDefault bool) *port.Pay
 
 // fetchPaymentMethod retrieves a Stripe PaymentMethod. Charge and Authorize
 // use it to learn the type behind a bare "pm_..." ID (one extra API call per
-// charge): Stripe requires konbini / customer_balance PaymentIntents to name
-// their type explicitly in payment_method_types, and Authorize must reject
-// those types before creating a manual-capture intent.
+// charge): Stripe requires konbini / customer_balance / paypay PaymentIntents
+// to name their type explicitly in payment_method_types, and Authorize must
+// reject those types before creating a manual-capture intent.
 func (g *Gateway) fetchPaymentMethod(ctx context.Context, id string) (*stripego.PaymentMethod, error) {
 	params := &stripego.PaymentMethodParams{}
 	setContext(&params.Params, ctx)
@@ -626,12 +645,31 @@ func (g *Gateway) fetchPaymentMethod(ctx context.Context, id string) (*stripego.
 	return pm, nil
 }
 
-// isAsyncSettlementType reports whether the Stripe payment method type settles
-// asynchronously (confirm yields requires_action; funds arrive later via
-// webhook). These types support neither manual capture (Authorize) nor
-// attachment to a customer (RegisterPaymentMethod).
+// stripePaymentMethodTypePayPay is Stripe's "paypay" PaymentMethod type.
+// stripe-go v82.5.1 does not enumerate it (no constant, no PaymentMethod.PayPay
+// struct, no PaymentIntent options), but the API is string-driven: the type is
+// sent verbatim in payment_method_types and decodes fine into the string-typed
+// PaymentMethod.Type, so the adapter defines the constant locally.
+const stripePaymentMethodTypePayPay stripego.PaymentMethodType = "paypay"
+
+// isAsyncSettlementType reports whether the Stripe payment method type is an
+// async INSTRUCTION method (confirm yields requires_action with issued payment
+// instructions; funds arrive later via webhook). PayPay is deliberately NOT
+// included: its requires_action is a redirect approval — the same nature as a
+// card 3DS challenge, not an instruction issuance — which matters for the
+// webhook classifier (classifyRequiresActionEvent) that maps only instruction
+// methods to payment_instruction.created.
 func isAsyncSettlementType(t stripego.PaymentMethodType) bool {
 	return t == stripego.PaymentMethodTypeKonbini || t == stripego.PaymentMethodTypeCustomerBalance
+}
+
+// isChargeOnlyType reports whether the Stripe payment method type supports
+// one-step charges only in this adapter: the async instruction methods plus
+// paypay (no manual-capture surface in stripe-go v82, so Authorize rejects it
+// conservatively). None of these can be attached to a customer either
+// (RegisterPaymentMethod rejects their port types).
+func isChargeOnlyType(t stripego.PaymentMethodType) bool {
+	return isAsyncSettlementType(t) || t == stripePaymentMethodTypePayPay
 }
 
 // applyMethodTypeParams configures the PaymentIntent params for the resolved
@@ -653,6 +691,16 @@ func isAsyncSettlementType(t stripego.PaymentMethodType) bool {
 // instead of a return_url redirect. customer_balance additionally requires a
 // Stripe customer, because the received funds are tracked on the customer's
 // cash balance.
+//
+// PayPay is a JPY-only REDIRECT-approval method: it is likewise pinned via
+// payment_method_types, but confirmation REQUIRES a return_url (the customer
+// approves in the PayPay app/web and is redirected back). The only return-URL
+// carrier on the port request is ThreeDSecureRequest.ReturnURL — the same
+// field the card 3DS redirect flow uses — so the paypay branch reads it from
+// there and rejects the charge with a ValidationError when it is absent,
+// rather than silently creating an unconfirmable intent. The approval URL
+// comes back via next_action.redirect_to_url (nextActionResult's first
+// branch). The card-only request_three_d_secure option is not applied.
 func applyMethodTypeParams(
 	params *stripego.PaymentIntentParams,
 	pmType stripego.PaymentMethodType,
@@ -688,6 +736,20 @@ func applyMethodTypeParams(
 				},
 			},
 		}
+	case stripePaymentMethodTypePayPay:
+		if err := requireJPY("paypay", currency); err != nil {
+			return err
+		}
+		if tds == nil || tds.ReturnURL == "" {
+			return &ValidationError{
+				Field:   "ThreeDSecure.ReturnURL",
+				Message: "a return URL is required for paypay charges (the customer approves in PayPay and is redirected back)",
+			}
+		}
+		params.ReturnURL = stripego.String(tds.ReturnURL)
+		params.PaymentMethodTypes = stripego.StringSlice([]string{
+			string(stripePaymentMethodTypePayPay),
+		})
 	default:
 		applyThreeDS(params, tds)
 		applyAutomaticPaymentMethods(params)
@@ -709,11 +771,11 @@ func requireJPY(method, currency string) error {
 
 // stripePMToPortType maps a Stripe PaymentMethod to the port payment method
 // type. Cards distinguish debit via funding; konbini and customer_balance map
-// to the port's convenience_store / bank_transfer; us_bank_account (the type
-// on which Stripe exposes bank account details) maps to direct_debit. Any
-// other type degrades gracefully to a typed pass-through of its raw Stripe
-// name — mirroring the webhook handler's unknown-event pass-through — so a
-// new Stripe method never panics or masquerades as a card.
+// to the port's convenience_store / bank_transfer; paypay maps to qr_code;
+// us_bank_account (the type on which Stripe exposes bank account details) maps
+// to direct_debit. Any other type degrades gracefully to a typed pass-through
+// of its raw Stripe name — mirroring the webhook handler's unknown-event
+// pass-through — so a new Stripe method never panics or masquerades as a card.
 func stripePMToPortType(pm *stripego.PaymentMethod) port.PaymentMethodType {
 	switch pm.Type {
 	case stripego.PaymentMethodTypeCard:
@@ -725,6 +787,8 @@ func stripePMToPortType(pm *stripego.PaymentMethod) port.PaymentMethodType {
 		return port.PaymentMethodTypeConvenienceStore
 	case stripego.PaymentMethodTypeCustomerBalance:
 		return port.PaymentMethodTypeBankTransfer
+	case stripePaymentMethodTypePayPay:
+		return port.PaymentMethodTypeQRCode
 	case stripego.PaymentMethodTypeUSBankAccount:
 		return port.PaymentMethodTypeDirectDebit
 	default:
@@ -857,13 +921,14 @@ func cardFundingToMethodType(funding stripego.CardFunding) port.PaymentMethodTyp
 // the 3DS redirect flow uses, so the core's existing requires_action handling
 // covers every method:
 //
-//   - card 3DS challenge: next_action.redirect_to_url.url
+//   - card 3DS challenge or PayPay approval: next_action.redirect_to_url.url
 //   - konbini: next_action.konbini_display_details.hosted_voucher_url
 //   - customer_balance (JP bank transfer):
 //     next_action.display_bank_transfer_instructions.hosted_instructions_url
 //
-// In all three cases the caller sends the customer to the URL to complete the
-// payment (authenticate / print the voucher / read the wire instructions).
+// In every case the caller sends the customer to the URL to complete the
+// payment (authenticate / approve in PayPay / print the voucher / read the
+// wire instructions).
 func nextActionResult(pi *stripego.PaymentIntent) *port.ThreeDSecureResult {
 	na := pi.NextAction
 	if na == nil {

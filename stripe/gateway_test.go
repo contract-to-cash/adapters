@@ -566,6 +566,68 @@ func TestGateway_GetTransaction(t *testing.T) {
 	if tx.Status != port.TransactionStatusSucceeded {
 		t.Errorf("Status = %q", tx.Status)
 	}
+	// No next_action on the intent → no requires-action URL (regression).
+	if tx.ThreeDSecure != nil {
+		t.Errorf("ThreeDSecure = %+v, want nil without next_action", tx.ThreeDSecure)
+	}
+}
+
+// TestGateway_GetTransaction_PendingActionURL verifies that reading back a
+// requires_action intent surfaces the pending customer-action URL on
+// Transaction.ThreeDSecure — the platform's only read-back surface for the
+// voucher / instructions / approval / 3DS URL of a pending charge.
+func TestGateway_GetTransaction_PendingActionURL(t *testing.T) {
+	cases := []struct {
+		name       string
+		nextAction map[string]any
+		wantURL    string
+	}{
+		{
+			name: "konbini voucher",
+			nextAction: map[string]any{
+				"type": "konbini_display_details",
+				"konbini_display_details": map[string]any{
+					"hosted_voucher_url": "https://payments.stripe.com/konbini/voucher/abc",
+				},
+			},
+			wantURL: "https://payments.stripe.com/konbini/voucher/abc",
+		},
+		{
+			name: "redirect approval (PayPay / 3DS)",
+			nextAction: map[string]any{
+				"type":            "redirect_to_url",
+				"redirect_to_url": map[string]any{"url": "https://hooks.stripe.com/redirect/xyz"},
+			},
+			wantURL: "https://hooks.stripe.com/redirect/xyz",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeStripe(t)
+			obj := map[string]any{
+				"id": "pi_pending", "object": "payment_intent", "amount": 1000,
+				"currency": "jpy", "status": "requires_action", "created": 1_700_000_000,
+				"next_action": tc.nextAction,
+			}
+			b, _ := json.Marshal(obj)
+			f.on("GET /v1/payment_intents/pi_pending", string(b))
+			g := f.gateway(WithClock(fixedClock))
+
+			tx, err := g.GetTransaction(context.Background(), "pi_pending")
+			if err != nil {
+				t.Fatalf("GetTransaction: %v", err)
+			}
+			if tx.Status != port.TransactionStatusRequiresAction {
+				t.Errorf("Status = %q, want requires_action", tx.Status)
+			}
+			if tx.ThreeDSecure == nil || tx.ThreeDSecure.RedirectURL == nil {
+				t.Fatalf("expected pending action URL on ThreeDSecure, got %+v", tx.ThreeDSecure)
+			}
+			if *tx.ThreeDSecure.RedirectURL != tc.wantURL {
+				t.Errorf("RedirectURL = %q, want %q", *tx.ThreeDSecure.RedirectURL, tc.wantURL)
+			}
+		})
+	}
 }
 
 func TestGateway_RegisterPaymentMethod_Default(t *testing.T) {
@@ -650,6 +712,7 @@ func TestGateway_IDAndSupportedMethods(t *testing.T) {
 		port.PaymentMethodTypeDebitCard,
 		port.PaymentMethodTypeConvenienceStore,
 		port.PaymentMethodTypeBankTransfer,
+		port.PaymentMethodTypeQRCode,
 	}
 	if len(methods) != len(want) {
 		t.Fatalf("SupportedMethods = %v, want %v", methods, want)
@@ -1137,6 +1200,7 @@ func TestGateway_ListPaymentMethods_MultiType(t *testing.T) {
 					"bank_name": "STRIPE TEST BANK", "routing_number": "110000000",
 					"account_type": "checking", "last4": "6789",
 				}},
+			map[string]any{"id": "pm_pp", "object": "payment_method", "type": "paypay", "created": 1_700_000_000},
 			map[string]any{"id": "pm_link", "object": "payment_method", "type": "link", "created": 1_700_000_000},
 		},
 	}
@@ -1155,8 +1219,8 @@ func TestGateway_ListPaymentMethods_MultiType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPaymentMethods: %v", err)
 	}
-	if len(methods) != 3 {
-		t.Fatalf("len = %d, want 3", len(methods))
+	if len(methods) != 4 {
+		t.Fatalf("len = %d, want 4", len(methods))
 	}
 	if methods[0].Type != port.PaymentMethodTypeCreditCard || methods[0].Card == nil {
 		t.Errorf("card method = %+v", methods[0])
@@ -1172,11 +1236,17 @@ func TestGateway_ListPaymentMethods_MultiType(t *testing.T) {
 		ba.AccountType != "checking" || ba.AccountNumber != "6789" || ba.AccountHolder != "Taro Yamada" {
 		t.Errorf("BankAccount = %+v", ba)
 	}
-	// Unknown Stripe types degrade to a typed pass-through, not a fake card.
-	if methods[2].Type != port.PaymentMethodType("link") {
-		t.Errorf("link Type = %q, want raw pass-through", methods[2].Type)
+	if methods[2].Type != port.PaymentMethodTypeQRCode {
+		t.Errorf("paypay Type = %q, want qr_code", methods[2].Type)
 	}
-	if methods[2].Card != nil || methods[2].BankAccount != nil {
+	if methods[2].QRCode == nil || methods[2].QRCode.Provider != "paypay" {
+		t.Errorf("paypay QRCode = %+v, want provider paypay", methods[2].QRCode)
+	}
+	// Unknown Stripe types degrade to a typed pass-through, not a fake card.
+	if methods[3].Type != port.PaymentMethodType("link") {
+		t.Errorf("link Type = %q, want raw pass-through", methods[3].Type)
+	}
+	if methods[3].Card != nil || methods[3].BankAccount != nil {
 		t.Errorf("link method should carry no card/bank details")
 	}
 }
@@ -1197,5 +1267,120 @@ func TestGateway_GetPaymentMethod_Konbini(t *testing.T) {
 	}
 	if detail.Card != nil {
 		t.Errorf("konbini detail should carry no card details")
+	}
+}
+
+// --- PayPay (qr_code) ---
+
+// TestGateway_Charge_PayPay verifies a paypay charge pins the type in
+// payment_method_types, forwards the required return_url, surfaces the PayPay
+// approval redirect URL through the requires-action channel, and reports
+// PaymentMethodType qr_code.
+func TestGateway_Charge_PayPay(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_pp", pmJSON("pm_pp", "paypay", nil))
+	obj := map[string]any{
+		"id": "pi_pp", "object": "payment_intent", "amount": 3000, "currency": "jpy",
+		"status": "requires_action", "created": 1_700_000_000,
+		"next_action": map[string]any{
+			"type":            "redirect_to_url",
+			"redirect_to_url": map[string]any{"url": "https://hooks.stripe.com/redirect/paypay/abc"},
+		},
+	}
+	b, _ := json.Marshal(obj)
+	f.on("POST /v1/payment_intents", string(b))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_pp"
+	resp, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: jpy(3000), CustomerID: "cus_1", PaymentMethodID: &pmID,
+		ThreeDSecure: &port.ThreeDSecureRequest{ReturnURL: "https://app/paypay/return"},
+	})
+	if err != nil {
+		t.Fatalf("Charge: %v", err)
+	}
+	if got := f.lastForm.Get("payment_method_types[0]"); got != "paypay" {
+		t.Errorf("payment_method_types[0] = %q, want paypay", got)
+	}
+	if got := f.lastForm.Get("return_url"); got != "https://app/paypay/return" {
+		t.Errorf("return_url = %q", got)
+	}
+	if _, ok := f.lastForm["automatic_payment_methods[enabled]"]; ok {
+		t.Errorf("automatic_payment_methods must not be sent with explicit payment_method_types")
+	}
+	// The card-only 3DS challenge option must not leak onto the paypay intent.
+	if _, ok := f.lastForm["payment_method_options[card][request_three_d_secure]"]; ok {
+		t.Errorf("request_three_d_secure must not be sent for paypay")
+	}
+	if resp.Status != port.TransactionStatusRequiresAction {
+		t.Errorf("Status = %q, want requires_action", resp.Status)
+	}
+	if resp.PaymentMethodType != port.PaymentMethodTypeQRCode {
+		t.Errorf("PaymentMethodType = %q, want qr_code", resp.PaymentMethodType)
+	}
+	if resp.ThreeDSecure == nil || resp.ThreeDSecure.RedirectURL == nil ||
+		*resp.ThreeDSecure.RedirectURL != "https://hooks.stripe.com/redirect/paypay/abc" {
+		t.Fatalf("expected PayPay approval redirect URL, got %+v", resp.ThreeDSecure)
+	}
+}
+
+// TestGateway_Charge_PayPay_RequiresReturnURL verifies a paypay charge without
+// a return URL fails client-side with a ValidationError instead of creating an
+// unconfirmable PaymentIntent (only the PM lookup route is registered — the
+// fake fatals if the intent creation is attempted).
+func TestGateway_Charge_PayPay_RequiresReturnURL(t *testing.T) {
+	cases := map[string]*port.ThreeDSecureRequest{
+		"nil ThreeDSecure": nil,
+		"empty ReturnURL":  {Required: false, ReturnURL: ""},
+	}
+	for name, tds := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeStripe(t)
+			f.on("GET /v1/payment_methods/pm_pp", pmJSON("pm_pp", "paypay", nil))
+			g := f.gateway(WithClock(fixedClock))
+
+			pmID := "pm_pp"
+			_, err := g.Charge(context.Background(), &port.ChargeRequest{
+				Amount: jpy(3000), PaymentMethodID: &pmID, ThreeDSecure: tds,
+			})
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("want ValidationError, got %v", err)
+			}
+		})
+	}
+}
+
+// TestGateway_Charge_PayPay_NonJPYRejected verifies the JPY-only guard.
+func TestGateway_Charge_PayPay_NonJPYRejected(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_pp", pmJSON("pm_pp", "paypay", nil))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_pp"
+	_, err := g.Charge(context.Background(), &port.ChargeRequest{
+		Amount: usd(2599), PaymentMethodID: &pmID,
+		ThreeDSecure: &port.ThreeDSecureRequest{ReturnURL: "https://app/return"},
+	})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) || ge.Code != port.ErrorCodeCurrencyNotSupported {
+		t.Fatalf("want currency_not_supported GatewayError, got %v", err)
+	}
+}
+
+// TestGateway_Authorize_PayPayRejected verifies the conservative charge-only
+// stance: stripe-go v82 exposes no manual-capture surface for paypay, so
+// Authorize rejects it rather than risking a mis-charge.
+func TestGateway_Authorize_PayPayRejected(t *testing.T) {
+	f := newFakeStripe(t)
+	f.on("GET /v1/payment_methods/pm_pp", pmJSON("pm_pp", "paypay", nil))
+	g := f.gateway(WithClock(fixedClock))
+
+	pmID := "pm_pp"
+	_, err := g.Authorize(context.Background(), &port.AuthorizeRequest{
+		Amount: jpy(3000), PaymentMethodID: &pmID,
+	})
+	var ge *port.GatewayError
+	if !errors.As(err, &ge) || ge.Code != port.ErrorCodeMethodNotSupported {
+		t.Fatalf("want method_not_supported GatewayError, got %v", err)
 	}
 }

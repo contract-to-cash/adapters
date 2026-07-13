@@ -260,7 +260,8 @@ var stripeEventMap = map[string]port.WebhookEventType{
 	// the intent's payment method (see classifyRequiresActionEvent), because
 	// "payment instructions issued" only describes the async instruction
 	// methods (konbini, customer_balance) — for a card the same event is a 3DS
-	// authentication prompt, which keeps its raw pass-through.
+	// authentication prompt, and for paypay a redirect approval; both keep
+	// their raw pass-through.
 	"payment_intent.succeeded":      port.WebhookEventPaymentSucceeded,
 	"payment_intent.payment_failed": port.WebhookEventPaymentFailed,
 	"payment_intent.processing":     port.WebhookEventPaymentPending,
@@ -392,8 +393,10 @@ func classifyChargeRefundedEvent(stripeType string, data []byte) port.WebhookEve
 // become payment_instruction.created ("voucher / bank-transfer instructions
 // issued"). For a card the same Stripe event is a 3DS authentication prompt,
 // not an instruction issuance, so it keeps the raw pass-through it had before
-// this adapter supported async methods; an unreadable or ambiguous payload is
-// likewise NOT guessed and passes through with its raw Stripe name.
+// this adapter supported async methods; paypay is deliberately excluded too
+// (isAsyncSettlementType does not include it) because its requires_action is
+// a redirect approval of the same nature as 3DS. An unreadable or ambiguous
+// payload is likewise NOT guessed and passes through with its raw Stripe name.
 func classifyRequiresActionEvent(stripeType string, data []byte) port.WebhookEventType {
 	var intent struct {
 		PaymentMethodTypes []string `json:"payment_method_types"`
