@@ -59,8 +59,12 @@ func TestContractRepo_Save_AppendsEvents(t *testing.T) {
 	repo, mock := newContractRepo(t)
 	agg := newDraftContract(t, "c-1")
 
-	// Event store Append with no ambient tx: Begin, COUNT check, INSERT, Commit.
+	// Event store Append with no ambient tx: Begin, append-lock, COUNT check,
+	// INSERT, Commit. The FOR UPDATE on event_append_lock serializes appends so
+	// global positions commit in order (issue #60).
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("c-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))

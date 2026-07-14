@@ -19,6 +19,14 @@ const (
 	subscriberBuffer    = 100
 	pgUniqueViolation   = "23505"
 	defaultCatchUpBatch = 1000
+
+	// eventAppendLockKey is the fixed transaction-level advisory-lock key that
+	// serializes every event append against every other (issue #60). It is an
+	// arbitrary but stable constant (the ASCII bytes of "events") chosen to be
+	// distinctive so it is unlikely to collide with an advisory-lock key an
+	// integrator uses elsewhere in the same database; if you do use
+	// pg_advisory_xact_lock yourself, avoid this value.
+	eventAppendLockKey int64 = 0x6576656e7473 // "events"
 )
 
 // PostgresEventStore implements eventstore.Store.
@@ -102,6 +110,28 @@ func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events
 
 func (s *PostgresEventStore) appendInTx(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	q := s.q(ctx)
+
+	// Serialize all appends against each other for the lifetime of this
+	// transaction (issue #60). global_position (BIGSERIAL) is assigned at INSERT
+	// time but only becomes visible at COMMIT time, and commits are NOT ordered
+	// by position: without this lock, tx A could grab positions 100-101 while
+	// tx B grabs 102 and commits first. A subscriber's catch-up
+	// (`WHERE global_position > pos ORDER BY global_position`) would then read
+	// 102, durably advance its checkpoint past it, and never see 100-101 once A
+	// commits — permanent, silent event loss in subscriptions/projections.
+	//
+	// pg_advisory_xact_lock is held until the transaction ends (commit or
+	// rollback), so it makes the [assign position, commit] windows of concurrent
+	// appends non-overlapping: the holder assigns the lower positions AND commits
+	// them before the next append can assign any. Commit order therefore equals
+	// position order, which is exactly the gap-free visibility the reader side
+	// (Subscribe/LoadAll) relies on — no reader-side change is needed. Aggregate
+	// rehydration (per-stream, version-ordered) never depended on this and is
+	// unaffected. In the ambient-transaction case the lock is held until the
+	// caller commits, which also serializes appends against that wider unit.
+	if _, err := q.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, eventAppendLockKey); err != nil {
+		return fmt.Errorf("acquire append lock: %w", err)
+	}
 
 	// Optimistic-concurrency pre-check (same transaction as the inserts,
 	// mirroring the mysql adapter): the UNIQUE (stream_id, version)
@@ -276,7 +306,11 @@ func (s *PostgresEventStore) LoadAll(ctx context.Context, fromPosition int64, li
 // up to DB durability and at-least-once: a slow consumer back-pressures the
 // sender (the channel send blocks rather than dropping), and catch-up is keyed
 // off the last delivered global_position so a NOTIFY that races an in-flight
-// catch-up cannot skip an event. The channel is closed when ctx is cancelled
+// catch-up cannot skip an event. Losslessness across concurrent appends further
+// depends on Append serializing position assignment and commit under
+// pg_advisory_xact_lock (issue #60): that makes commit order equal position
+// order, so advancing past position N here can never hide an as-yet-uncommitted
+// event at a lower position. The channel is closed when ctx is cancelled
 // (runSubscription returns on ctx.Err() / ctx.Done() and defers close(ch)); an
 // abnormal termination is surfaced via the optional subscription error handler
 // (WithSubscriptionErrorHandler), since the bare channel return cannot.

@@ -733,34 +733,49 @@ and returned in UTC; `DATETIME` columns are scanned correctly under either
 
 ## Operational semantics
 
-### `global_position` ordering and at-most-once tailing
+### `global_position` ordering and gap-free tailing (issue #60)
 
 `global_position` is a `BIGSERIAL` / `AUTO_INCREMENT` column: the value is
 **assigned when a row is INSERTed** but only becomes **visible when the inserting
-transaction COMMITs**. Under concurrent appends those two moments can reorder.
-If transaction A grabs position `N` and transaction B grabs `N+1`, and B commits
-first, a reader polling `WHERE global_position > last_seen` can observe `N+1`,
-advance its cursor past it, and then **never see `N`** once A finally commits —
-`N` is now behind the cursor. This affects everything that tails by position:
+transaction COMMITs**. Left unserialized those two moments can reorder: if
+transaction A grabs position `N` and transaction B grabs `N+1`, and B commits
+first, a reader polling `WHERE global_position > last_seen` could observe `N+1`,
+advance its cursor past it, and then **never see `N`** once A finally commits.
+That is permanent, silent event loss for everything that tails by position —
 `EventStore.Subscribe` (both adapters) and any position-based projector driven
 off `LoadAll` / a `CheckpointStore`.
 
+**`Append` closes this gap by serializing appends** so that commit order always
+equals `global_position` order:
+
+- **postgres** takes `pg_advisory_xact_lock` (a fixed per-store key) at the start
+  of the append transaction — no schema change.
+- **mysql** takes an exclusive row lock on a single `event_append_lock` row via
+  `SELECT ... FOR UPDATE` (migration `017_event_append_lock`), since MySQL has no
+  transaction-scoped advisory lock.
+
+Both locks are held until the transaction ends, so the *assign-position →ᅠcommit*
+windows of concurrent appends never overlap: the holder assigns the lower
+positions **and** commits them before any other append assigns a position.
+A reader that has advanced past position `N` can therefore never later be shown a
+lower, as-yet-uncommitted position. In the ambient-transaction case the lock is
+held until the caller commits, serializing appends against that wider unit too.
+
 Consequences and guidance:
 
-- **Position-based subscription/projection is at-most-once with respect to a
-  concurrent-commit gap.** It is not a durable-delivery guarantee. Do not use it
-  as the sole path for state that must never miss an event.
-- **For strict correctness, use synchronous projection** — project inside the
-  same transaction that appends the events (core's synchronous projection mode),
-  so the read model is updated atomically with the write and no position gap can
-  form. The `TxManager` in each adapter lets a projector run in the append
-  transaction.
-- If you must tail asynchronously, reduce the window by keeping append
-  transactions short, and reconcile periodically with a `Rebuild` (which scans
-  by `global_position` after the fact, when all rows are committed and visible).
-  This adapter does not add a `txid`/gap-detection guard; if you need one, gate
-  the cursor on the oldest in-flight transaction (e.g. `pg_snapshot_xmin`) in
-  your projector.
+- **Position-based subscription/projection is now gap-free** — lossless up to DB
+  durability. Delivery is still **at-least-once** (a retried/idempotent append or
+  a re-subscribe can redeliver a position), so keep position-based consumers
+  idempotent / dedup by event ID.
+- The trade-off is that appends are **globally serialized** at commit granularity.
+  Keep append transactions short so the lock is not held across unrelated work;
+  an ambient transaction that calls `Append` holds the lock until it commits.
+- **Synchronous projection remains available** for consumers that want the read
+  model updated atomically with the write — project inside the append
+  transaction via the adapter `TxManager`. It is no longer *required* to avoid
+  position gaps, only a stronger-consistency option.
+- Aggregate rehydration (per-stream, version-ordered via `Load`) never depended
+  on global-position visibility and is unaffected.
 
 `Subscribe` (postgres) additionally distinguishes a broken subscription from a
 clean shutdown. The core `eventstore.Store` interface returns only a channel
