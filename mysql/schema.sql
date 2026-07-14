@@ -37,3 +37,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
     PRIMARY KEY (stream_id, version),
     KEY idx_stream_created (stream_id, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+-- Single-row lock table that serializes event appends so commit order matches
+-- global_position order (issue #60). Appends take SELECT ... FOR UPDATE on the
+-- id = 1 row for the lifetime of the append transaction; see mysql/eventstore.go
+-- appendOn and migration 017_event_append_lock.up.sql.
+CREATE TABLE IF NOT EXISTS event_append_lock (
+    id    TINYINT UNSIGNED NOT NULL,
+    notes VARCHAR(255)     NOT NULL DEFAULT '',
+    PRIMARY KEY (id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+INSERT INTO event_append_lock (id, notes)
+VALUES (1, 'serializes event appends; see issue #60')
+ON DUPLICATE KEY UPDATE id = id;

@@ -62,6 +62,8 @@ func TestEventStore_Append_Success(t *testing.T) {
 	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
@@ -89,6 +91,8 @@ func TestEventStore_Append_UsesAmbientTx(t *testing.T) {
 	// The caller's transaction. sqlmock matches the Begin/Commit to this one;
 	// the store itself must not Begin/Commit again.
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
@@ -121,6 +125,8 @@ func TestEventStore_Append_VersionConflict(t *testing.T) {
 	events := []eventstore.Event{sampleEvent("e9", "contract-1", 6)}
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1)) // current=1, expected=5
@@ -138,6 +144,8 @@ func TestEventStore_Append_DuplicateKeyMapsToVersionConflict(t *testing.T) {
 	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
@@ -167,6 +175,8 @@ func TestEventStore_Append_DuplicateEventIDIsNotVersionConflict(t *testing.T) {
 	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
@@ -204,6 +214,8 @@ func TestEventStore_Append_ContractIdempotencyConflictMapsToConflict(t *testing.
 	events := []eventstore.Event{sampleEvent("e1", "contract-1", 1)}
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
@@ -305,6 +317,8 @@ func TestEventStore_Append_DerivesVersionFromExpectedVersion(t *testing.T) {
 	e2 := sampleEvent("e7", "wrong-stream", 42)
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(5))
@@ -407,6 +421,8 @@ func TestEventStore_Append_NormalizesEmptyData(t *testing.T) {
 	ev.Data = nil
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
 		WithArgs("contract-1").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))

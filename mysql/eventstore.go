@@ -128,6 +128,33 @@ func (s *EventStore) Append(ctx context.Context, streamID string, events []event
 // stale or inconsistent caller value cannot diverge from the optimistic
 // concurrency baseline.
 func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, events []eventstore.Event, expectedVersion int) error {
+	// Serialize all appends against each other for the lifetime of this
+	// transaction (issue #60). global_position (AUTO_INCREMENT) is assigned at
+	// INSERT time but only becomes visible at COMMIT time, and commits are NOT
+	// ordered by position: without this lock, tx A could grab positions 100-101
+	// while tx B grabs 102 and commits first. A subscriber's poll
+	// (`WHERE global_position > pos ORDER BY global_position`) would then read
+	// 102, durably advance its checkpoint past it, and never see 100-101 once A
+	// commits — permanent, silent event loss in subscriptions/projections.
+	//
+	// MySQL has no transaction-scoped advisory lock (GET_LOCK is session-scoped),
+	// so we take an exclusive row lock on the single event_append_lock row
+	// (migration 017). The lock is held until this transaction ends (commit or
+	// rollback), making the [assign position, commit] windows of concurrent
+	// appends non-overlapping: the holder assigns the lower positions AND commits
+	// them before the next append can assign any, so commit order equals position
+	// order — exactly the gap-free visibility the reader side (Subscribe/LoadAll)
+	// relies on, mirroring the postgres adapter's pg_advisory_xact_lock. q here is
+	// always a transaction (Append guarantees one), so the FOR UPDATE lock is
+	// genuinely held to commit; in the ambient-transaction case that is the
+	// caller's commit. Aggregate rehydration (per-stream, version-ordered) never
+	// depended on this and is unaffected.
+	var lockID int
+	if err := q.QueryRowContext(ctx,
+		"SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE").Scan(&lockID); err != nil {
+		return fmt.Errorf("event store: acquire append lock: %w", err)
+	}
+
 	var current int
 	if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE stream_id = ?", streamID).Scan(&current); err != nil {
 		return fmt.Errorf("event store: count events: %w", err)
@@ -241,7 +268,12 @@ func (s *EventStore) LoadAll(ctx context.Context, fromPosition int64, limit int)
 // tails newly appended events. Unlike the in-memory reference store this honours
 // fromPosition (replay-then-tail) and is lossless up to DB durability: delivery
 // is backed by polling LoadAll, so a slow consumer back-pressures the poller
-// rather than dropping events. The channel is closed when ctx is cancelled.
+// rather than dropping events. Losslessness across concurrent appends further
+// depends on Append serializing position assignment and commit under the
+// event_append_lock row lock (issue #60): that makes commit order equal position
+// order, so advancing the poll cursor past position N can never hide an
+// as-yet-uncommitted event at a lower position. The channel is closed when ctx
+// is cancelled.
 func (s *EventStore) Subscribe(ctx context.Context, fromPosition int64) (<-chan eventstore.Event, error) {
 	ch := make(chan eventstore.Event, s.subscribeBuffer)
 	go s.pollLoop(ctx, fromPosition, ch)

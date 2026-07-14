@@ -958,3 +958,82 @@ func mustUsageRecord(t *testing.T, id, idempotencyKey string) *usage.UsageRecord
 	}
 	return rec
 }
+
+// Issue #60: concurrent appends must serialize so global positions become
+// visible in commit order. global_position (AUTO_INCREMENT) is assigned at INSERT
+// but only visible at COMMIT, and commits are not ordered by position; without
+// serialization a subscriber that read a higher position could permanently miss
+// a lower one committed afterwards. Append now takes an exclusive row lock on the
+// single event_append_lock row (SELECT ... FOR UPDATE), so an append holding an
+// open transaction blocks every other append until it commits.
+//
+// This holds an uncommitted append in tx A and asserts a concurrent append B
+// cannot proceed until A commits, and that A's event (positioned first, under the
+// lock) sorts before B's in LoadAll — i.e. commit order == global-position order.
+func TestIntegration_EventStore_ConcurrentAppends_SerializeGlobalPosition(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	ctx := context.Background()
+	store := mysql.New(db, integrationClock)
+
+	evt := func(id, stream string) []eventstore.Event {
+		return []eventstore.Event{{
+			ID: id, Type: "test.event", SchemaVersion: 1,
+			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		}}
+	}
+
+	// Tx A appends inside an ambient transaction and stays open: it holds the
+	// event_append_lock row lock until it commits.
+	txA, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx A: %v", err)
+	}
+	ctxA := mysql.ContextWithTx(ctx, txA)
+	if err := store.Append(ctxA, "stream-A", evt("evt-a", "stream-A"), 0); err != nil {
+		_ = txA.Rollback()
+		t.Fatalf("append A: %v", err)
+	}
+
+	// Tx B is a self-managed append run concurrently; it must block on the
+	// append-lock row until A commits.
+	bDone := make(chan error, 1)
+	go func() { bDone <- store.Append(ctx, "stream-B", evt("evt-b", "stream-B"), 0) }()
+
+	select {
+	case err := <-bDone:
+		_ = txA.Rollback()
+		t.Fatalf("append B completed before A committed (appends not serialized): %v", err)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: B is blocked on the row lock held by A.
+	}
+
+	if err := txA.Commit(); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("append B after A committed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("append B did not complete after A committed")
+	}
+
+	// Commit order (A then B) must equal global-position order.
+	all, err := store.LoadAll(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("want 2 events, got %d", len(all))
+	}
+	if all[0].StreamID != "stream-A" || all[1].StreamID != "stream-B" {
+		t.Fatalf("global-position order = [%s, %s], want [stream-A, stream-B]",
+			all[0].StreamID, all[1].StreamID)
+	}
+	if all[1].GlobalPosition <= all[0].GlobalPosition {
+		t.Fatalf("positions not strictly increasing in commit order: %d then %d",
+			all[0].GlobalPosition, all[1].GlobalPosition)
+	}
+}
