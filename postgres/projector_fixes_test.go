@@ -95,6 +95,83 @@ func TestContractProjector_TrialEnded_Converted_IsActive(t *testing.T) {
 	}
 }
 
+// --- Dunning: past_due / recovered transitions are materialized ---
+
+// A payment-failure dunning transition (core MarkPastDue) must land the read
+// model in 'past_due' so status-filtered queries (e.g. FindDueForRenewal's
+// status = 'active') stop selecting the contract.
+func TestContractProjector_PastDue_IsPastDue(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	seedContract(t, ctx, es, proj, "c-pastdue", "p-1", time.Now().UTC())
+
+	pastDue := eventstore.Event{
+		ID: "evt-pastdue", StreamID: "c-pastdue", Type: contract.EventTypeContractPastDue,
+		Version: 2, SchemaVersion: 1,
+		Data:       json.RawMessage(`{"contract_id":"c-pastdue","reason":"payment_failed","marked_at":"2026-06-01T12:00:00Z"}`),
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := es.Append(ctx, "c-pastdue", []eventstore.Event{pastDue}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := proj.Project(ctx, pastDue); err != nil {
+		t.Fatal(err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM contract_read_models WHERE id = 'c-pastdue'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "past_due" {
+		t.Errorf("status = %q, want 'past_due'", status)
+	}
+}
+
+// A recovery transition (core RecoverFromPastDue) must return the read model
+// to 'active', mirroring the resumed case.
+func TestContractProjector_Recovered_IsActive(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	seedContract(t, ctx, es, proj, "c-recovered", "p-1", time.Now().UTC())
+
+	pastDue := eventstore.Event{
+		ID: "evt-rec-pastdue", StreamID: "c-recovered", Type: contract.EventTypeContractPastDue,
+		Version: 2, SchemaVersion: 1,
+		Data:       json.RawMessage(`{"contract_id":"c-recovered","reason":"payment_failed","marked_at":"2026-06-01T12:00:00Z"}`),
+		OccurredAt: time.Now().UTC(),
+	}
+	recovered := eventstore.Event{
+		ID: "evt-recovered", StreamID: "c-recovered", Type: contract.EventTypeContractRecovered,
+		Version: 3, SchemaVersion: 1,
+		Data:       json.RawMessage(`{"contract_id":"c-recovered","recovered_at":"2026-06-02T12:00:00Z"}`),
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := es.Append(ctx, "c-recovered", []eventstore.Event{pastDue, recovered}, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []eventstore.Event{pastDue, recovered} {
+		if err := proj.Project(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM contract_read_models WHERE id = 'c-recovered'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Errorf("status = %q, want 'active'", status)
+	}
+}
+
 // --- Issue #14 Fix 2: invoice total parsed from core Money JSON ---
 
 func TestInvoiceProjector_Created_ParsesMoneyTotal(t *testing.T) {

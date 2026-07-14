@@ -66,6 +66,55 @@ func TestContractProjector_Project_Suspended(t *testing.T) {
 	}
 }
 
+// A payment-failure dunning transition (core MarkPastDue) must land the read
+// model in 'past_due' so status-filtered queries (e.g. FindDueForRenewal's
+// status = 'active') stop selecting the contract.
+func TestContractProjector_Project_PastDue(t *testing.T) {
+	proj, mock := newContractProjector(t)
+
+	ev := eventstore.Event{
+		StreamID: "contract-1",
+		Type:     "contract.past_due",
+		Version:  3,
+		Data:     []byte(`{"contract_id":"contract-1","reason":"payment_failed","marked_at":"2026-06-01T12:00:00Z"}`),
+	}
+
+	mock.ExpectExec(`UPDATE contract_read_models SET status = 'past_due'`).
+		WithArgs(sqlmock.AnyArg(), 3, "contract-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project past_due: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A recovery transition (core RecoverFromPastDue) must return the read model
+// to 'active', mirroring the resumed case.
+func TestContractProjector_Project_Recovered(t *testing.T) {
+	proj, mock := newContractProjector(t)
+
+	ev := eventstore.Event{
+		StreamID: "contract-1",
+		Type:     "contract.recovered",
+		Version:  4,
+		Data:     []byte(`{"contract_id":"contract-1","recovered_at":"2026-06-02T12:00:00Z"}`),
+	}
+
+	mock.ExpectExec(`UPDATE contract_read_models SET status = 'active'`).
+		WithArgs(sqlmock.AnyArg(), 4, "contract-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project recovered: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // A trial that ends without converting must land the read model in 'cancelled'
 // (matching the aggregate), not 'active'.
 func TestContractProjector_Project_TrialEnded_NotConverted(t *testing.T) {
