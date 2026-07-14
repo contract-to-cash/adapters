@@ -33,6 +33,8 @@ func (p *ContractProjector) Project(ctx context.Context, event eventstore.Event)
 		contract.EventTypeContractActivated,
 		contract.EventTypeContractSuspended,
 		contract.EventTypeContractResumed,
+		contract.EventTypeContractPastDue,
+		contract.EventTypeContractRecovered,
 		contract.EventTypeContractCancelled,
 		contract.EventTypeContractRenewed,
 		contract.EventTypeContractExpired,
@@ -178,6 +180,24 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 		return err
 
 	case contract.EventTypeContractResumed:
+		_, err := q.Exec(ctx,
+			`UPDATE contract_read_models SET status = 'active', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
+			raw, event.Version, contractID)
+		return err
+
+	case contract.EventTypeContractPastDue:
+		// Dunning: the aggregate moved Active -> PastDue (core MarkPastDue).
+		// Materializing 'past_due' keeps status-filtered queries honest —
+		// notably FindDueForRenewal (status = 'active'), which must stop
+		// selecting a contract whose renewal would be rejected by core anyway.
+		_, err := q.Exec(ctx,
+			`UPDATE contract_read_models SET status = 'past_due', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
+			raw, event.Version, contractID)
+		return err
+
+	case contract.EventTypeContractRecovered:
+		// Recovery: PastDue -> Active after a successful payment (core
+		// RecoverFromPastDue).
 		_, err := q.Exec(ctx,
 			`UPDATE contract_read_models SET status = 'active', data = $1, version = $2, updated_at = NOW() WHERE id = $3`,
 			raw, event.Version, contractID)
