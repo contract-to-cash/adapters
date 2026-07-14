@@ -800,6 +800,10 @@ func splitPaymentMethodID(id string) (customerID, cardID string, err error) {
 // --- Response mapping ---
 
 func (g *Gateway) toChargeResponse(resp *PaymentResponse) *port.ChargeResponse {
+	// Instructions stays nil: this adapter is card-only today, and card
+	// charges settle synchronously (or via 3DS, which is not a payment
+	// instruction). Populate port.PaymentInstructions here once async/push
+	// methods (konbini, bank transfer, ...) land.
 	out := &port.ChargeResponse{
 		TransactionID:     resp.ID,
 		Status:            toTransactionStatus(resp.Status),

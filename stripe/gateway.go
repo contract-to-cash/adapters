@@ -533,6 +533,7 @@ func (g *Gateway) toChargeResponse(pi *stripego.PaymentIntent, methodType port.P
 		CreatedAt:         unixTime(pi.Created),
 		Metadata:          pi.Metadata,
 		ThreeDSecure:      nextActionResult(pi),
+		Instructions:      paymentInstructions(pi),
 	}, nil
 }
 
@@ -929,6 +930,13 @@ func cardFundingToMethodType(funding stripego.CardFunding) port.PaymentMethodTyp
 // In every case the caller sends the customer to the URL to complete the
 // payment (authenticate / approve in PayPay / print the voucher / read the
 // wire instructions).
+//
+// Note: for async/push-style outcomes (konbini, bank transfer) the canonical
+// channel is now ChargeResponse.Instructions (port.PaymentInstructions, core
+// payment-gateway.md §6.5.6), populated by paymentInstructions below. The
+// voucher/instructions URL is still mirrored here for backward compatibility
+// with integrators that read RedirectURL; the 3DS redirect keeps this channel
+// as its primary (and only) home.
 func nextActionResult(pi *stripego.PaymentIntent) *port.ThreeDSecureResult {
 	na := pi.NextAction
 	if na == nil {
@@ -948,6 +956,51 @@ func nextActionResult(pi *stripego.PaymentIntent) *port.ThreeDSecureResult {
 	return &port.ThreeDSecureResult{
 		Status:      port.ThreeDSecureStatusRequired,
 		RedirectURL: &u,
+	}
+}
+
+// paymentInstructions maps the PaymentIntent's next_action to the port's
+// customer-facing payment instructions (ChargeResponse.Instructions) for
+// async/push-style outcomes:
+//
+//   - konbini_display_details → kind "konbini_voucher": the hosted voucher
+//     page plus the voucher expiry (expires_at). Stripe exposes only
+//     per-chain payment/confirmation codes (stores.familymart/lawson/...),
+//     not a single canonical code, so Reference is left empty — the voucher
+//     page carries the per-store codes.
+//   - display_bank_transfer_instructions → kind "bank_transfer": the hosted
+//     instructions page plus Stripe's short transfer reference code (the memo
+//     the customer attaches to the wire). Full virtual-account details stay
+//     on the hosted page; they are deliberately not flattened into Reference.
+//
+// Card 3DS challenges (redirect_to_url) return nil: authentication redirects
+// are not payment instructions and stay on ThreeDSecureResult.RedirectURL.
+func paymentInstructions(pi *stripego.PaymentIntent) *port.PaymentInstructions {
+	na := pi.NextAction
+	if na == nil {
+		return nil
+	}
+	switch {
+	case na.KonbiniDisplayDetails != nil && na.KonbiniDisplayDetails.HostedVoucherURL != "":
+		k := na.KonbiniDisplayDetails
+		inst := &port.PaymentInstructions{
+			Kind: "konbini_voucher",
+			URL:  k.HostedVoucherURL,
+		}
+		if k.ExpiresAt > 0 {
+			exp := time.Unix(k.ExpiresAt, 0).UTC()
+			inst.ExpiresAt = &exp
+		}
+		return inst
+	case na.DisplayBankTransferInstructions != nil && na.DisplayBankTransferInstructions.HostedInstructionsURL != "":
+		bt := na.DisplayBankTransferInstructions
+		return &port.PaymentInstructions{
+			Kind:      "bank_transfer",
+			URL:       bt.HostedInstructionsURL,
+			Reference: bt.Reference,
+		}
+	default:
+		return nil
 	}
 }
 
