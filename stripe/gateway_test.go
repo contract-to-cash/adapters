@@ -287,6 +287,11 @@ func TestGateway_Charge_RequiresAction3DS(t *testing.T) {
 	if *resp.ThreeDSecure.RedirectURL != "https://hooks.stripe.com/redirect/abc" {
 		t.Errorf("redirect = %q", *resp.ThreeDSecure.RedirectURL)
 	}
+	// A 3DS authentication redirect is not a payment instruction: the async
+	// instructions channel must stay empty for cards.
+	if resp.Instructions != nil {
+		t.Errorf("Instructions = %+v, want nil for card 3DS", resp.Instructions)
+	}
 	if f.lastForm.Get("return_url") != "https://app/return" {
 		t.Errorf("return_url = %q", f.lastForm.Get("return_url"))
 	}
@@ -999,6 +1004,25 @@ func TestGateway_Charge_Konbini(t *testing.T) {
 	if *resp.ThreeDSecure.RedirectURL != "https://payments.stripe.com/konbini/voucher/abc" {
 		t.Errorf("voucher URL = %q", *resp.ThreeDSecure.RedirectURL)
 	}
+	// The canonical channel for async instructions (core §6.5.6).
+	if resp.Instructions == nil {
+		t.Fatalf("expected Instructions on konbini requires-action response")
+	}
+	if resp.Instructions.Kind != "konbini_voucher" {
+		t.Errorf("Instructions.Kind = %q, want konbini_voucher", resp.Instructions.Kind)
+	}
+	if resp.Instructions.URL != "https://payments.stripe.com/konbini/voucher/abc" {
+		t.Errorf("Instructions.URL = %q", resp.Instructions.URL)
+	}
+	if resp.Instructions.ExpiresAt == nil {
+		t.Fatalf("expected Instructions.ExpiresAt from konbini expires_at")
+	}
+	if want := time.Unix(1_700_300_000, 0).UTC(); !resp.Instructions.ExpiresAt.Equal(want) {
+		t.Errorf("Instructions.ExpiresAt = %v, want %v", resp.Instructions.ExpiresAt, want)
+	}
+	if loc := resp.Instructions.ExpiresAt.Location(); loc != time.UTC {
+		t.Errorf("Instructions.ExpiresAt location = %v, want UTC", loc)
+	}
 }
 
 // TestGateway_Charge_BankTransfer verifies a customer_balance charge pins the
@@ -1015,6 +1039,7 @@ func TestGateway_Charge_BankTransfer(t *testing.T) {
 			"display_bank_transfer_instructions": map[string]any{
 				"type":                    "jp_bank_transfer",
 				"hosted_instructions_url": "https://payments.stripe.com/instructions/xyz",
+				"reference":               "CTC-1234",
 			},
 		},
 	}
@@ -1050,6 +1075,24 @@ func TestGateway_Charge_BankTransfer(t *testing.T) {
 	if resp.ThreeDSecure == nil || resp.ThreeDSecure.RedirectURL == nil ||
 		*resp.ThreeDSecure.RedirectURL != "https://payments.stripe.com/instructions/xyz" {
 		t.Fatalf("expected hosted instructions URL, got %+v", resp.ThreeDSecure)
+	}
+	// The canonical channel for async instructions (core §6.5.6).
+	if resp.Instructions == nil {
+		t.Fatalf("expected Instructions on bank-transfer requires-action response")
+	}
+	if resp.Instructions.Kind != "bank_transfer" {
+		t.Errorf("Instructions.Kind = %q, want bank_transfer", resp.Instructions.Kind)
+	}
+	if resp.Instructions.URL != "https://payments.stripe.com/instructions/xyz" {
+		t.Errorf("Instructions.URL = %q", resp.Instructions.URL)
+	}
+	// Short transfer reference code only — full virtual-account details must
+	// not be flattened into the reference string.
+	if resp.Instructions.Reference != "CTC-1234" {
+		t.Errorf("Instructions.Reference = %q, want CTC-1234", resp.Instructions.Reference)
+	}
+	if resp.Instructions.ExpiresAt != nil {
+		t.Errorf("Instructions.ExpiresAt = %v, want nil (Stripe bank transfers do not expire)", resp.Instructions.ExpiresAt)
 	}
 }
 
