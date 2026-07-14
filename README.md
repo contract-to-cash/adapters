@@ -767,9 +767,26 @@ Consequences and guidance:
   durability. Delivery is still **at-least-once** (a retried/idempotent append or
   a re-subscribe can redeliver a position), so keep position-based consumers
   idempotent / dedup by event ID.
-- The trade-off is that appends are **globally serialized** at commit granularity.
-  Keep append transactions short so the lock is not held across unrelated work;
-  an ambient transaction that calls `Append` holds the lock until it commits.
+- **Trade-off — global append serialization.** This is a *hard serialization*: a
+  single lock orders **all** appends, so even appends to *different* streams wait
+  behind each other and total write throughput is bounded by how fast append
+  transactions commit. For high-frequency append workloads this cost is not
+  negligible. It was chosen deliberately over the reader-side alternative
+  (leave appends concurrent and gate the read cursor on the oldest in-flight
+  transaction, e.g. `pg_snapshot_xmin` / a `txid` low-water mark), which pushes
+  complexity and a correctness burden onto every consumer; the write-side lock is
+  the most robust and keeps consumers trivial. Keep append transactions short so
+  the lock is not held across unrelated work; an ambient transaction that calls
+  `Append` holds the lock until *it* commits.
+- **Deadlock surface (ambient transactions).** Because the append lock is held to
+  the caller's commit, a caller that also takes other row locks around `Append`
+  can deadlock against another transaction that appends first and then touches the
+  same rows inside the append transaction — notably core's pattern of running a
+  **synchronous projection or an outbox writer inside the append transaction**.
+  Lock order crosses (`R → L` vs `L → R`) and the DB detects it, returning a
+  retryable error (postgres `40P01` / mysql `1213`) — it is **not** silent, but
+  callers combining ambient row locks with `Append` should keep the append
+  transaction short and be prepared to retry on deadlock.
 - **Synchronous projection remains available** for consumers that want the read
   model updated atomically with the write — project inside the append
   transaction via the adapter `TxManager`. It is no longer *required* to avoid

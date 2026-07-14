@@ -16,12 +16,18 @@
 -- windows of concurrent appends non-overlapping, exactly like the advisory lock.
 --
 -- The table holds exactly one row (id = 1); it stores no data of its own.
+--
+-- Both statements are idempotent (IF NOT EXISTS + ON DUPLICATE KEY UPDATE) so the
+-- whole file is safe to re-run after a manual reconciliation of a half-applied
+-- migration (MySQL DDL auto-commits, so a mid-file failure can leave the table
+-- created but the seed row missing). This matches schema.sql exactly.
 
-CREATE TABLE event_append_lock (
+CREATE TABLE IF NOT EXISTS event_append_lock (
     id    TINYINT UNSIGNED NOT NULL,
     notes VARCHAR(255)     NOT NULL DEFAULT '',
     PRIMARY KEY (id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 INSERT INTO event_append_lock (id, notes)
-VALUES (1, 'serializes event appends; see issue #60');
+VALUES (1, 'serializes event appends; see issue #60')
+ON DUPLICATE KEY UPDATE id = id;
