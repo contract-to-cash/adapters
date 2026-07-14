@@ -405,7 +405,19 @@ verification level differs:
 
 CI (`.github/workflows/ci.yml`) builds against the `contract-to-cash/core`
 version pinned in `go.mod`, resolved from the Go module proxy like any other
-dependency. The pin is now core **v0.4.0**.
+dependency. The pin is now core **v0.7.0**.
+
+Round 4 (core v0.7.0):
+
+- **dependency bump only**: core `v0.4.0` → `v0.7.0`. No adapter code changes
+  were required — the intervening core releases are additive (Minor). Notable
+  new core surface now available to adapters:
+  - `PaymentInstructions` on `ChargeResponse` (core 0.7.0): async / push charges
+    (konbini vouchers, bank-transfer virtual accounts) can return customer-facing
+    instructions (url / reference / expiry) as a first-class field instead of
+    smuggling a URL through `ThreeDSecureResult`.
+  - `OnCompensationExecutedHook` (core#257): non-fatal observability hook fired
+    after `ProcessPayment` saga charge-reversal.
 
 Round 3 (core v0.4.0):
 

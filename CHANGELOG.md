@@ -16,6 +16,17 @@ publishes a GitHub Release. See the **Releasing** section of the README.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
+### Changed
+
+- Bump `github.com/contract-to-cash/core` `v0.4.0` → **`v0.7.0`**. Dependency
+  update only — no adapter code changes were required, as the intervening core
+  releases are additive (Minor). New core surface now available to adapters:
+  `PaymentInstructions` on `ChargeResponse` (async / push-charge instructions
+  for konbini and bank-transfer virtual accounts) and the non-fatal
+  `OnCompensationExecutedHook` (saga charge-reversal observability, core#257).
+
 ## [0.1.0] - 2026-07-14
 
 Initial curated release. Establishes the versioning, licensing, and
