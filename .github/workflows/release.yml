@@ -1,0 +1,217 @@
+name: Release
+
+# リリースフロー（core/.github/workflows/release.yml と同じ運用）:
+#   1. main へ push（PR マージ）されると、CHANGELOG.md の最新バージョン見出し
+#      （## [x.y.z]）を読み取り、そのタグが未作成なら自動でリリースする。
+#      CHANGELOG に [Unreleased] しか無い場合や、既に同名タグがある場合は no-op。
+#      → 「リリースしたい版を CHANGELOG に切る」ことがリリーストリガーになる。
+#   2. workflow_dispatch で手動起動も可能。切るタグを input で明示指定できる。
+#
+# どちらの経路でも、タグを打つ前に build + lint + unit/integration test を実行し、
+# 通った場合のみタグと GitHub Release を作成する（壊れた版を公開しない）。
+# adapters は postgres / mysql の実 DB を要するため、verify で両サービスを起動する。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'CHANGELOG.md'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '切るタグ (例: v0.1.0)。空の場合は CHANGELOG.md の最新版を使用する'
+        required: false
+        type: string
+      prerelease:
+        description: 'プレリリースとして公開する'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # 切るべきタグを決定する。決まらなければ以降の job をスキップする。
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      should_release: ${{ steps.decide.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Decide tag
+        id: decide
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 1. dispatch で明示指定があればそれを使う。無ければ CHANGELOG から抽出。
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            # CHANGELOG.md の最初の `## [x.y.z]` 見出し（Unreleased を除く）を拾う。
+            # 1件もマッチしないのは正常ケース（Unreleased のみ等）なので、
+            # `set -e -o pipefail` 下で grep の exit 1 に殺されないよう `|| true` で握り潰す。
+            version=$( { grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+[^]]*\]' CHANGELOG.md || true; } \
+              | head -1 | sed -E 's/^## \[([^]]+)\].*/\1/')
+            if [ -z "$version" ]; then
+              echo "CHANGELOG.md にバージョン見出し (## [x.y.z]) がありません。リリースをスキップします。"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tag="v${version}"
+          fi
+
+          # 2. `v` プレフィックスを正規化（v1.2.3 でも 1.2.3 でも受け付ける）
+          case "$tag" in
+            v*) : ;;
+            *)  tag="v${tag}" ;;
+          esac
+
+          # 3. SemVer 形式を検証
+          if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::タグ '$tag' が SemVer (vX.Y.Z) 形式ではありません。"
+            exit 1
+          fi
+
+          # 4. 既存タグと衝突していないか確認（衝突ならスキップ = 冪等）
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "タグ $tag は既に存在します。リリースをスキップします。"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "リリース対象タグ: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  # タグを打つ前に build / lint / unit + integration test を実行し、壊れた版を公開しない。
+  # CI (ci.yml) と同じ検証を、postgres / mysql サービスを起動して一括で走らせる。
+  verify:
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: adapters_test
+          POSTGRES_PASSWORD: adapters_test
+          POSTGRES_DB: adapters_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapters_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_USER: adapters_test
+          MYSQL_PASSWORD: adapters_test
+          MYSQL_DATABASE: adapters_test
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ADAPTERS_TEST_DSN: postgres://adapters_test:adapters_test@localhost:5432/adapters_test?sslmode=disable
+      ADAPTERS_TEST_MYSQL_DSN: adapters_test:adapters_test@tcp(127.0.0.1:3306)/adapters_test?parseTime=true&loc=UTC&multiStatements=true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt differences in:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.5.0
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: Tests (unit + postgres/mysql integration)
+        run: go test ./... -race -count=1
+
+  # タグを作成し、GitHub Release を発行する。
+  release:
+    needs: [resolve, verify]
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      PRERELEASE: ${{ github.event.inputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          notes_file="$(mktemp)"
+
+          # CHANGELOG.md から該当バージョンの節（次の `## ` まで）を切り出す。
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > "$notes_file"
+
+          if [ ! -s "$notes_file" ]; then
+            echo "CHANGELOG に ${version} の節が見つからないため、自動生成ノートを使用します。" >&2
+            printf 'Release %s\n' "$TAG" > "$notes_file"
+          fi
+          echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create GitHub Release
+        run: |
+          set -euo pipefail
+          args=(--title "$TAG" --notes-file "${{ steps.notes.outputs.notes_file }}" --target "$GITHUB_SHA")
+          if [ "${PRERELEASE:-false}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"

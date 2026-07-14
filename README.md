@@ -836,3 +836,44 @@ with `WHERE stream_id = ANY($1)` (postgres) / `WHERE stream_id IN (?, …)`
 doing it correctly in both dialects (snapshot + post-snapshot event windows,
 per-stream ordering) is a larger change than this housekeeping pass warrants.
 Until then, keep batch sizes bounded on very large renewal runs.
+
+## Releasing
+
+This module is versioned **separately** from
+[`contract-to-cash/core`](https://github.com/contract-to-cash/core) and follows
+[Semantic Versioning](https://semver.org/). Releases are **driven by
+[CHANGELOG.md](CHANGELOG.md)** — the same convention `core` uses.
+
+To cut a release:
+
+1. Add a new `## [x.y.z] - YYYY-MM-DD` section to `CHANGELOG.md` (move items out
+   of `## [Unreleased]`), and update the compare/tag links at the bottom.
+2. Merge that change to `main`.
+3. The [`Release` workflow](.github/workflows/release.yml) reads the newest
+   `## [x.y.z]` heading, and if that tag does not yet exist it:
+   - builds, lints (`gofmt` + `golangci-lint` + `go vet`), and runs the **full
+     unit + PostgreSQL/MySQL integration suite** — a broken version is never
+     published;
+   - creates an annotated `vx.y.z` tag; and
+   - publishes a GitHub Release whose notes are extracted from that CHANGELOG
+     section.
+
+The workflow is **idempotent**: if the newest CHANGELOG version already has a
+tag (e.g. the merge touched `CHANGELOG.md` without cutting a new version), it is
+a no-op. You can also run it manually from the Actions tab
+(`workflow_dispatch`), optionally passing an explicit tag and/or marking the
+release as a prerelease.
+
+Pin compatible tags of `adapters` and `core` together — check `go.mod` for the
+core version a given release targets.
+
+## License
+
+[contract-to-cash Adapters License](LICENSE) — MIT-style permissive terms with a
+**commercial-use attribution** requirement: any commercial product or service
+that uses these adapters must clearly and conspicuously acknowledge that it uses
+`contract-to-cash/adapters` (for example, in its documentation or an
+About/Credits/Third-Party Notices screen). Non-commercial use — internal
+evaluation, research, education, and personal projects not provided for
+commercial gain — carries no such requirement. See [LICENSE](LICENSE) for the
+exact terms.
