@@ -15,6 +15,15 @@ import (
 // ContractProjectorName is the checkpoint key for the contract projector.
 const ContractProjectorName = "contract"
 
+// contractUpcasterChain runs every contract event through the same core
+// upcaster chain the aggregate rehydration path uses (contract.ContractAggregate.
+// LoadFromHistory in core/domain/contract/aggregate.go), so the projection read
+// model never has to hand-roll a second implementation of a core schema
+// migration (issue #63). Upcast is idempotent and a no-op for event types /
+// versions no registered upcaster claims, so running it unconditionally over
+// every contract event here is safe.
+var contractUpcasterChain = contract.NewContractUpcasterChain()
+
 // ContractProjector maintains the contract_read_models projection table.
 type ContractProjector struct {
 	db         *sql.DB
@@ -145,13 +154,28 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 	q := querierFromContext(ctx, p.db)
 	contractID := event.StreamID
 
+	// Upcast before decoding so the projection reads the same schema the
+	// aggregate would after replay (issue #63) -- e.g. a legacy v1
+	// contract.created payload with billing_cycle instead of interval, or a
+	// v1 price.changed missing new_price_id, arrives here already migrated.
+	upcasted, err := contractUpcasterChain.Upcast(event)
+	if err != nil {
+		return fmt.Errorf("upcast contract event: %w", err)
+	}
+
 	var data map[string]any
-	if len(event.Data) > 0 {
-		if err := json.Unmarshal(event.Data, &data); err != nil {
+	if len(upcasted.Data) > 0 {
+		if err := json.Unmarshal(upcasted.Data, &data); err != nil {
 			return fmt.Errorf("unmarshal event data: %w", err)
 		}
 	}
-	raw := normalizeJSON(event.Data)
+	// raw is persisted into contract_read_models.data, a read-model column
+	// (not the append-only event log, which upcasting never touches -- see
+	// eventstore.go's Append). Storing the upcasted payload keeps the read
+	// model's JSON blob self-consistent with the aggregate's view of the same
+	// event, so any consumer reading contract_read_models.data directly
+	// (rather than replaying the stream) also sees the migrated shape.
+	raw := normalizeJSON(upcasted.Data)
 
 	switch event.Type {
 	case contract.EventTypeContractCreated:
@@ -269,6 +293,11 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 		// An immediate price change must move the read model's price_id to the
 		// new price so price-filtered queries stay accurate. NULLIF guards
 		// against clobbering the existing price_id with an empty payload value.
+		// contractUpcasterChain (above) already guarantees new_price_id is
+		// PRESENT on a legacy v1 payload (PriceChangedEventUpcaster fills it
+		// with "" when absent), but a v1 event that never had a PriceID -- only
+		// an old/new Money pair -- legitimately upcasts to an empty string, so
+		// the NULLIF/COALESCE fallback to the existing price_id stays required.
 		newPriceID, _ := data["new_price_id"].(string)
 		_, err := q.ExecContext(ctx,
 			`UPDATE contract_read_models
