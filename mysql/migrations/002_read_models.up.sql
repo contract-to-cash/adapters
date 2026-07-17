@@ -40,6 +40,14 @@ CREATE INDEX idx_contract_rm_trial_end ON contract_read_models (trial_end_date);
 -- Do not use this column for arithmetic or financial reconciliation. Same
 -- lossy BIGINT-from-big.Rat truncation as the domain-table money columns
 -- documented in mysql/money.go.
+-- NOTE: this SQL comment is the canonical documentation of that behavior. The
+-- migration runner (mysql/migrate.go) tracks applied migrations by filename
+-- only and never re-runs an already-applied file, so the inline COMMENT
+-- clause below only reaches information_schema.COLUMNS.COLUMN_COMMENT (and
+-- thus DESCRIBE / SHOW FULL COLUMNS) on a database migrated from scratch
+-- after this change; an existing deployment that already has this table
+-- keeps whatever comment (or none) it had before, regardless of what this
+-- file now says.
 CREATE TABLE invoice_read_models (
     id          VARCHAR(191) NOT NULL,
     contract_id VARCHAR(191) NOT NULL,

@@ -45,6 +45,13 @@ CREATE TABLE invoice_read_models (
 -- use this column for arithmetic or financial reconciliation. Same lossy
 -- BIGINT-from-big.Rat truncation as the domain-table money columns documented
 -- in postgres/money.go (parseMoneyPayload).
+-- NOTE: this SQL comment is the canonical documentation of that behavior. The
+-- migration runner (postgres/migrate.go) tracks applied migrations by
+-- filename only and never re-runs an already-applied file, so the
+-- COMMENT ON COLUMN below only reaches pg_catalog (and thus \d+ / information
+-- schema introspection) on a database migrated from scratch after this
+-- change; an existing deployment that already has this table keeps whatever
+-- comment (or none) it had before, regardless of what this file now says.
 COMMENT ON COLUMN invoice_read_models.total IS
     'Floor-truncated whole-currency-unit approximation for query/display only; exact big.Rat amount lives in event payloads / state JSON (see also the data column on this table); do not use for arithmetic or reconciliation.';
 

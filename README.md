@@ -47,7 +47,13 @@ cuts off on snapshot `CreatedAt`, and `Append` validates that each event's
 caller-stamped `Version` is contiguous with `expectedVersion` (i.e. event `i`
 must equal `expectedVersion+i+1`), rejecting the whole batch with a
 `shared.DomainError` (code `validation_error`) on a gap, stale version, or
-out-of-order value instead of silently renumbering it.
+out-of-order value instead of silently renumbering it. One divergence remains:
+both SQL adapters treat an empty event batch as a no-op and return `nil`
+immediately, without performing the `expectedVersion` optimistic-lock check,
+whereas the in-memory reference checks `currentVersion != expectedVersion`
+before ever looking at the events slice and returns `version_conflict` even
+for an empty batch. This is pre-existing behavior (pinned by mysql's
+`TestEventStore_Append_EmptyIsNoop`), not something this change alters.
 
 `usage.Repository.Record` also follows the core reference
 (`infrastructure/inmemory/usage_repository.go`): recording a `UsageRecord`
