@@ -95,6 +95,25 @@ func (s *EventStore) q(ctx context.Context) Querier {
 // runs directly on it — the caller owns the begin/commit. Otherwise the store
 // wraps the COUNT check and inserts in its own transaction so the batch is
 // atomic.
+//
+// Timestamp precision (issue #64): core stamps Event.OccurredAt with
+// nanosecond-precision time.Now() (indirectly, via shared.Clock). The events
+// table's occurred_at column is DATETIME(6) (migration 001), which MySQL
+// stores at microsecond precision, so a round trip through Append/Load
+// truncates any sub-microsecond component of OccurredAt — the same
+// characteristic as the postgres adapter's TIMESTAMPTZ column. A boundary
+// comparison that relies on nanosecond-exact ordering between two events
+// stamped in the same microsecond can therefore behave differently than
+// against the in-memory reference store (infrastructure/inmemory/event_store.go),
+// which keeps OccurredAt at full Go time.Time precision. This is a storage
+// characteristic, not a bug.
+//
+// RecordedAt provenance (issue #64): unlike the postgres adapter, which lets
+// the events.recorded_at column's DB-side DEFAULT NOW() populate RecordedAt,
+// this adapter stamps RecordedAt explicitly from the injected shared.Clock
+// (see recordedAt below) — matching the in-memory reference store. This is an
+// intentional adapter divergence from postgres, not a bug: no behavior change
+// is planned here.
 func (s *EventStore) Append(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	if len(events) == 0 {
 		return nil
@@ -122,11 +141,14 @@ func (s *EventStore) Append(ctx context.Context, streamID string, events []event
 // appendOn performs the COUNT-based optimistic check and inserts on the given
 // Querier (either an ambient *sql.Tx or the store's own tx).
 //
-// The stored version is derived server-side as expectedVersion+i+1 (and the
-// stream id from the streamID argument), matching the postgres adapter. The
-// caller-populated Event.Version / Event.StreamID fields are ignored so a
-// stale or inconsistent caller value cannot diverge from the optimistic
-// concurrency baseline.
+// The stored version is expectedVersion+i+1, and each event's caller-stamped
+// Version must equal that value or Append rejects the whole batch (see the
+// contiguity check below) — matching the in-memory reference store
+// (infrastructure/inmemory/event_store.go) and the postgres adapter. This
+// catches a caller that built events against a stale aggregate version before
+// they ever reach the database, rather than silently persisting a different
+// version than the caller stamped. The caller-populated Event.StreamID field
+// is still ignored; the streamID argument is authoritative.
 func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, events []eventstore.Event, expectedVersion int) error {
 	// Serialize all appends against each other for the lifetime of this
 	// transaction (issue #60). global_position (AUTO_INCREMENT) is assigned at
@@ -161,6 +183,23 @@ func (s *EventStore) appendOn(ctx context.Context, q Querier, streamID string, e
 	}
 	if current != expectedVersion {
 		return versionConflict(streamID, fmt.Errorf("expected version %d but stream is at %d", expectedVersion, current))
+	}
+
+	// Validate Version contiguity: appended events must be numbered
+	// sequentially starting at expectedVersion+1, matching the in-memory
+	// reference store (infrastructure/inmemory/event_store.go). A gap or
+	// out-of-order Version means the events were built against a stale
+	// aggregate version and would corrupt the append-only log (breaking
+	// optimistic locking and temporal replay), so reject the batch rather
+	// than silently renumber and persist a different version than the
+	// caller stamped.
+	for i := range events {
+		wantVersion := expectedVersion + i + 1
+		if events[i].Version != wantVersion {
+			return shared.NewDomainError(shared.ErrCodeValidation,
+				fmt.Sprintf("event %d for stream %q has version %d but expected contiguous version %d",
+					i, streamID, events[i].Version, wantVersion))
+		}
 	}
 
 	recordedAt := s.clock.Now().UTC()
@@ -341,6 +380,15 @@ func (s *EventStore) LoadSnapshot(ctx context.Context, streamID string) (*events
 // LoadSnapshotBefore loads the latest snapshot created before the given time,
 // or (nil, nil) if none. version DESC breaks ties between snapshots created
 // at the same instant deterministically (highest wins).
+//
+// Because the cutoff is CreatedAt (wall-clock) while callers bound events by
+// OccurredAt, a snapshot returned here is not automatically safe to use for an
+// as-of reconstruction: with a skewed/injected clock a snapshot can be
+// CreatedAt before asOf yet cover an event that OCCURRED after asOf. The
+// caller must apply the core review W7 consistency guard (reject the snapshot
+// if its Version exceeds the highest event version within the asOf horizon) —
+// see MySQLContractRepository.FindByIDAsOf in contract_repo.go, which mirrors
+// core's application/query/temporal_query_service.go GetContractAsOf.
 func (s *EventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	row := s.q(ctx).QueryRowContext(ctx,
 		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC, version DESC LIMIT 1",

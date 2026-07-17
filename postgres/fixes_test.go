@@ -16,6 +16,7 @@ import (
 	"github.com/contract-to-cash/core/domain/balance"
 	"github.com/contract-to-cash/core/domain/contract"
 	"github.com/contract-to-cash/core/domain/invoice"
+	"github.com/contract-to-cash/core/domain/pricing"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/eventstore"
 )
@@ -30,9 +31,9 @@ func TestEventStore_AppendAtomicWithoutTx(t *testing.T) {
 	// Append 3 events. The 3rd has a duplicate ID with the 1st to trigger an
 	// error midway. If Append is atomic, none should be persisted.
 	events := []eventstore.Event{
-		{ID: "atomic-1", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
-		{ID: "atomic-2", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
-		{ID: "atomic-1", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}, // dup ID
+		{ID: "atomic-1", Type: "test.event", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+		{ID: "atomic-2", Type: "test.event", Version: 2, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+		{ID: "atomic-1", Type: "test.event", Version: 3, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}, // dup ID
 	}
 
 	err := store.Append(ctx, "stream-atomic", events, 0)
@@ -107,7 +108,7 @@ func TestEventStore_DuplicateIDIsNotVersionConflict(t *testing.T) {
 
 	// Insert an event on stream-1.
 	events1 := []eventstore.Event{{
-		ID: "dup-id", Type: "test.event", SchemaVersion: 1,
+		ID: "dup-id", Type: "test.event", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	if err := store.Append(ctx, "stream-dup-1", events1, 0); err != nil {
@@ -117,7 +118,7 @@ func TestEventStore_DuplicateIDIsNotVersionConflict(t *testing.T) {
 	// Insert an event with the SAME ID on a DIFFERENT stream.
 	// This is a PK violation (duplicate id), NOT a version conflict.
 	events2 := []eventstore.Event{{
-		ID: "dup-id", Type: "test.event", SchemaVersion: 1,
+		ID: "dup-id", Type: "test.event", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	err := store.Append(ctx, "stream-dup-2", events2, 0)
@@ -127,6 +128,248 @@ func TestEventStore_DuplicateIDIsNotVersionConflict(t *testing.T) {
 	// Should NOT be a version conflict error.
 	if isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Error("duplicate event ID should not be reported as version conflict")
+	}
+}
+
+// --- Issue #62: W7 snapshot-consistency guard for FindByIDAsOf ---
+
+// TestContractRepo_FindByIDAsOf_DiscardsSnapshotBeyondHorizon is a live-DB
+// regression test for the W7 snapshot-consistency guard (core's
+// application/query/temporal_query_service.go GetContractAsOf), mirroring
+// core's TestGetContractAsOf_IgnoresSnapshotCoveringPostAsOfEvents.
+//
+// The contract is Created at t1 and Activated at t3 (real events, real
+// occurred_at columns via the injected clock on each aggregate). A snapshot at
+// version 2 (Active) is then saved directly through the event store with
+// CreatedAt backdated to t1 — before asOf (t2, between t1 and t3) — even
+// though its Version already reflects the t3 Activate event. Without the
+// guard, LoadSnapshotBefore(asOf) would happily return this snapshot (its
+// created_at < asOf) and FindByIDAsOf would incorrectly report Active at t2.
+// With the guard, snapshot.Version (2) exceeds maxVersionAsOf (1, only the
+// Create event occurred at/before t2), so the snapshot is discarded and the
+// reconstruction falls back to a full replay, correctly returning Draft.
+func TestContractRepo_FindByIDAsOf_DiscardsSnapshotBeyondHorizon(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	repo := postgres.NewContractRepository(pool, es, shared.FixedClock{FixedTime: time.Now()})
+	ctx := context.Background()
+
+	id := shared.ContractID("c-w7-live")
+	t1 := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	asOf := time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC)
+	t3 := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)
+
+	// Create at t1.
+	agg := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t1})
+	if err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: "idem-w7-live",
+		AccountID:      "acc-w7",
+		PriceID:        "price-w7",
+		Price:          jpy(1000),
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
+	}, eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.Save(ctx, agg); err != nil {
+		t.Fatalf("Save create: %v", err)
+	}
+
+	// Activate at t3 (after asOf), replaying from the events actually
+	// persisted so the aggregate version lines up with the event store.
+	createdEvents, err := es.Load(ctx, string(id))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	agg2 := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t3})
+	if err := agg2.LoadFromHistory(createdEvents); err != nil {
+		t.Fatalf("LoadFromHistory: %v", err)
+	}
+	if err := agg2.Activate(eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if err := repo.Save(ctx, agg2); err != nil {
+		t.Fatalf("Save activate: %v", err)
+	}
+
+	// Snapshot at version 2 (Active), CreatedAt backdated to t1 — before asOf —
+	// simulating a skewed/injected clock that produced a snapshot physically
+	// created before asOf yet covering the post-asOf Activate event.
+	allEvents, err := es.Load(ctx, string(id))
+	if err != nil {
+		t.Fatalf("Load all events: %v", err)
+	}
+	snapAgg := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t3})
+	if err := snapAgg.LoadFromHistory(allEvents); err != nil {
+		t.Fatalf("LoadFromHistory for snapshot: %v", err)
+	}
+	state, err := snapAgg.MarshalSnapshot()
+	if err != nil {
+		t.Fatalf("MarshalSnapshot: %v", err)
+	}
+	if err := es.SaveSnapshot(ctx, eventstore.Snapshot{
+		StreamID:  string(id),
+		Version:   snapAgg.Version(),
+		State:     state,
+		AsOf:      t3,
+		CreatedAt: t1,
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	got, err := repo.FindByIDAsOf(ctx, id, asOf)
+	if err != nil {
+		t.Fatalf("FindByIDAsOf: %v", err)
+	}
+	if got.Status() != contract.ContractStatusDraft {
+		t.Errorf("status = %s, want draft (post-asOf snapshot must be discarded)", got.Status())
+	}
+	if got.Version() != 1 {
+		t.Errorf("version = %d, want 1 (full replay from version 0)", got.Version())
+	}
+}
+
+// TestContractRepo_FindByIDAsOf_UsesSnapshotWithinHorizon is the fast-path
+// counterpart to TestContractRepo_FindByIDAsOf_DiscardsSnapshotBeyondHorizon:
+// a snapshot whose Version does not exceed the asOf event horizon
+// (snapshot.Version <= maxVersionAsOf) must still be used, with only the
+// events after the snapshot version replayed on top of it. This pins that the
+// W7 guard (core review W7 / issue #62) does not over-reject legitimate
+// snapshots — mirrors mysql's TestContractRepo_FindByIDAsOf_UsesSnapshotWithinHorizon
+// and core's TestGetContractAsOf_WithSnapshot.
+func TestContractRepo_FindByIDAsOf_UsesSnapshotWithinHorizon(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	repo := postgres.NewContractRepository(pool, es, shared.FixedClock{FixedTime: time.Now()})
+	ctx := context.Background()
+
+	id := shared.ContractID("c-w7-fastpath-live")
+	t1 := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC)
+	snapCreatedAt := time.Date(2026, 1, 1, 1, 30, 0, 0, time.UTC)
+	asOf := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)
+
+	// Create at t1.
+	agg := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t1})
+	if err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: "idem-w7-fastpath-live",
+		AccountID:      "acc-w7-fp",
+		PriceID:        "price-w7-fp",
+		Price:          jpy(1000),
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
+	}, eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Snapshot at version 1 (Draft), CreatedAt = t1+30min — before asOf and
+	// not covering any event beyond the asOf horizon.
+	state, err := agg.MarshalSnapshot()
+	if err != nil {
+		t.Fatalf("MarshalSnapshot: %v", err)
+	}
+	if err := repo.Save(ctx, agg); err != nil {
+		t.Fatalf("Save create: %v", err)
+	}
+	if err := es.SaveSnapshot(ctx, eventstore.Snapshot{
+		StreamID:  string(id),
+		Version:   1,
+		State:     state,
+		AsOf:      t1,
+		CreatedAt: snapCreatedAt,
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	// Activate at t2 (still before asOf).
+	createdEvents, err := es.Load(ctx, string(id))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	agg2 := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t2})
+	if err := agg2.LoadFromHistory(createdEvents); err != nil {
+		t.Fatalf("LoadFromHistory: %v", err)
+	}
+	if err := agg2.Activate(eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if err := repo.Save(ctx, agg2); err != nil {
+		t.Fatalf("Save activate: %v", err)
+	}
+
+	// asOf = t3: both events occurred before it (maxVersionAsOf = 2), and the
+	// snapshot (version 1) does not exceed that horizon, so it must be used —
+	// only the Activate event (version 2) is replayed on top of it.
+	got, err := repo.FindByIDAsOf(ctx, id, asOf)
+	if err != nil {
+		t.Fatalf("FindByIDAsOf: %v", err)
+	}
+	if got.Status() != contract.ContractStatusActive {
+		t.Errorf("status = %s, want active", got.Status())
+	}
+	if got.Version() != 2 {
+		t.Errorf("version = %d, want 2 (snapshot v1 + replayed Activate event)", got.Version())
+	}
+}
+
+// TestContractRepo_FindByIDAsOf_NotFoundWhenSnapshotDiscardedAndNoEventsWithinHorizon
+// pins a hidden win of the W7 guard (issue #62): once a snapshot beyond the
+// asOf horizon is discarded, the not-found check
+// (!useSnapshot && len(relevant) == 0) means a skew-backdated snapshot can no
+// longer "resurrect" a contract before its first event. Here the contract's
+// only event (Create) occurs AFTER asOf, but a snapshot at version 1 was
+// saved with CreatedAt backdated to before asOf — without the guard,
+// LoadSnapshotBefore(asOf) would return it and FindByIDAsOf would incorrectly
+// report the contract as existing (Draft) at asOf. With the guard, the
+// snapshot is discarded (its version 1 exceeds maxVersionAsOf 0, since no
+// events occurred at/before asOf) and, with zero relevant events either,
+// FindByIDAsOf correctly returns ErrCodeNotFound.
+func TestContractRepo_FindByIDAsOf_NotFoundWhenSnapshotDiscardedAndNoEventsWithinHorizon(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	repo := postgres.NewContractRepository(pool, es, shared.FixedClock{FixedTime: time.Now()})
+	ctx := context.Background()
+
+	id := shared.ContractID("c-w7-notfound-live")
+	asOf := time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC)
+	snapCreatedAt := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC) // before asOf
+	tCreate := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)       // after asOf
+
+	// The contract's only event (Create) occurs AFTER asOf.
+	agg := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: tCreate})
+	if err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: "idem-w7-notfound-live",
+		AccountID:      "acc-w7-nf",
+		PriceID:        "price-w7-nf",
+		Price:          jpy(1000),
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
+	}, eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.Save(ctx, agg); err != nil {
+		t.Fatalf("Save create: %v", err)
+	}
+
+	// A skew-backdated snapshot at version 1, CreatedAt before asOf even
+	// though the only event it could reflect occurred after asOf.
+	state, err := agg.MarshalSnapshot()
+	if err != nil {
+		t.Fatalf("MarshalSnapshot: %v", err)
+	}
+	if err := es.SaveSnapshot(ctx, eventstore.Snapshot{
+		StreamID:  string(id),
+		Version:   agg.Version(),
+		State:     state,
+		AsOf:      tCreate,
+		CreatedAt: snapCreatedAt,
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	_, err = repo.FindByIDAsOf(ctx, id, asOf)
+	if !isDomainError(err, shared.ErrCodeNotFound) {
+		t.Errorf("expected not_found, got: %v", err)
 	}
 }
 

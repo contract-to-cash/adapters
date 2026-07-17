@@ -15,6 +15,7 @@ import (
 	"github.com/contract-to-cash/adapters/mysql/mysqltest"
 	"github.com/contract-to-cash/core/application/tx"
 	"github.com/contract-to-cash/core/domain/balance"
+	"github.com/contract-to-cash/core/domain/contract"
 	"github.com/contract-to-cash/core/domain/invoice"
 	"github.com/contract-to-cash/core/domain/payment"
 	"github.com/contract-to-cash/core/domain/pricing"
@@ -58,8 +59,8 @@ func TestIntegration_EventStore_AppendAndLoad(t *testing.T) {
 	ctx := context.Background()
 
 	events := []eventstore.Event{
-		{ID: "evt-1", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{"name":"test"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
-		{ID: "evt-2", Type: "test.updated", SchemaVersion: 1, Data: json.RawMessage(`{"name":"updated"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
+		{ID: "evt-1", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{"name":"test"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
+		{ID: "evt-2", Type: "test.updated", Version: 2, SchemaVersion: 1, Data: json.RawMessage(`{"name":"updated"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
 	}
 	if err := store.Append(ctx, "stream-1", events, 0); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -85,11 +86,13 @@ func TestIntegration_EventStore_AppendVersionConflict(t *testing.T) {
 	store := mysql.New(db, integrationClock)
 	ctx := context.Background()
 
-	first := []eventstore.Event{{ID: "vc-1", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
+	first := []eventstore.Event{{ID: "vc-1", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
 	if err := store.Append(ctx, "stream-vc", first, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
-	second := []eventstore.Event{{ID: "vc-2", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
+	// second's Version is irrelevant: the stale expectedVersion=0 trips the
+	// version-conflict check before the contiguity check ever runs.
+	second := []eventstore.Event{{ID: "vc-2", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
 	err := store.Append(ctx, "stream-vc", second, 0) // stale expectedVersion
 	if !isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Fatalf("expected version_conflict, got %v", err)
@@ -105,14 +108,14 @@ func TestIntegration_EventStore_DuplicateEventIDIsNotVersionConflict(t *testing.
 	store := mysql.New(db, integrationClock)
 	ctx := context.Background()
 
-	ev := eventstore.Event{ID: "dup-id", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
+	ev := eventstore.Event{ID: "dup-id", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
 	if err := store.Append(ctx, "stream-dup-a", []eventstore.Event{ev}, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
 
 	// Same ID on a DIFFERENT stream: COUNT precheck passes (new stream is at 0)
 	// but the INSERT trips uq_event_id.
-	dup := eventstore.Event{ID: "dup-id", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
+	dup := eventstore.Event{ID: "dup-id", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
 	err := store.Append(ctx, "stream-dup-b", []eventstore.Event{dup}, 0)
 	if err == nil {
 		t.Fatal("expected error from duplicate event ID, got nil")
@@ -150,13 +153,13 @@ func TestIntegration_EventStore_ContractIdempotencyKeyUniqueness(t *testing.T) {
 	}
 
 	// First contract.created with a non-empty key succeeds.
-	ev1 := eventstore.Event{ID: "idem-a", Type: "contract.created", SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
+	ev1 := eventstore.Event{ID: "idem-a", Type: "contract.created", Version: 1, SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
 	if err := store.Append(ctx, "c-idem-a", []eventstore.Event{ev1}, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
 
 	// A DIFFERENT stream reusing the same key is rejected as a conflict.
-	ev2 := eventstore.Event{ID: "idem-b", Type: "contract.created", SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
+	ev2 := eventstore.Event{ID: "idem-b", Type: "contract.created", Version: 1, SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
 	err := store.Append(ctx, "c-idem-b", []eventstore.Event{ev2}, 0)
 	if isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Fatalf("idempotency conflict must NOT be version_conflict: %v", err)
@@ -166,14 +169,14 @@ func TestIntegration_EventStore_ContractIdempotencyKeyUniqueness(t *testing.T) {
 	}
 
 	// A distinct key is fine.
-	ev3 := eventstore.Event{ID: "idem-c", Type: "contract.created", SchemaVersion: 3, Data: created("other-key"), OccurredAt: time.Now().UTC()}
+	ev3 := eventstore.Event{ID: "idem-c", Type: "contract.created", Version: 1, SchemaVersion: 3, Data: created("other-key"), OccurredAt: time.Now().UTC()}
 	if err := store.Append(ctx, "c-idem-c", []eventstore.Event{ev3}, 0); err != nil {
 		t.Fatalf("distinct key Append: %v", err)
 	}
 
 	// Historical events with NO idempotency_key are exempt: two coexist.
 	for _, s := range []struct{ id, stream string }{{"legacy-a", "c-legacy-a"}, {"legacy-b", "c-legacy-b"}} {
-		ev := eventstore.Event{ID: s.id, Type: "contract.created", SchemaVersion: 2, Data: json.RawMessage(`{"contract_id":"x","account_id":"a"}`), OccurredAt: time.Now().UTC()}
+		ev := eventstore.Event{ID: s.id, Type: "contract.created", Version: 1, SchemaVersion: 2, Data: json.RawMessage(`{"contract_id":"x","account_id":"a"}`), OccurredAt: time.Now().UTC()}
 		if err := store.Append(ctx, s.stream, []eventstore.Event{ev}, 0); err != nil {
 			t.Fatalf("legacy Append %s: %v", s.id, err)
 		}
@@ -258,6 +261,102 @@ func TestIntegration_EventStore_SnapshotRoundTrip(t *testing.T) {
 	}
 	if state["status"] != "active" {
 		t.Errorf("state[status] = %q, want active", state["status"])
+	}
+}
+
+// TestIntegration_ContractRepo_FindByIDAsOf_DiscardsSnapshotBeyondHorizon is a
+// live-DB regression test for the W7 snapshot-consistency guard (core's
+// application/query/temporal_query_service.go GetContractAsOf), mirroring core's
+// TestGetContractAsOf_IgnoresSnapshotCoveringPostAsOfEvents.
+//
+// The contract is Created at t1 and Activated at t3 (real events, real
+// occurred_at columns via the injected clock on each aggregate). A snapshot at
+// version 2 (Active) is then saved directly through the event store with
+// CreatedAt backdated to t1 — before asOf (t2, between t1 and t3) — even
+// though its Version already reflects the t3 Activate event. Without the
+// guard, LoadSnapshotBefore(asOf) would happily return this snapshot (its
+// created_at < asOf) and FindByIDAsOf would incorrectly report Active at t2.
+// With the guard, snapshot.Version (2) exceeds maxVersionAsOf (1, only the
+// Create event occurred at/before t2), so the snapshot is discarded and the
+// reconstruction falls back to a full replay, correctly returning Draft.
+func TestIntegration_ContractRepo_FindByIDAsOf_DiscardsSnapshotBeyondHorizon(t *testing.T) {
+	db := mysqltest.NewDB(t)
+	es := mysql.New(db, integrationClock)
+	repo := mysql.NewContractRepository(db, es, integrationClock)
+	ctx := context.Background()
+
+	id := shared.ContractID("c-w7-live")
+	t1 := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	asOf := time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC)
+	t3 := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)
+
+	// Create at t1.
+	agg := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t1})
+	if err := agg.Create(contract.CreateContractCommand{
+		IdempotencyKey: "idem-w7-live",
+		AccountID:      "acc-w7",
+		PriceID:        "price-w7",
+		Price:          jpy(1000),
+		ContractType:   contract.ContractTypeSubscription,
+		Interval:       pricing.Monthly(),
+	}, eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := repo.Save(ctx, agg); err != nil {
+		t.Fatalf("Save create: %v", err)
+	}
+
+	// Activate at t3 (after asOf), replaying from the events actually
+	// persisted so the aggregate version lines up with the event store.
+	createdEvents, err := es.Load(ctx, string(id))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	agg2 := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t3})
+	if err := agg2.LoadFromHistory(createdEvents); err != nil {
+		t.Fatalf("LoadFromHistory: %v", err)
+	}
+	if err := agg2.Activate(eventstore.EventMetadata{UserID: "user-1"}); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if err := repo.Save(ctx, agg2); err != nil {
+		t.Fatalf("Save activate: %v", err)
+	}
+
+	// Snapshot at version 2 (Active), CreatedAt backdated to t1 — before asOf —
+	// simulating a skewed/injected clock that produced a snapshot physically
+	// created before asOf yet covering the post-asOf Activate event.
+	allEvents, err := es.Load(ctx, string(id))
+	if err != nil {
+		t.Fatalf("Load all events: %v", err)
+	}
+	snapAgg := contract.NewContractAggregate(id, shared.FixedClock{FixedTime: t3})
+	if err := snapAgg.LoadFromHistory(allEvents); err != nil {
+		t.Fatalf("LoadFromHistory for snapshot: %v", err)
+	}
+	state, err := snapAgg.MarshalSnapshot()
+	if err != nil {
+		t.Fatalf("MarshalSnapshot: %v", err)
+	}
+	if err := es.SaveSnapshot(ctx, eventstore.Snapshot{
+		StreamID:  string(id),
+		Version:   snapAgg.Version(),
+		State:     state,
+		AsOf:      t3,
+		CreatedAt: t1,
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	got, err := repo.FindByIDAsOf(ctx, id, asOf)
+	if err != nil {
+		t.Fatalf("FindByIDAsOf: %v", err)
+	}
+	if got.Status() != contract.ContractStatusDraft {
+		t.Errorf("status = %s, want draft (post-asOf snapshot must be discarded)", got.Status())
+	}
+	if got.Version() != 1 {
+		t.Errorf("version = %d, want 1 (full replay from version 0)", got.Version())
 	}
 }
 
@@ -977,7 +1076,7 @@ func TestIntegration_EventStore_ConcurrentAppends_SerializeGlobalPosition(t *tes
 
 	evt := func(id, stream string) []eventstore.Event {
 		return []eventstore.Event{{
-			ID: id, Type: "test.event", SchemaVersion: 1,
+			ID: id, Type: "test.event", Version: 1, SchemaVersion: 1,
 			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		}}
 	}

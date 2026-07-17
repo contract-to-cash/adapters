@@ -3,6 +3,8 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/contract-to-cash/adapters/postgres/postgrestest"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/eventstore"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestEventStore_AppendAndLoad(t *testing.T) {
@@ -21,6 +24,7 @@ func TestEventStore_AppendAndLoad(t *testing.T) {
 		{
 			ID:            "evt-1",
 			Type:          "test.created",
+			Version:       1,
 			SchemaVersion: 1,
 			Data:          json.RawMessage(`{"name":"test"}`),
 			OccurredAt:    time.Now().UTC().Truncate(time.Microsecond),
@@ -28,6 +32,7 @@ func TestEventStore_AppendAndLoad(t *testing.T) {
 		{
 			ID:            "evt-2",
 			Type:          "test.updated",
+			Version:       2,
 			SchemaVersion: 1,
 			Data:          json.RawMessage(`{"name":"updated"}`),
 			OccurredAt:    time.Now().UTC().Truncate(time.Microsecond),
@@ -65,16 +70,18 @@ func TestEventStore_AppendVersionConflict(t *testing.T) {
 	ctx := context.Background()
 
 	event1 := []eventstore.Event{{
-		ID: "evt-1", Type: "test.created", SchemaVersion: 1,
+		ID: "evt-1", Type: "test.created", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	if err := store.Append(ctx, "stream-1", event1, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
 
-	// Attempt to append at the same version should conflict.
+	// Attempt to append at the same version should conflict (the version
+	// conflict check runs before the contiguity check, so the stamped Version
+	// here is irrelevant to what's being asserted).
 	event2 := []eventstore.Event{{
-		ID: "evt-2", Type: "test.created", SchemaVersion: 1,
+		ID: "evt-2", Type: "test.created", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	err := store.Append(ctx, "stream-1", event2, 0)
@@ -96,7 +103,7 @@ func TestEventStore_AppendVersionConflict_ExpectedVersionAhead(t *testing.T) {
 	ctx := context.Background()
 
 	event1 := []eventstore.Event{{
-		ID: "evt-ahead-1", Type: "test.created", SchemaVersion: 1,
+		ID: "evt-ahead-1", Type: "test.created", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	if err := store.Append(ctx, "stream-ahead", event1, 0); err != nil {
@@ -104,9 +111,12 @@ func TestEventStore_AppendVersionConflict_ExpectedVersionAhead(t *testing.T) {
 	}
 
 	// Stream is at version 1; claiming it is at 10 must be a version
-	// conflict, not a successful insert of version 11.
+	// conflict, not a successful insert of version 11. The version conflict
+	// check runs before the contiguity check, so the stamped Version here
+	// (11, contiguous with the claimed expectedVersion=10) is irrelevant to
+	// what's being asserted.
 	event2 := []eventstore.Event{{
-		ID: "evt-ahead-2", Type: "test.updated", SchemaVersion: 1,
+		ID: "evt-ahead-2", Type: "test.updated", Version: 11, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	err := store.Append(ctx, "stream-ahead", event2, 10)
@@ -127,6 +137,121 @@ func TestEventStore_AppendVersionConflict_ExpectedVersionAhead(t *testing.T) {
 	}
 }
 
+// Append must reject a caller-stamped Version that is stale (does not equal
+// expectedVersion+i+1) rather than silently renumbering it, matching the
+// in-memory reference store (infrastructure/inmemory/event_store.go).
+func TestEventStore_Append_RejectsStaleStampedVersion(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	event1 := []eventstore.Event{{
+		ID: "evt-stale-1", Type: "test.created", Version: 1, SchemaVersion: 1,
+		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+	}}
+	if err := store.Append(ctx, "stream-stale", event1, 0); err != nil {
+		t.Fatalf("first Append: %v", err)
+	}
+
+	// Stream is now at version 1 (expectedVersion=1 is correct), but the event
+	// carries a stale Version=99 (e.g. built against a since-superseded
+	// aggregate). This must be rejected, not persisted as version 2.
+	event2 := []eventstore.Event{{
+		ID: "evt-stale-2", Type: "test.updated", Version: 99, SchemaVersion: 1,
+		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+	}}
+	err := store.Append(ctx, "stream-stale", event2, 1)
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !isDomainError(err, shared.ErrCodeValidation) {
+		t.Errorf("expected ErrCodeValidation, got: %v", err)
+	}
+
+	events, err := store.Load(ctx, "stream-stale")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("rejected event must not be persisted, got %d events", len(events))
+	}
+}
+
+// A gap in the middle of a batch (event 0 correctly stamped, event 1 not)
+// must reject the WHOLE batch, leaving nothing persisted — a partial insert
+// would leave a version hole in the append-only log.
+func TestEventStore_Append_RejectsVersionGapMidBatch(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	events := []eventstore.Event{
+		{ID: "evt-gap-1", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+		{ID: "evt-gap-2", Type: "test.updated", Version: 3, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+	}
+	err := store.Append(ctx, "stream-gap", events, 0)
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !isDomainError(err, shared.ErrCodeValidation) {
+		t.Errorf("expected ErrCodeValidation, got: %v", err)
+	}
+
+	loaded, loadErr := store.Load(ctx, "stream-gap")
+	if loadErr != nil {
+		t.Fatalf("Load: %v", loadErr)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("no events from a rejected batch may be persisted, got %d", len(loaded))
+	}
+}
+
+// A zero (unstamped) Event.Version — e.g. a caller that forgot to stamp
+// Version at all — must be rejected rather than silently accepted as
+// expectedVersion+i+1.
+func TestEventStore_Append_RejectsZeroVersion(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	events := []eventstore.Event{{
+		ID: "evt-zero-1", Type: "test.created", SchemaVersion: 1,
+		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		// Version intentionally left at its zero value.
+	}}
+	err := store.Append(ctx, "stream-zero", events, 0)
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !isDomainError(err, shared.ErrCodeValidation) {
+		t.Errorf("expected ErrCodeValidation, got: %v", err)
+	}
+}
+
+// Correctly-stamped, contiguous versions across a multi-event batch are
+// accepted and persisted as given.
+func TestEventStore_Append_AcceptsContiguousStampedVersions(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	store := postgres.NewEventStore(pool)
+	ctx := context.Background()
+
+	events := []eventstore.Event{
+		{ID: "evt-ok-1", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+		{ID: "evt-ok-2", Type: "test.updated", Version: 2, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+	}
+	if err := store.Append(ctx, "stream-ok", events, 0); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	loaded, err := store.Load(ctx, "stream-ok")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 2 || loaded[0].Version != 1 || loaded[1].Version != 2 {
+		t.Fatalf("unexpected loaded events: %+v", loaded)
+	}
+}
+
 func TestEventStore_LoadUntilVersion(t *testing.T) {
 	pool := postgrestest.NewPool(t)
 	store := postgres.NewEventStore(pool)
@@ -135,7 +260,7 @@ func TestEventStore_LoadUntilVersion(t *testing.T) {
 	events := make([]eventstore.Event, 5)
 	for i := range events {
 		events[i] = eventstore.Event{
-			ID: "evt-" + string(rune('a'+i)), Type: "test.event", SchemaVersion: 1,
+			ID: "evt-" + string(rune('a'+i)), Type: "test.event", Version: i + 1, SchemaVersion: 1,
 			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		}
 	}
@@ -159,7 +284,7 @@ func TestEventStore_LoadAll(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		events := []eventstore.Event{{
-			ID: "evt-" + string(rune('a'+i)), Type: "test.event", SchemaVersion: 1,
+			ID: "evt-" + string(rune('a'+i)), Type: "test.event", Version: 1, SchemaVersion: 1,
 			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		}}
 		if err := store.Append(ctx, "stream-"+string(rune('a'+i)), events, 0); err != nil {
@@ -307,10 +432,10 @@ func TestEventStore_LoadRange_HalfOpenInterval(t *testing.T) {
 	to := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 
 	events := []eventstore.Event{
-		{ID: "evt-before", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: from.Add(-time.Second)},
-		{ID: "evt-at-from", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: from},
-		{ID: "evt-mid", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: mid},
-		{ID: "evt-at-to", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: to},
+		{ID: "evt-before", Type: "test.event", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: from.Add(-time.Second)},
+		{ID: "evt-at-from", Type: "test.event", Version: 2, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: from},
+		{ID: "evt-mid", Type: "test.event", Version: 3, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: mid},
+		{ID: "evt-at-to", Type: "test.event", Version: 4, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: to},
 	}
 	if err := store.Append(ctx, "stream-range", events, 0); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -345,7 +470,7 @@ func TestEventStore_Subscribe(t *testing.T) {
 
 	// Append an event.
 	events := []eventstore.Event{{
-		ID: "evt-sub-1", Type: "test.event", SchemaVersion: 1,
+		ID: "evt-sub-1", Type: "test.event", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	if err := store.Append(ctx, "stream-sub", events, 0); err != nil {
@@ -380,7 +505,7 @@ func TestEventStore_ConcurrentAppends_SerializeGlobalPosition(t *testing.T) {
 
 	evt := func(id, stream string) []eventstore.Event {
 		return []eventstore.Event{{
-			ID: id, Type: "test.event", SchemaVersion: 1,
+			ID: id, Type: "test.event", Version: 1, SchemaVersion: 1,
 			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		}}
 	}
@@ -438,5 +563,87 @@ func TestEventStore_ConcurrentAppends_SerializeGlobalPosition(t *testing.T) {
 	if all[1].GlobalPosition <= all[0].GlobalPosition {
 		t.Fatalf("positions not strictly increasing in commit order: %d then %d",
 			all[0].GlobalPosition, all[1].GlobalPosition)
+	}
+}
+
+// Issue #61: a subscription must survive its LISTEN connection being killed
+// server-side (DB failover, admin pg_terminate_backend): the dead connection
+// is released, a fresh one is acquired and re-LISTENed, and catch-up delivers
+// the events committed during the outage. Before the fix the tail loop retried
+// WaitForNotification on the same dead connection forever and the subscription
+// became a silent zombie.
+func TestEventStore_Subscribe_ReconnectsAfterConnectionKill(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+
+	var reported atomic.Int32
+	store := postgres.NewEventStore(pool,
+		postgres.WithSubscriptionErrorHandler(func(error) { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ch, err := store.Subscribe(ctx, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Deliver a first event so we know LISTEN is established.
+	evt := func(id string, version int) []eventstore.Event {
+		return []eventstore.Event{{
+			ID: id, Type: "test.event", Version: version, SchemaVersion: 1,
+			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		}}
+	}
+	if err := store.Append(ctx, "stream-kill", evt("evt-kill-1", 1), 0); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	recv := func(wantID string, timeout time.Duration) {
+		t.Helper()
+		select {
+		case e, ok := <-ch:
+			if !ok {
+				t.Fatalf("channel closed while waiting for %q", wantID)
+			}
+			if e.ID != wantID {
+				t.Fatalf("received %q, want %q", e.ID, wantID)
+			}
+		case <-time.After(timeout):
+			t.Fatalf("timed out waiting for %q", wantID)
+		}
+	}
+	recv("evt-kill-1", 5*time.Second)
+
+	// Find the LISTEN backend and kill it server-side.
+	var pid int
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := pool.QueryRow(ctx,
+			`SELECT pid FROM pg_stat_activity
+			 WHERE datname = current_database() AND query LIKE 'LISTEN %'
+			 LIMIT 1`).Scan(&pid)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("query pg_stat_activity: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("LISTEN backend not found in pg_stat_activity")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatalf("pg_terminate_backend: %v", err)
+	}
+
+	// Append while the subscriber is (potentially still) disconnected: the
+	// post-reconnect catch-up must deliver it even if the NOTIFY was missed.
+	if err := store.Append(ctx, "stream-kill", evt("evt-kill-2", 2), 1); err != nil {
+		t.Fatalf("Append after kill: %v", err)
+	}
+	recv("evt-kill-2", 15*time.Second)
+
+	if reported.Load() == 0 {
+		t.Error("expected the connection kill to be reported via WithSubscriptionErrorHandler")
 	}
 }

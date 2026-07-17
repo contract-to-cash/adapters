@@ -16,6 +16,52 @@ publishes a GitHub Release. See the **Releasing** section of the README.
 
 ## [Unreleased]
 
+### Fixed
+
+- **postgres**: a subscription no longer becomes a silent zombie after its
+  LISTEN connection dies (DB failover, `pg_terminate_backend`). The dead
+  connection is released, a fresh one is acquired and re-LISTENed with capped
+  exponential backoff, and catch-up closes the notification gap so events
+  committed during the outage are still delivered. Every failed cycle is
+  reported via `WithSubscriptionErrorHandler`; the new
+  `WithSubscriptionMaxReconnects` option optionally bounds consecutive failed
+  attempts (default: retry forever). (#61)
+- **postgres, mysql**: `FindByIDAsOf` now applies the W7 snapshot-consistency
+  guard from core's `TemporalQueryService`: a snapshot whose version exceeds
+  the highest event version within the `asOf` horizon (possible with a
+  skewed/injected clock, since snapshots are selected by `CreatedAt` while
+  events are bounded by `OccurredAt`) is discarded in favor of a full replay,
+  so post-`asOf` state can no longer leak into temporal reconstructions. (#62)
+- **postgres, mysql**: contract projectors now run every event through the
+  core contract upcaster chain (`contract.NewContractUpcasterChain`) before
+  projecting, matching aggregate rehydration. Legacy payloads (e.g. a v1
+  `contract.created` carrying `billing_cycle`, or a v1 `price.changed`
+  without `new_price_id`) are migrated once by core's upcasters instead of
+  requiring hand-rolled defensive projector code, and
+  `contract_read_models.data` stores the upcasted shape. (#63)
+
+### Changed
+
+- **postgres, mysql**: `Append` now validates that each event's caller-stamped
+  `Version` is contiguous with `expectedVersion` (event `i` must equal
+  `expectedVersion+i+1`) and rejects the whole batch with a
+  `validation_error` `DomainError` on a stale version, mid-batch gap, or
+  unstamped (zero) version — matching the in-memory reference store instead
+  of silently renumbering server-side. Callers that let core's
+  `BaseAggregate.RaiseEvent` stamp versions (including this module's own
+  repositories) are unaffected. (#64)
+
+### Documentation
+
+- **postgres, mysql**: annotated the read-model money column
+  (`invoice_read_models.total`) as a floor-truncated whole-currency-unit
+  approximation for query/display only — exact `big.Rat` amounts live in the
+  `data` JSON / event payloads. Documented the microsecond timestamp
+  round-trip (core stamps nanoseconds; `TIMESTAMPTZ` / `DATETIME(6)` store
+  microseconds) and the `RecordedAt` provenance divergence (postgres uses the
+  DB's `NOW()` default; mysql stamps from the injected clock) in the
+  event-store godocs. (#64)
+
 ## [0.2.0] - 2026-07-14
 
 ### Changed

@@ -127,22 +127,45 @@ func (r *PostgresContractRepository) FindTrialsEndingBefore(ctx context.Context,
 func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared.ContractID, asOf time.Time) (*contract.ContractAggregate, error) {
 	streamID := string(id)
 
+	// Load events that OCCURRED at or before asOf (OccurredAt-bounded).
+	events, err := r.eventStore.LoadUntil(ctx, streamID, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("load events until: %w", err)
+	}
+
+	// The highest event version within the asOf horizon. A snapshot may only be
+	// used as an optimization if it does not cover any event beyond this
+	// horizon (see the guard below).
+	var maxVersionAsOf int
+	for _, e := range events {
+		if e.Version > maxVersionAsOf {
+			maxVersionAsOf = e.Version
+		}
+	}
+
 	snap, err := r.eventStore.LoadSnapshotBefore(ctx, streamID, asOf)
 	if err != nil {
 		return nil, fmt.Errorf("load snapshot before: %w", err)
 	}
 
+	// Consistency guard (core review W7, mirrored from core's
+	// application/query/temporal_query_service.go GetContractAsOf): snapshots
+	// are selected by CreatedAt (wall-clock, see LoadSnapshotBefore) while
+	// events are bounded by OccurredAt above. With a skewed/injected clock an
+	// event can be recorded (CreatedAt/RecordedAt) before the snapshot but
+	// stamped with an OccurredAt after asOf; such a snapshot would already
+	// contain post-asOf state, which must not leak into the reconstruction.
+	// Only use the snapshot if its version does not exceed the asOf event
+	// horizon; otherwise discard it and fall back to a full replay from
+	// version 0.
+	useSnapshot := snap != nil && snap.Version <= maxVersionAsOf
+
 	agg := contract.NewContractAggregate(id, r.clock)
 
-	if snap != nil {
+	if useSnapshot {
 		if err := agg.LoadFromSnapshot(*snap); err != nil {
 			return nil, fmt.Errorf("restore from snapshot: %w", err)
 		}
-	}
-
-	events, err := r.eventStore.LoadUntil(ctx, streamID, asOf)
-	if err != nil {
-		return nil, fmt.Errorf("load events until: %w", err)
 	}
 
 	fromVersion := agg.Version()
@@ -153,7 +176,7 @@ func (r *PostgresContractRepository) FindByIDAsOf(ctx context.Context, id shared
 		}
 	}
 
-	if snap == nil && len(relevant) == 0 {
+	if !useSnapshot && len(relevant) == 0 {
 		return nil, shared.NewDomainError(shared.ErrCodeNotFound,
 			fmt.Sprintf("contract %s not found as of %s", id, asOf))
 	}

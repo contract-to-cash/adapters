@@ -303,18 +303,28 @@ func TestEventStore_LoadSnapshotBefore(t *testing.T) {
 	}
 }
 
-// The stored version must be derived from expectedVersion (expected+i+1) and
-// the stored stream id from the streamID argument — never from the
-// caller-populated Event.Version / Event.StreamID fields. A caller passing
-// stale or inconsistent values must not be able to break the version sequence
-// (parity with the postgres adapter, whose INSERT derives both server-side).
-func TestEventStore_Append_DerivesVersionFromExpectedVersion(t *testing.T) {
+// assertValidationError requires err to be a *shared.DomainError with code
+// validation_error, mirroring the in-memory reference store's contiguity
+// check (infrastructure/inmemory/event_store.go).
+func assertValidationError(t *testing.T, err error) *shared.DomainError {
+	t.Helper()
+	var de *shared.DomainError
+	if !errors.As(err, &de) || de.Code != shared.ErrCodeValidation {
+		t.Fatalf("expected validation_error DomainError, got %v", err)
+	}
+	return de
+}
+
+// The stored version must equal the caller-stamped Event.Version, which in
+// turn must be contiguous with expectedVersion (expected+i+1) — matching the
+// in-memory reference store and the postgres adapter. Correctly-stamped,
+// contiguous events across a multi-event batch are accepted and persisted
+// as-is (StreamID is still taken from the Append argument, not the event).
+func TestEventStore_Append_AcceptsContiguousStampedVersions(t *testing.T) {
 	store, mock := newTestStore(t)
 
-	// Caller-supplied Version (99) and StreamID ("wrong-stream") disagree with
-	// the Append arguments; the derived values must win.
-	e1 := sampleEvent("e6", "wrong-stream", 99)
-	e2 := sampleEvent("e7", "wrong-stream", 42)
+	e1 := sampleEvent("e6", "wrong-stream", 6)
+	e2 := sampleEvent("e7", "wrong-stream", 7)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
@@ -335,6 +345,82 @@ func TestEventStore_Append_DerivesVersionFromExpectedVersion(t *testing.T) {
 	if err := store.Append(context.Background(), "contract-1", []eventstore.Event{e1, e2}, 5); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A caller-stamped Version that is stale (built against an older aggregate
+// version than expectedVersion reflects) must be rejected outright, not
+// silently renumbered — mirrors the in-memory reference. No INSERT may run.
+func TestEventStore_Append_RejectsStaleStampedVersion(t *testing.T) {
+	store, mock := newTestStore(t)
+
+	// expectedVersion=5 means the first event must be stamped 6; this one
+	// carries a stale 99 (e.g. computed against a since-superseded aggregate).
+	e1 := sampleEvent("e6", "contract-1", 99)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(5))
+	mock.ExpectRollback()
+
+	err := store.Append(context.Background(), "contract-1", []eventstore.Event{e1}, 5)
+	de := assertValidationError(t, err)
+	if de.Message == "" {
+		t.Error("expected a non-empty validation message")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A gap in the middle of a batch (event 0 correctly stamped, event 1 not)
+// must reject the WHOLE batch before any INSERT runs — a partial insert would
+// leave a version hole in the append-only log.
+func TestEventStore_Append_RejectsVersionGapMidBatch(t *testing.T) {
+	store, mock := newTestStore(t)
+
+	// expectedVersion=5: e1 correctly stamped 6, e2 should be 7 but skips to 9.
+	e1 := sampleEvent("e6", "contract-1", 6)
+	e2 := sampleEvent("e7", "contract-1", 9)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(5))
+	mock.ExpectRollback()
+
+	err := store.Append(context.Background(), "contract-1", []eventstore.Event{e1, e2}, 5)
+	_ = assertValidationError(t, err)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A zero (unstamped) Event.Version — e.g. a caller that forgot to stamp
+// Version at all — must be rejected rather than silently accepted as version
+// expectedVersion+i+1.
+func TestEventStore_Append_RejectsZeroVersion(t *testing.T) {
+	store, mock := newTestStore(t)
+
+	e1 := sampleEvent("e1", "contract-1", 0)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM event_append_lock WHERE id = 1 FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM events WHERE stream_id = \?`).
+		WithArgs("contract-1").
+		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	mock.ExpectRollback()
+
+	err := store.Append(context.Background(), "contract-1", []eventstore.Event{e1}, 0)
+	_ = assertValidationError(t, err)
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}

@@ -475,3 +475,113 @@ func TestContractRepo_FindDueForRenewal_IncludesNormalSubscription(t *testing.T)
 		t.Error("end_date = NULL, want set")
 	}
 }
+
+// --- Issue #63: the projector must run events through the core upcaster
+// chain before projecting, just like aggregate rehydration (LoadFromHistory)
+// does. Both regression tests below feed a LEGACY (pre-upcast) payload
+// straight into Project and assert the persisted contract_read_models.data
+// reflects the MIGRATED shape.
+
+// A legacy (SchemaVersion 1) contract.created payload carries billing_cycle
+// instead of interval -- the schema contract.ContractCreatedEventUpcaster
+// migrates (core/domain/contract/upcaster.go). The projector must persist the
+// upcasted payload (with "interval" populated from "billing_cycle") into
+// contract_read_models.data, not the verbatim legacy JSON.
+func TestContractProjector_Created_LegacyBillingCycle_UpcastsInterval(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	createEvt := eventstore.Event{
+		ID: "evt-legacy-create", StreamID: "c-legacy-billing-cycle", Type: contract.EventTypeContractCreated,
+		Version: 1, SchemaVersion: 1,
+		Data: json.RawMessage(`{"contract_id":"c-legacy-billing-cycle","account_id":"acc-legacy",
+			"price_id":"price-legacy","billing_cycle":"yearly","contract_type":"subscription",
+			"created_at":"2026-01-01T00:00:00Z"}`),
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := es.Append(ctx, "c-legacy-billing-cycle", []eventstore.Event{createEvt}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := proj.Project(ctx, createEvt); err != nil {
+		t.Fatalf("Project legacy created: %v", err)
+	}
+
+	var unit string
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT data->'interval'->>'unit', (data->'interval'->>'count')::int
+		 FROM contract_read_models WHERE id = 'c-legacy-billing-cycle'`,
+	).Scan(&unit, &count); err != nil {
+		t.Fatalf("query projected interval: %v", err)
+	}
+	if unit != "year" || count != 1 {
+		t.Errorf("data.interval = {unit:%q count:%d}, want {unit:\"year\" count:1} (recovered from legacy billing_cycle)", unit, count)
+	}
+
+	var priceID string
+	if err := pool.QueryRow(ctx, `SELECT price_id FROM contract_read_models WHERE id = 'c-legacy-billing-cycle'`).Scan(&priceID); err != nil {
+		t.Fatal(err)
+	}
+	if priceID != "price-legacy" {
+		t.Errorf("price_id = %q, want 'price-legacy'", priceID)
+	}
+}
+
+// A legacy (SchemaVersion 1) price.changed payload carries only the old/new
+// Money pair, with no new_price_id field at all -- the schema
+// contract.PriceChangedEventUpcaster adds (defaulting it to "" when absent).
+// The projector's COALESCE(NULLIF($1, empty string)) guard must still leave the read
+// model's existing price_id untouched, and the persisted data blob must carry
+// the upcasted policy/old_price_id/new_price_id fields the legacy payload
+// never had.
+func TestContractProjector_PriceChanged_LegacyV1_NoNewPriceID_LeavesPriceIDUnchanged(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+	es := postgres.NewEventStore(pool)
+	cp := postgres.NewCheckpointStore(pool)
+	proj := postgres.NewContractProjector(pool, es, cp)
+	ctx := context.Background()
+
+	seedContract(t, ctx, es, proj, "c-price-legacy", "price-original", time.Now().UTC())
+
+	changed := eventstore.Event{
+		ID: "evt-price-legacy", StreamID: "c-price-legacy", Type: contract.EventTypePriceChanged,
+		Version: 2, SchemaVersion: 1,
+		Data: json.RawMessage(`{"contract_id":"c-price-legacy",
+			"old_price":{"amount":"1000/1","currency":"JPY"},
+			"new_price":{"amount":"2000/1","currency":"JPY"},
+			"changed_at":"2026-01-01T00:00:00Z","effective_at":"2026-01-01T00:00:00Z"}`),
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := es.Append(ctx, "c-price-legacy", []eventstore.Event{changed}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := proj.Project(ctx, changed); err != nil {
+		t.Fatalf("Project legacy price_changed: %v", err)
+	}
+
+	var priceID string
+	if err := pool.QueryRow(ctx, `SELECT price_id FROM contract_read_models WHERE id = 'c-price-legacy'`).Scan(&priceID); err != nil {
+		t.Fatal(err)
+	}
+	if priceID != "price-original" {
+		t.Errorf("price_id = %q, want unchanged 'price-original' (legacy payload upcasts new_price_id to empty string)", priceID)
+	}
+
+	var policy string
+	var hasOldID, hasNewID bool
+	if err := pool.QueryRow(ctx,
+		`SELECT data->>'policy', data ? 'old_price_id', data ? 'new_price_id'
+		 FROM contract_read_models WHERE id = 'c-price-legacy'`,
+	).Scan(&policy, &hasOldID, &hasNewID); err != nil {
+		t.Fatalf("query projected data: %v", err)
+	}
+	if policy != "immediate" {
+		t.Errorf("data.policy = %q, want 'immediate' (upcaster default for legacy events)", policy)
+	}
+	if !hasOldID || !hasNewID {
+		t.Errorf("data missing upcasted old_price_id/new_price_id fields: hasOldID=%v hasNewID=%v", hasOldID, hasNewID)
+	}
+}
