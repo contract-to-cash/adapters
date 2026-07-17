@@ -795,7 +795,7 @@ func TestEventStore_SchemaVersionRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	ev := eventstore.Event{
-		ID: "sv-1", Type: contract.EventTypeContractCreated, SchemaVersion: 3,
+		ID: "sv-1", Type: contract.EventTypeContractCreated, Version: 1, SchemaVersion: 3,
 		Data:       json.RawMessage(`{"contract_id":"c-sv","account_id":"a","idempotency_key":"sv-key"}`),
 		OccurredAt: time.Now().UTC(),
 	}

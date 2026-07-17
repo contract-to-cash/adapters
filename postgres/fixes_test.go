@@ -30,9 +30,9 @@ func TestEventStore_AppendAtomicWithoutTx(t *testing.T) {
 	// Append 3 events. The 3rd has a duplicate ID with the 1st to trigger an
 	// error midway. If Append is atomic, none should be persisted.
 	events := []eventstore.Event{
-		{ID: "atomic-1", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
-		{ID: "atomic-2", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
-		{ID: "atomic-1", Type: "test.event", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}, // dup ID
+		{ID: "atomic-1", Type: "test.event", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+		{ID: "atomic-2", Type: "test.event", Version: 2, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()},
+		{ID: "atomic-1", Type: "test.event", Version: 3, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}, // dup ID
 	}
 
 	err := store.Append(ctx, "stream-atomic", events, 0)
@@ -107,7 +107,7 @@ func TestEventStore_DuplicateIDIsNotVersionConflict(t *testing.T) {
 
 	// Insert an event on stream-1.
 	events1 := []eventstore.Event{{
-		ID: "dup-id", Type: "test.event", SchemaVersion: 1,
+		ID: "dup-id", Type: "test.event", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	if err := store.Append(ctx, "stream-dup-1", events1, 0); err != nil {
@@ -117,7 +117,7 @@ func TestEventStore_DuplicateIDIsNotVersionConflict(t *testing.T) {
 	// Insert an event with the SAME ID on a DIFFERENT stream.
 	// This is a PK violation (duplicate id), NOT a version conflict.
 	events2 := []eventstore.Event{{
-		ID: "dup-id", Type: "test.event", SchemaVersion: 1,
+		ID: "dup-id", Type: "test.event", Version: 1, SchemaVersion: 1,
 		Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 	}}
 	err := store.Append(ctx, "stream-dup-2", events2, 0)
