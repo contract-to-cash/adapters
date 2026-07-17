@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -687,4 +690,184 @@ func TestEventStore_LoadSnapshot_NoneReturnsNil(t *testing.T) {
 	if snap != nil {
 		t.Fatalf("expected nil snapshot, got %+v", snap)
 	}
+}
+
+// subErrCollector is a concurrency-safe WithSubscriptionErrorHandler sink
+// (mirrors postgres's errCollector in subscription_reconnect_test.go).
+type subErrCollector struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (c *subErrCollector) handle(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errs = append(c.errs, err)
+}
+
+func (c *subErrCollector) snapshot() []error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]error(nil), c.errs...)
+}
+
+// A failed poll must be reported through WithSubscriptionErrorHandler AND must
+// not kill the loop: the next poll runs and its events are still delivered.
+func TestEventStore_Subscribe_ReportsPollErrors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	reports := &subErrCollector{}
+	store := New(db, shared.FixedClock{FixedTime: fixedTime},
+		WithPollInterval(20*time.Millisecond),
+		WithSubscriptionErrorHandler(reports.handle))
+
+	// sqlmock matches expectations in order by default; make it explicit so
+	// the failing poll is guaranteed to precede the successful one.
+	mock.MatchExpectationsInOrder(true)
+	mock.ExpectQuery(`SELECT .* FROM events WHERE global_position > \? ORDER BY global_position ASC LIMIT \?`).
+		WithArgs(int64(0), 256).
+		WillReturnError(errors.New("boom"))
+	row := sqlmock.NewRows([]string{
+		"id", "stream_id", "type", "version", "schema_version",
+		"data", "metadata", "occurred_at", "recorded_at", "global_position",
+	}).AddRow("e1", "c1", "contract.created", 1, 1, []byte(`{}`), []byte(`{}`), fixedTime, fixedTime, int64(7))
+	mock.ExpectQuery(`SELECT .* FROM events WHERE global_position > \? ORDER BY global_position ASC LIMIT \?`).
+		WithArgs(int64(0), 256).
+		WillReturnRows(row)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := store.Subscribe(ctx, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// The loop survived the failed first poll: the second poll's event arrives.
+	select {
+	case e, ok := <-ch:
+		if !ok || e.GlobalPosition != 7 {
+			t.Fatalf("expected delivered event at position 7, got ok=%v ev=%+v", ok, e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for subscribed event after a failed poll")
+	}
+
+	// Expectations are ordered, so by the time the event was delivered the
+	// failing poll has already been reported.
+	var found bool
+	for _, rerr := range reports.snapshot() {
+		if strings.Contains(rerr.Error(), "boom") {
+			found = true
+			if !strings.Contains(rerr.Error(), "subscribe: event store: load all") {
+				t.Errorf("reported error %q is not wrapped as \"subscribe: event store: load all\"", rerr)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected the failed poll to be reported (containing \"boom\"), got %v", reports.snapshot())
+	}
+
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected channel to be closed after cancel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for channel close")
+	}
+}
+
+// Context cancellation is a normal shutdown: the channel closes and nothing is
+// reported to the subscription error handler.
+func TestEventStore_Subscribe_CancelDoesNotReportError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	reports := &subErrCollector{}
+	// A 1h poll interval and a 1-event batch (< pollBatchSize, so no
+	// full-batch continue) mean the single poll has provably completed once
+	// the event is received: no LoadAll is in flight at or after cancel, and
+	// the goroutine's only remaining transitions are parking on the ticker
+	// select and observing ctx.Done — neither can report an error.
+	store := New(db, shared.FixedClock{FixedTime: fixedTime},
+		WithPollInterval(time.Hour),
+		WithSubscriptionErrorHandler(reports.handle))
+
+	row := sqlmock.NewRows([]string{
+		"id", "stream_id", "type", "version", "schema_version",
+		"data", "metadata", "occurred_at", "recorded_at", "global_position",
+	}).AddRow("e1", "c1", "contract.created", 1, 1, []byte(`{}`), []byte(`{}`), fixedTime, fixedTime, int64(7))
+	mock.ExpectQuery(`SELECT .* FROM events WHERE global_position > \? ORDER BY global_position ASC LIMIT \?`).
+		WithArgs(int64(0), 256).
+		WillReturnRows(row)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := store.Subscribe(ctx, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Receiving the event proves the single poll completed successfully.
+	select {
+	case e, ok := <-ch:
+		if !ok || e.GlobalPosition != 7 {
+			t.Fatalf("expected delivered event at position 7, got ok=%v ev=%+v", ok, e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for subscribed event")
+	}
+
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected channel to be closed after cancel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for channel close")
+	}
+
+	for _, rerr := range reports.snapshot() {
+		if errors.Is(rerr, context.Canceled) {
+			t.Errorf("context cancellation must not be reported, got %v", rerr)
+		}
+	}
+	if got := reports.snapshot(); len(got) != 0 {
+		t.Errorf("expected no reported errors on clean shutdown, got %v", got)
+	}
+}
+
+func TestReportSubErr_FiltersContextCancellation(t *testing.T) {
+	var got []error
+	s := &EventStore{onSubErr: func(err error) { got = append(got, err) }}
+
+	// Normal-shutdown errors must not be reported.
+	s.reportSubErr(nil)
+	s.reportSubErr(context.Canceled)
+	s.reportSubErr(context.DeadlineExceeded)
+	s.reportSubErr(fmt.Errorf("wrap: %w", context.Canceled))
+	s.reportSubErr(fmt.Errorf("wrap: %w", context.DeadlineExceeded))
+	if len(got) != 0 {
+		t.Fatalf("context/nil errors should not be reported, got %v", got)
+	}
+
+	// A genuine failure is forwarded exactly once.
+	real := errors.New("load all failed")
+	s.reportSubErr(real)
+	if len(got) != 1 || !errors.Is(got[0], real) {
+		t.Fatalf("expected real error to be reported once, got %v", got)
+	}
+}
+
+func TestReportSubErr_NilHandlerIsSafe(t *testing.T) {
+	s := &EventStore{} // no handler
+	s.reportSubErr(errors.New("boom"))
 }

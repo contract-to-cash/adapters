@@ -39,6 +39,13 @@ publishes a GitHub Release. See the **Releasing** section of the README.
   without `new_price_id`) are migrated once by core's upcasters instead of
   requiring hand-rolled defensive projector code, and
   `contract_read_models.data` stores the upcasted shape. (#63)
+- **mysql**: `Subscribe` poll failures are no longer silently swallowed. Each
+  failed `LoadAll` poll is reported via the new `WithSubscriptionErrorHandler`
+  option (no debounce: during a DB outage the handler fires at the
+  `WithPollInterval` cadence, mirroring the postgres adapter's per-failed-cycle
+  reporting). Context cancellation is a normal shutdown and is not reported.
+  Without the option, behavior is unchanged (failures are still dropped and
+  the loop keeps polling). (#80)
 
 ### Changed
 
