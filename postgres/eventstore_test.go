@@ -588,13 +588,13 @@ func TestEventStore_Subscribe_ReconnectsAfterConnectionKill(t *testing.T) {
 	}
 
 	// Deliver a first event so we know LISTEN is established.
-	evt := func(id string) []eventstore.Event {
+	evt := func(id string, version int) []eventstore.Event {
 		return []eventstore.Event{{
-			ID: id, Type: "test.event", SchemaVersion: 1,
+			ID: id, Type: "test.event", Version: version, SchemaVersion: 1,
 			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		}}
 	}
-	if err := store.Append(ctx, "stream-kill", evt("evt-kill-1"), 0); err != nil {
+	if err := store.Append(ctx, "stream-kill", evt("evt-kill-1", 1), 0); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	recv := func(wantID string, timeout time.Duration) {
@@ -638,7 +638,7 @@ func TestEventStore_Subscribe_ReconnectsAfterConnectionKill(t *testing.T) {
 
 	// Append while the subscriber is (potentially still) disconnected: the
 	// post-reconnect catch-up must deliver it even if the NOTIFY was missed.
-	if err := store.Append(ctx, "stream-kill", evt("evt-kill-2"), 1); err != nil {
+	if err := store.Append(ctx, "stream-kill", evt("evt-kill-2", 2), 1); err != nil {
 		t.Fatalf("Append after kill: %v", err)
 	}
 	recv("evt-kill-2", 15*time.Second)
