@@ -346,3 +346,201 @@ func TestWithSubscriptionMaxReconnects_Option(t *testing.T) {
 		t.Errorf("maxReconnects = %d, want 3 (non-positive values ignored)", s.maxReconnects)
 	}
 }
+
+// fakeClock is a controllable clock for the `now` seam so healthy-window
+// semantics can be tested without real 30s waits.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// A failed connection attempt that itself takes longer than the healthy
+// window (network partition: pool.Acquire blocks for the OS TCP timeout,
+// minutes per attempt) must NOT reset the reconnect budget — the cycle never
+// established, so WithSubscriptionMaxReconnects must still exhaust at the
+// limit and close the channel. (Regression: the old code keyed the reset on
+// bare cycle duration, so slow failures reset the counter every iteration and
+// the limit was unreachable in exactly this scenario.)
+func TestRunSubscription_SlowFailedAcquiresNeverResetBudget(t *testing.T) {
+	reports := &errCollector{}
+	clock := newFakeClock()
+
+	s := NewEventStore(nil,
+		WithSubscriptionErrorHandler(reports.handle),
+		WithSubscriptionMaxReconnects(2),
+	)
+	s.now = clock.now
+	s.acquireSubConn = func(_ context.Context) (subListenConn, error) {
+		// Simulate a connect attempt that eats far more wall-clock time than
+		// the healthy window before failing.
+		clock.advance(subReconnectHealthyAfter + 10*time.Second)
+		return nil, errors.New("connect timeout")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan eventstore.Event, subscriberBuffer)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runSubscription(ctx, 0, ch)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("slow failed acquires reset the reconnect budget: limit never exhausted")
+	}
+	if _, ok := <-ch; ok {
+		t.Fatal("expected the events channel to be closed after exhaustion")
+	}
+
+	errs := reports.snapshot()
+	if len(errs) != 4 {
+		t.Fatalf("expected 4 reported errors (3 cycles + terminal), got %d: %v", len(errs), errs)
+	}
+	if last := errs[len(errs)-1].Error(); !strings.Contains(last, "closing subscription after 2 consecutive failed reconnect attempts") {
+		t.Errorf("terminal error %q does not describe exhaustion", last)
+	}
+}
+
+// A cycle that establishes (LISTEN + catch-up succeeded, tail loop entered)
+// and stays up for at least the healthy window resets the reconnect budget:
+// under a maxReconnects limit, an arbitrarily long sequence of such cycles
+// must never exhaust the subscription.
+func TestRunSubscription_EstablishedSustainedCycleResetsBudget(t *testing.T) {
+	reports := &errCollector{}
+	clock := newFakeClock()
+	rec := &callRecorder{}
+
+	s := NewEventStore(nil,
+		WithSubscriptionErrorHandler(reports.handle),
+		WithSubscriptionMaxReconnects(2),
+	)
+	s.now = clock.now
+	s.loadAll = func(_ context.Context, _ int64, _ int) ([]eventstore.Event, error) {
+		return nil, nil
+	}
+
+	const cycles = 6 // well past maxReconnects+1
+	acquired := make(chan int, cycles+8)
+	acquires := 0
+	s.acquireSubConn = func(_ context.Context) (subListenConn, error) {
+		acquires++
+		id := acquires
+		acquired <- id
+		return &scriptedConn{rec: rec, id: id, wait: func(_ context.Context) error {
+			// The connection stays up past the healthy window, then dies.
+			clock.advance(subReconnectHealthyAfter + 10*time.Second)
+			return errors.New("connection recycled")
+		}}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan eventstore.Event, subscriberBuffer)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runSubscription(ctx, 0, ch)
+	}()
+
+	for i := 1; i <= cycles; i++ {
+		select {
+		case <-acquired:
+		case <-done:
+			t.Fatalf("subscription exhausted after %d healthy cycles despite budget resets", i-1)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for connection cycle %d", i)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscription did not stop after context cancellation")
+	}
+	for _, err := range reports.snapshot() {
+		if strings.Contains(err.Error(), "closing subscription") {
+			t.Fatalf("healthy cycles must not lead to a terminal give-up, got %v", err)
+		}
+	}
+}
+
+// Scenario pinned deliberately (issue #61 review): a cycle that establishes
+// but dies BEFORE the healthy window elapses still counts against the
+// reconnect budget, so a connect-then-die loop cannot bypass a configured
+// limit. Integrators whose infrastructure recycles connections faster than
+// the healthy window must size the limit accordingly (or keep the default
+// unlimited) — see the WithSubscriptionMaxReconnects godoc.
+func TestRunSubscription_EstablishedButShortCyclesCountTowardLimit(t *testing.T) {
+	reports := &errCollector{}
+	clock := newFakeClock()
+	rec := &callRecorder{}
+
+	s := NewEventStore(nil,
+		WithSubscriptionErrorHandler(reports.handle),
+		WithSubscriptionMaxReconnects(2),
+	)
+	s.now = clock.now
+	s.loadAll = func(_ context.Context, _ int64, _ int) ([]eventstore.Event, error) {
+		return nil, nil
+	}
+
+	acquires := 0
+	s.acquireSubConn = func(_ context.Context) (subListenConn, error) {
+		acquires++
+		return &scriptedConn{rec: rec, id: acquires, wait: func(_ context.Context) error {
+			// Established, but killed immediately: no clock advance.
+			return errors.New("killed right after establishing")
+		}}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan eventstore.Event, subscriberBuffer)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runSubscription(ctx, 0, ch)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("established-but-short cycles must exhaust the limit")
+	}
+	if _, ok := <-ch; ok {
+		t.Fatal("expected the events channel to be closed after exhaustion")
+	}
+	if acquires != 3 {
+		t.Errorf("expected 3 connection cycles (initial + 2 reconnects), got %d", acquires)
+	}
+	errs := reports.snapshot()
+	if len(errs) != 4 {
+		t.Fatalf("expected 4 reported errors (3 cycles + terminal), got %d: %v", len(errs), errs)
+	}
+	if last := errs[len(errs)-1].Error(); !strings.Contains(last, "closing subscription after 2 consecutive failed reconnect attempts") {
+		t.Errorf("terminal error %q does not describe exhaustion", last)
+	}
+}

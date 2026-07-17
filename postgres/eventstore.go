@@ -37,12 +37,18 @@ const (
 	subReconnectInitialBackoff = 100 * time.Millisecond
 	subReconnectMaxBackoff     = 5 * time.Second
 
-	// subReconnectHealthyAfter: a connection cycle that stayed up at least
-	// this long before failing is considered to have been healthy, so the
-	// backoff and the consecutive-failure counter reset. This keeps a
-	// long-lived-but-idle connection from escalating the backoff across
-	// unrelated outages, while a tight crash loop (connections dying
-	// immediately) still backs off exponentially.
+	// subReconnectHealthyAfter: a connection cycle that ESTABLISHED (LISTEN +
+	// initial catch-up succeeded, i.e. the tail loop was entered) and then
+	// stayed up at least this long before failing is considered to have been
+	// healthy, so the backoff and the consecutive-failure counter reset. Both
+	// conditions are required: a cycle that never established must never
+	// reset, no matter how long its failure took (a network-partition
+	// pool.Acquire can block for the OS TCP timeout, minutes per attempt —
+	// measuring bare cycle duration would reset the counter every iteration
+	// and make WithSubscriptionMaxReconnects unreachable in exactly the
+	// outage it exists for), and an established-but-immediately-killed
+	// connection still counts as a failure so a connect-then-die loop cannot
+	// bypass the bound either.
 	subReconnectHealthyAfter = 30 * time.Second
 )
 
@@ -67,15 +73,18 @@ type PostgresEventStore struct {
 	catchUpBatch int
 
 	// maxReconnects, when > 0, bounds the number of CONSECUTIVE failed
-	// reconnect attempts after which the subscription gives up and closes its
-	// channel. 0 (default) retries forever with capped backoff.
+	// reconnect attempts (cycles without established-and-sustained uptime,
+	// see subReconnectHealthyAfter) after which the subscription gives up and
+	// closes its channel. 0 (default) retries forever with capped backoff.
 	maxReconnects int
 
-	// acquireSubConn and loadAll are seams for the subscription reconnect
-	// state machine so it is unit-testable without a database. NewEventStore
-	// wires them to the pool-backed implementations; only tests override them.
+	// acquireSubConn, loadAll and now are seams for the subscription
+	// reconnect state machine so it is unit-testable without a database (and
+	// with a controllable clock). NewEventStore wires them to the pool-backed
+	// implementations and the real clock; only tests override them.
 	acquireSubConn func(ctx context.Context) (subListenConn, error)
 	loadAll        func(ctx context.Context, fromPosition int64, limit int) ([]eventstore.Event, error)
+	now            func() time.Time
 }
 
 var _ eventstore.Store = (*PostgresEventStore)(nil)
@@ -102,10 +111,30 @@ func WithSubscriptionErrorHandler(fn func(error)) EventStoreOption {
 // consumer blocked on the channel (e.g. core's ProjectionService.Start, which
 // returns when the channel closes) regains control instead of waiting forever.
 //
-// The counter resets after a healthy cycle (a connection that stayed up for a
-// while), so the limit bounds a single continuous outage, not the lifetime
-// total. The default (0, or any value <= 0, which is ignored) retries forever
-// with capped exponential backoff — see Subscribe for why that is the default.
+// The counter resets only after a HEALTHY cycle: one that established (LISTEN
+// and the initial catch-up succeeded) and then stayed up for a sustained
+// period (30s) before failing. So the limit bounds a single continuous outage,
+// not the lifetime total, and both halves of "healthy" are deliberate:
+//
+//   - Establishment is required so that the time a FAILURE takes never counts
+//     as health. During a network partition pool.Acquire can block for the OS
+//     TCP connect timeout (minutes per attempt, pgx sets no default
+//     connect_timeout); if bare cycle duration reset the counter, the limit
+//     would never be reached in exactly the outage this option exists for.
+//   - Sustained uptime after establishment is required so a connect-then-die
+//     loop (e.g. a proxy that accepts LISTEN and then drops the connection)
+//     cannot reset the counter every cycle and bypass the bound.
+//
+// Consequence to size N for: a WORKING subscription whose connections are
+// killed more often than every 30s (aggressive LB idle timeout on a quiet
+// stream) accumulates failures despite delivering events, and will close the
+// channel after N such cycles. Each of those cycles reports through the
+// subscription error handler first, so the situation is observable; if your
+// infrastructure recycles idle connections aggressively, choose N well above
+// the recycle rate you consider normal, or keep the default (unlimited).
+//
+// The default (0, or any value <= 0, which is ignored) retries forever with
+// capped exponential backoff — see Subscribe for why that is the default.
 func WithSubscriptionMaxReconnects(n int) EventStoreOption {
 	return func(s *PostgresEventStore) {
 		if n > 0 {
@@ -128,6 +157,7 @@ func NewEventStore(pool *pgxpool.Pool, opts ...EventStoreOption) *PostgresEventS
 	s := &PostgresEventStore{pool: pool, catchUpBatch: defaultCatchUpBatch}
 	s.acquireSubConn = s.acquirePoolSubConn
 	s.loadAll = s.LoadAll
+	s.now = time.Now
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -429,7 +459,11 @@ func (s *PostgresEventStore) LoadAll(ctx context.Context, fromPosition int64, li
 // fail-fast supervision (e.g. an orchestrator restarting the process) can
 // bound consecutive attempts with WithSubscriptionMaxReconnects; on
 // exhaustion a terminal error is reported and the channel is closed so a
-// blocked consumer regains control.
+// blocked consumer regains control. The failure budget resets only after a
+// healthy cycle — one that established (LISTEN + initial catch-up succeeded)
+// and then stayed up for a sustained window measured from establishment; the
+// duration of a failed connection attempt itself never counts as health (see
+// WithSubscriptionMaxReconnects for the full semantics).
 //
 // The channel is closed when ctx is cancelled (normal shutdown) or when a
 // configured reconnect limit is exhausted; abnormal terminations and outage
@@ -502,14 +536,20 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 	reconnects := 0 // consecutive reconnect attempts since the last healthy cycle
 
 	for {
-		cycleStart := time.Now()
-		err := s.listenAndTail(ctx, &position, ch)
+		establishedAt, err := s.listenAndTail(ctx, &position, ch)
 		if ctx.Err() != nil {
 			return // normal shutdown; the deferred close signals completion
 		}
 		s.reportSubErr(fmt.Errorf("subscribe: %w", err))
 
-		if time.Since(cycleStart) >= subReconnectHealthyAfter {
+		// Reset the failure budget only after a HEALTHY cycle: one that
+		// established (entered the tail loop) AND stayed up for a sustained
+		// window measured FROM establishment. Never key this off bare cycle
+		// duration — a failing pool.Acquire under a network partition can
+		// itself take minutes (OS TCP timeout), and counting that as health
+		// would make the maxReconnects bound unreachable exactly when it is
+		// needed (see subReconnectHealthyAfter).
+		if !establishedAt.IsZero() && s.now().Sub(establishedAt) >= subReconnectHealthyAfter {
 			reconnects = 0
 			backoff = subReconnectInitialBackoff
 		}
@@ -539,40 +579,47 @@ func (s *PostgresEventStore) runSubscription(ctx context.Context, fromPosition i
 // ctx.Err() on cancellation; the connection is always released before
 // returning (leak-free on every path).
 //
+// establishedAt is the instant the cycle ESTABLISHED — LISTEN and the initial
+// catch-up succeeded and the tail loop was entered — or the zero time if the
+// cycle failed before that point. The caller uses it to decide whether the
+// cycle counts as healthy (reset of the reconnect budget); a cycle that never
+// established must report the zero time no matter how long its failure took.
+//
 // Ordering matters: LISTEN is issued BEFORE catchUp, so an event committed
 // between the two is seen either by the catch-up query or by an already-queued
 // notification — nothing can fall in the gap. This is the same invariant on
 // the initial cycle and on every reconnect.
-func (s *PostgresEventStore) listenAndTail(ctx context.Context, position *int64, ch chan<- eventstore.Event) error {
+func (s *PostgresEventStore) listenAndTail(ctx context.Context, position *int64, ch chan<- eventstore.Event) (establishedAt time.Time, err error) {
 	conn, err := s.acquireSubConn(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire connection: %w", err)
+		return time.Time{}, fmt.Errorf("acquire connection: %w", err)
 	}
 	defer conn.release()
 
 	if err := conn.listen(ctx); err != nil {
-		return fmt.Errorf("LISTEN: %w", err)
+		return time.Time{}, fmt.Errorf("LISTEN: %w", err)
 	}
 	if err := s.catchUp(ctx, position, ch); err != nil {
-		return fmt.Errorf("catch-up: %w", err)
+		return time.Time{}, fmt.Errorf("catch-up: %w", err)
 	}
+	establishedAt = s.now()
 
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return establishedAt, ctx.Err()
 		}
 		if err := conn.waitForNotification(ctx); err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return establishedAt, ctx.Err()
 			}
 			// Any non-context error from WaitForNotification is terminal for
 			// this connection in pgx (broken/killed connection): tear it down
 			// and let the caller reconnect instead of spinning on it forever
 			// (issue #61).
-			return fmt.Errorf("wait for notification: %w", err)
+			return establishedAt, fmt.Errorf("wait for notification: %w", err)
 		}
 		if err := s.catchUp(ctx, position, ch); err != nil {
-			return fmt.Errorf("catch-up: %w", err)
+			return establishedAt, fmt.Errorf("catch-up: %w", err)
 		}
 	}
 }
