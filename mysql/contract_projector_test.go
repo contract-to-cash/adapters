@@ -2,6 +2,8 @@ package mysql
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -20,6 +22,26 @@ func newContractProjector(t *testing.T) (*ContractProjector, sqlmock.Sqlmock) {
 	es := New(db, shared.FixedClock{FixedTime: fixedTime})
 	cp := NewCheckpointStore(db)
 	return NewContractProjector(db, es, cp), mock
+}
+
+// jsonArgMatcher is a sqlmock.Argument that decodes a []byte driver.Value as
+// JSON and hands it to check. Used to assert on the SHAPE of the JSON blob the
+// projector persists (e.g. that it is the upcasted payload, not the verbatim
+// legacy one) without pinning the exact byte string.
+type jsonArgMatcher struct {
+	check func(data map[string]any) bool
+}
+
+func (m jsonArgMatcher) Match(v driver.Value) bool {
+	b, ok := v.([]byte)
+	if !ok {
+		return false
+	}
+	var data map[string]any
+	if err := json.Unmarshal(b, &data); err != nil {
+		return false
+	}
+	return m.check(data)
 }
 
 func TestContractProjector_Project_Created(t *testing.T) {
@@ -334,5 +356,100 @@ func TestContractProjector_Rebuild_NoForeignKeyToggle(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// --- Issue #63: the projector must run events through the core upcaster
+// chain before projecting, just like aggregate rehydration (LoadFromHistory)
+// does. Both regression tests below feed a LEGACY (pre-upcast) payload
+// straight into Project and assert the read model reflects the MIGRATED
+// shape.
+
+// A legacy (SchemaVersion 1) contract.created payload carries billing_cycle
+// instead of interval -- the schema contract.ContractCreatedEventUpcaster
+// migrates (core/domain/contract/upcaster.go). The projector must persist the
+// upcasted payload (with "interval" populated from "billing_cycle") into
+// contract_read_models.data, not the verbatim legacy JSON.
+func TestContractProjector_Project_Created_LegacyBillingCycle_UpcastsInterval(t *testing.T) {
+	proj, mock := newContractProjector(t)
+
+	ev := eventstore.Event{
+		StreamID:      "contract-legacy",
+		Type:          "contract.created",
+		Version:       1,
+		SchemaVersion: 1,
+		Data: []byte(`{"contract_id":"contract-legacy","account_id":"acc-1","price_id":"price-1",
+			"billing_cycle":"yearly","contract_type":"subscription","created_at":"2026-01-01T00:00:00Z"}`),
+	}
+
+	mock.ExpectExec(`INSERT INTO contract_read_models`).
+		WithArgs("contract-legacy", "acc-1", sqlmock.AnyArg(), "price-1",
+			jsonArgMatcher{check: func(data map[string]any) bool {
+				iv, ok := data["interval"].(map[string]any)
+				if !ok {
+					return false
+				}
+				unit, _ := iv["unit"].(string)
+				count, _ := iv["count"].(float64)
+				return unit == "year" && count == 1
+			}},
+			1).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project legacy created: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (projector did not persist the upcasted interval): %v", err)
+	}
+}
+
+// A legacy (SchemaVersion 1) price.changed payload carries only the old/new
+// Money pair, with no new_price_id field at all -- the schema
+// contract.PriceChangedEventUpcaster adds. Before issue #63, the projector
+// decoded the raw event.Data directly, so `data["new_price_id"]` type-asserted
+// to "" via the zero value of a missing key -- which happens to be
+// indistinguishable from the upcasted (guaranteed-present) empty string in
+// this particular case. The real regression this guards is that the
+// projector must still work end-to-end when the upcaster IS in the loop
+// (verifying the wiring, not just the type-assertion fallback), and that the
+// COALESCE(NULLIF(...)) defensive SQL correctly leaves price_id untouched for
+// this legacy shape.
+func TestContractProjector_Project_PriceChanged_LegacyV1_NoNewPriceID(t *testing.T) {
+	proj, mock := newContractProjector(t)
+
+	ev := eventstore.Event{
+		StreamID:      "contract-1",
+		Type:          "contract.price_changed",
+		Version:       5,
+		SchemaVersion: 1,
+		Data: []byte(`{"contract_id":"contract-1",
+			"old_price":{"amount":"1000/1","currency":"JPY"},
+			"new_price":{"amount":"2000/1","currency":"JPY"},
+			"changed_at":"2026-01-01T00:00:00Z","effective_at":"2026-01-01T00:00:00Z"}`),
+	}
+
+	// new_price_id upcasts to "" (never recorded for this legacy shape), so
+	// NULLIF(?, '') must yield NULL and COALESCE must leave the existing
+	// price_id in place -- the ExecContext call itself must still happen with
+	// "" as the bound parameter.
+	mock.ExpectExec(`UPDATE contract_read_models\s+SET price_id = COALESCE\(NULLIF\(\?, ''\), price_id\)`).
+		WithArgs("",
+			jsonArgMatcher{check: func(data map[string]any) bool {
+				// Upcasting must have added policy/old_price_id/new_price_id
+				// fields the legacy payload never carried.
+				policy, _ := data["policy"].(string)
+				_, hasOldID := data["old_price_id"]
+				_, hasNewID := data["new_price_id"]
+				return policy == "immediate" && hasOldID && hasNewID
+			}},
+			5, "contract-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := proj.Project(context.Background(), ev); err != nil {
+		t.Fatalf("Project legacy price_changed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (projector did not run the upcaster / SQL guard broke): %v", err)
 	}
 }
