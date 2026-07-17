@@ -3,6 +3,8 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/contract-to-cash/adapters/postgres/postgrestest"
 	"github.com/contract-to-cash/core/domain/shared"
 	"github.com/contract-to-cash/core/eventstore"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestEventStore_AppendAndLoad(t *testing.T) {
@@ -438,5 +441,87 @@ func TestEventStore_ConcurrentAppends_SerializeGlobalPosition(t *testing.T) {
 	if all[1].GlobalPosition <= all[0].GlobalPosition {
 		t.Fatalf("positions not strictly increasing in commit order: %d then %d",
 			all[0].GlobalPosition, all[1].GlobalPosition)
+	}
+}
+
+// Issue #61: a subscription must survive its LISTEN connection being killed
+// server-side (DB failover, admin pg_terminate_backend): the dead connection
+// is released, a fresh one is acquired and re-LISTENed, and catch-up delivers
+// the events committed during the outage. Before the fix the tail loop retried
+// WaitForNotification on the same dead connection forever and the subscription
+// became a silent zombie.
+func TestEventStore_Subscribe_ReconnectsAfterConnectionKill(t *testing.T) {
+	pool := postgrestest.NewPool(t)
+
+	var reported atomic.Int32
+	store := postgres.NewEventStore(pool,
+		postgres.WithSubscriptionErrorHandler(func(error) { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ch, err := store.Subscribe(ctx, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Deliver a first event so we know LISTEN is established.
+	evt := func(id string) []eventstore.Event {
+		return []eventstore.Event{{
+			ID: id, Type: "test.event", SchemaVersion: 1,
+			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		}}
+	}
+	if err := store.Append(ctx, "stream-kill", evt("evt-kill-1"), 0); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	recv := func(wantID string, timeout time.Duration) {
+		t.Helper()
+		select {
+		case e, ok := <-ch:
+			if !ok {
+				t.Fatalf("channel closed while waiting for %q", wantID)
+			}
+			if e.ID != wantID {
+				t.Fatalf("received %q, want %q", e.ID, wantID)
+			}
+		case <-time.After(timeout):
+			t.Fatalf("timed out waiting for %q", wantID)
+		}
+	}
+	recv("evt-kill-1", 5*time.Second)
+
+	// Find the LISTEN backend and kill it server-side.
+	var pid int
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := pool.QueryRow(ctx,
+			`SELECT pid FROM pg_stat_activity
+			 WHERE datname = current_database() AND query LIKE 'LISTEN %'
+			 LIMIT 1`).Scan(&pid)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("query pg_stat_activity: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("LISTEN backend not found in pg_stat_activity")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatalf("pg_terminate_backend: %v", err)
+	}
+
+	// Append while the subscriber is (potentially still) disconnected: the
+	// post-reconnect catch-up must deliver it even if the NOTIFY was missed.
+	if err := store.Append(ctx, "stream-kill", evt("evt-kill-2"), 1); err != nil {
+		t.Fatalf("Append after kill: %v", err)
+	}
+	recv("evt-kill-2", 15*time.Second)
+
+	if reported.Load() == 0 {
+		t.Error("expected the connection kill to be reported via WithSubscriptionErrorHandler")
 	}
 }
