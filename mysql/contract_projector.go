@@ -152,7 +152,6 @@ scan:
 
 func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Event) error {
 	q := querierFromContext(ctx, p.db)
-	contractID := event.StreamID
 
 	// Upcast before decoding so the projection reads the same schema the
 	// aggregate would after replay (issue #63) -- e.g. a legacy v1
@@ -162,10 +161,18 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 	if err != nil {
 		return fmt.Errorf("upcast contract event: %w", err)
 	}
+	// Everything below must see the migrated event: UpcasterChain.Upcast
+	// returns a full eventstore.Event (not just Data), and a future core
+	// upcaster is free to mutate any field of it (e.g. rename an event type
+	// on migration). Reassigning here means the switch, StreamID, and every
+	// other event.* read automatically track that, instead of a future edit
+	// accidentally reaching back into the pre-upcast event.
+	event = upcasted
+	contractID := event.StreamID
 
 	var data map[string]any
-	if len(upcasted.Data) > 0 {
-		if err := json.Unmarshal(upcasted.Data, &data); err != nil {
+	if len(event.Data) > 0 {
+		if err := json.Unmarshal(event.Data, &data); err != nil {
 			return fmt.Errorf("unmarshal event data: %w", err)
 		}
 	}
@@ -175,7 +182,7 @@ func (p *ContractProjector) applyEvent(ctx context.Context, event eventstore.Eve
 	// model's JSON blob self-consistent with the aggregate's view of the same
 	// event, so any consumer reading contract_read_models.data directly
 	// (rather than replaying the stream) also sees the migrated shape.
-	raw := normalizeJSON(upcasted.Data)
+	raw := normalizeJSON(event.Data)
 
 	switch event.Type {
 	case contract.EventTypeContractCreated:
