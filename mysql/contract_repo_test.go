@@ -321,6 +321,56 @@ func TestContractRepo_FindByIDAsOf_UsesSnapshotWithinHorizon(t *testing.T) {
 	}
 }
 
+// TestContractRepo_FindByIDAsOf_NotFoundWhenSnapshotDiscardedAndNoEventsWithinHorizon
+// pins a hidden win of the W7 guard (issue #62): once a snapshot beyond the
+// asOf horizon is discarded, the not-found check
+// (!useSnapshot && len(relevant) == 0) means a skew-backdated snapshot can no
+// longer "resurrect" a contract before its first event. Here the contract's
+// only event (Create) occurs AFTER asOf, but a snapshot at version 1 was
+// saved with CreatedAt backdated to before asOf — without the guard,
+// LoadSnapshotBefore(asOf) would return it and FindByIDAsOf would incorrectly
+// report the contract as existing (Draft) at asOf. With the guard, the
+// snapshot is discarded (its version 1 exceeds maxVersionAsOf 0, since no
+// events occurred at/before asOf) and, with zero relevant events either,
+// FindByIDAsOf correctly returns ErrCodeNotFound.
+func TestContractRepo_FindByIDAsOf_NotFoundWhenSnapshotDiscardedAndNoEventsWithinHorizon(t *testing.T) {
+	repo, mock := newContractRepo(t)
+	id := "c-w7-nf"
+
+	asOf := time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC)
+	snapCreatedAt := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC) // before asOf
+	tCreate := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)       // after asOf
+
+	// The contract's only event (Create) occurs AFTER asOf.
+	created := newDraftContractAt(t, id, tCreate)
+	snapState, err := created.MarshalSnapshot()
+	if err != nil {
+		t.Fatalf("MarshalSnapshot: %v", err)
+	}
+
+	// LoadUntil(asOf) returns no events: the only event occurred after asOf.
+	mock.ExpectQuery(`SELECT .* FROM events WHERE stream_id = \? AND occurred_at <= \? ORDER BY version ASC`).
+		WithArgs(id, asOf).
+		WillReturnRows(emptyEventRows())
+
+	// A skew-backdated snapshot at version 1, CreatedAt before asOf even
+	// though the only event it could reflect occurred after asOf. Its version
+	// (1) exceeds maxVersionAsOf (0), so the guard must discard it.
+	mock.ExpectQuery(`SELECT .* FROM snapshots WHERE stream_id = \? AND created_at < \? ORDER BY created_at DESC, version DESC LIMIT 1`).
+		WithArgs(id, asOf).
+		WillReturnRows(sqlmock.NewRows([]string{"stream_id", "version", "state", "as_of", "created_at"}).
+			AddRow(id, 1, snapState, tCreate, snapCreatedAt))
+
+	_, err = repo.FindByIDAsOf(context.Background(), shared.ContractID(id), asOf)
+	var de *shared.DomainError
+	if !errors.As(err, &de) || de.Code != shared.ErrCodeNotFound {
+		t.Fatalf("expected not_found DomainError, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 func emptyEventRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "stream_id", "type", "version", "schema_version",
