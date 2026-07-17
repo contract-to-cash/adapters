@@ -33,12 +33,19 @@ CREATE INDEX idx_contract_rm_end_date ON contract_read_models (end_date);
 CREATE INDEX idx_contract_rm_renewal_date ON contract_read_models (renewal_date);
 CREATE INDEX idx_contract_rm_trial_end ON contract_read_models (trial_end_date);
 
+-- total: floor-truncated whole-currency-unit approximation kept for
+-- query/display convenience only (filtering, ordering, dashboards). It is NOT
+-- the source of truth: the exact big.Rat amount lives in the data JSON
+-- column on this table and in the event store's event payloads / state JSON.
+-- Do not use this column for arithmetic or financial reconciliation. Same
+-- lossy BIGINT-from-big.Rat truncation as the domain-table money columns
+-- documented in mysql/money.go.
 CREATE TABLE invoice_read_models (
     id          VARCHAR(191) NOT NULL,
     contract_id VARCHAR(191) NOT NULL,
     account_id  VARCHAR(191) NOT NULL,
     status      VARCHAR(191) NOT NULL,
-    total       BIGINT       NOT NULL DEFAULT 0,
+    total       BIGINT       NOT NULL DEFAULT 0 COMMENT 'Floor-truncated whole-currency-unit approximation for query/display only; exact big.Rat amount lives in event payloads / state JSON (see also the data column on this table); do not use for arithmetic or reconciliation.',
     currency    VARCHAR(191) NOT NULL DEFAULT 'JPY',
     data        JSON         NOT NULL,
     version     INT          NOT NULL DEFAULT 0,
