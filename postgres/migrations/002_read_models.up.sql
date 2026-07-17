@@ -38,6 +38,16 @@ CREATE TABLE invoice_read_models (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- total is a floor-truncated whole-currency-unit approximation kept for
+-- query/display convenience only (filtering, ordering, dashboards). It is NOT
+-- the source of truth: the exact big.Rat amount lives in the data JSON column
+-- on this table and in the event store's event payloads / state JSON. Do not
+-- use this column for arithmetic or financial reconciliation. Same lossy
+-- BIGINT-from-big.Rat truncation as the domain-table money columns documented
+-- in postgres/money.go (parseMoneyPayload).
+COMMENT ON COLUMN invoice_read_models.total IS
+    'Floor-truncated whole-currency-unit approximation for query/display only; exact big.Rat amount lives in event payloads / state JSON (see also the data column on this table); do not use for arithmetic or reconciliation.';
+
 CREATE INDEX idx_invoice_rm_contract_id ON invoice_read_models (contract_id);
 CREATE INDEX idx_invoice_rm_account_id ON invoice_read_models (account_id);
 CREATE INDEX idx_invoice_rm_status ON invoice_read_models (status);

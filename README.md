@@ -43,8 +43,11 @@ Testing section for the difference in how each is verified).
 Event store semantics follow the core reference implementation
 (`infrastructure/inmemory/event_store.go`) in both SQL adapters:
 `LoadRange` is half-open (`from <= occurred_at < to`), `LoadSnapshotBefore`
-cuts off on snapshot `CreatedAt`, and `Append` derives event versions
-server-side from `expectedVersion`.
+cuts off on snapshot `CreatedAt`, and `Append` validates that each event's
+caller-stamped `Version` is contiguous with `expectedVersion` (i.e. event `i`
+must equal `expectedVersion+i+1`), rejecting the whole batch with a
+`shared.DomainError` (code `validation_error`) on a gap, stale version, or
+out-of-order value instead of silently renumbering it.
 
 `usage.Repository.Record` also follows the core reference
 (`infrastructure/inmemory/usage_repository.go`): recording a `UsageRecord`

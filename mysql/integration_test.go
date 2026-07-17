@@ -59,8 +59,8 @@ func TestIntegration_EventStore_AppendAndLoad(t *testing.T) {
 	ctx := context.Background()
 
 	events := []eventstore.Event{
-		{ID: "evt-1", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{"name":"test"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
-		{ID: "evt-2", Type: "test.updated", SchemaVersion: 1, Data: json.RawMessage(`{"name":"updated"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
+		{ID: "evt-1", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{"name":"test"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
+		{ID: "evt-2", Type: "test.updated", Version: 2, SchemaVersion: 1, Data: json.RawMessage(`{"name":"updated"}`), OccurredAt: time.Now().UTC().Truncate(time.Microsecond)},
 	}
 	if err := store.Append(ctx, "stream-1", events, 0); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -86,11 +86,13 @@ func TestIntegration_EventStore_AppendVersionConflict(t *testing.T) {
 	store := mysql.New(db, integrationClock)
 	ctx := context.Background()
 
-	first := []eventstore.Event{{ID: "vc-1", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
+	first := []eventstore.Event{{ID: "vc-1", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
 	if err := store.Append(ctx, "stream-vc", first, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
-	second := []eventstore.Event{{ID: "vc-2", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
+	// second's Version is irrelevant: the stale expectedVersion=0 trips the
+	// version-conflict check before the contiguity check ever runs.
+	second := []eventstore.Event{{ID: "vc-2", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}}
 	err := store.Append(ctx, "stream-vc", second, 0) // stale expectedVersion
 	if !isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Fatalf("expected version_conflict, got %v", err)
@@ -106,14 +108,14 @@ func TestIntegration_EventStore_DuplicateEventIDIsNotVersionConflict(t *testing.
 	store := mysql.New(db, integrationClock)
 	ctx := context.Background()
 
-	ev := eventstore.Event{ID: "dup-id", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
+	ev := eventstore.Event{ID: "dup-id", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
 	if err := store.Append(ctx, "stream-dup-a", []eventstore.Event{ev}, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
 
 	// Same ID on a DIFFERENT stream: COUNT precheck passes (new stream is at 0)
 	// but the INSERT trips uq_event_id.
-	dup := eventstore.Event{ID: "dup-id", Type: "test.created", SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
+	dup := eventstore.Event{ID: "dup-id", Type: "test.created", Version: 1, SchemaVersion: 1, Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC()}
 	err := store.Append(ctx, "stream-dup-b", []eventstore.Event{dup}, 0)
 	if err == nil {
 		t.Fatal("expected error from duplicate event ID, got nil")
@@ -151,13 +153,13 @@ func TestIntegration_EventStore_ContractIdempotencyKeyUniqueness(t *testing.T) {
 	}
 
 	// First contract.created with a non-empty key succeeds.
-	ev1 := eventstore.Event{ID: "idem-a", Type: "contract.created", SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
+	ev1 := eventstore.Event{ID: "idem-a", Type: "contract.created", Version: 1, SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
 	if err := store.Append(ctx, "c-idem-a", []eventstore.Event{ev1}, 0); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
 
 	// A DIFFERENT stream reusing the same key is rejected as a conflict.
-	ev2 := eventstore.Event{ID: "idem-b", Type: "contract.created", SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
+	ev2 := eventstore.Event{ID: "idem-b", Type: "contract.created", Version: 1, SchemaVersion: 3, Data: created("dup-key"), OccurredAt: time.Now().UTC()}
 	err := store.Append(ctx, "c-idem-b", []eventstore.Event{ev2}, 0)
 	if isDomainError(err, shared.ErrCodeVersionConflict) {
 		t.Fatalf("idempotency conflict must NOT be version_conflict: %v", err)
@@ -167,14 +169,14 @@ func TestIntegration_EventStore_ContractIdempotencyKeyUniqueness(t *testing.T) {
 	}
 
 	// A distinct key is fine.
-	ev3 := eventstore.Event{ID: "idem-c", Type: "contract.created", SchemaVersion: 3, Data: created("other-key"), OccurredAt: time.Now().UTC()}
+	ev3 := eventstore.Event{ID: "idem-c", Type: "contract.created", Version: 1, SchemaVersion: 3, Data: created("other-key"), OccurredAt: time.Now().UTC()}
 	if err := store.Append(ctx, "c-idem-c", []eventstore.Event{ev3}, 0); err != nil {
 		t.Fatalf("distinct key Append: %v", err)
 	}
 
 	// Historical events with NO idempotency_key are exempt: two coexist.
 	for _, s := range []struct{ id, stream string }{{"legacy-a", "c-legacy-a"}, {"legacy-b", "c-legacy-b"}} {
-		ev := eventstore.Event{ID: s.id, Type: "contract.created", SchemaVersion: 2, Data: json.RawMessage(`{"contract_id":"x","account_id":"a"}`), OccurredAt: time.Now().UTC()}
+		ev := eventstore.Event{ID: s.id, Type: "contract.created", Version: 1, SchemaVersion: 2, Data: json.RawMessage(`{"contract_id":"x","account_id":"a"}`), OccurredAt: time.Now().UTC()}
 		if err := store.Append(ctx, s.stream, []eventstore.Event{ev}, 0); err != nil {
 			t.Fatalf("legacy Append %s: %v", s.id, err)
 		}
@@ -1074,7 +1076,7 @@ func TestIntegration_EventStore_ConcurrentAppends_SerializeGlobalPosition(t *tes
 
 	evt := func(id, stream string) []eventstore.Event {
 		return []eventstore.Event{{
-			ID: id, Type: "test.event", SchemaVersion: 1,
+			ID: id, Type: "test.event", Version: 1, SchemaVersion: 1,
 			Data: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		}}
 	}

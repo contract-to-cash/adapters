@@ -138,6 +138,28 @@ func (s *PostgresEventStore) q(ctx context.Context) Querier {
 	return QuerierFromContext(ctx, s.pool)
 }
 
+// Append persists events to a stream under optimistic concurrency control.
+//
+// Timestamp precision (issue #64): core stamps Event.OccurredAt with
+// nanosecond-precision time.Now() (indirectly, via shared.Clock). The events
+// table's occurred_at column is TIMESTAMPTZ (migration 001), which PostgreSQL
+// stores at microsecond precision, so a round trip through Append/Load
+// truncates any sub-microsecond component of OccurredAt. A boundary
+// comparison (e.g. LoadUntil(ctx, streamID, until)) that relies on
+// nanosecond-exact ordering between two events stamped in the same
+// microsecond can therefore behave differently than against the in-memory
+// reference store (infrastructure/inmemory/event_store.go), which keeps
+// OccurredAt at full Go time.Time precision. This is a storage characteristic,
+// not a bug: callers needing sub-microsecond ordering guarantees should not
+// rely on OccurredAt equality/ordering at that resolution.
+//
+// RecordedAt provenance (issue #64): unlike the mysql adapter (and the
+// in-memory reference store), which stamp RecordedAt from the injected
+// shared.Clock, this adapter does NOT set RecordedAt in the INSERT below —
+// the events.recorded_at column's DEFAULT NOW() (migration 001) populates it
+// from the database server's clock. RecordedAt therefore reflects DB time,
+// not the store's caller-supplied clock. This is an intentional adapter
+// divergence, not a bug: no behavior change is planned here.
 func (s *PostgresEventStore) Append(ctx context.Context, streamID string, events []eventstore.Event, expectedVersion int) error {
 	if len(events) == 0 {
 		return nil
@@ -206,6 +228,23 @@ func (s *PostgresEventStore) appendInTx(ctx context.Context, streamID string, ev
 			shared.ErrCodeVersionConflict,
 			fmt.Sprintf("stream %q expected version %d but stream is at %d", streamID, expectedVersion, current),
 		)
+	}
+
+	// Validate Version contiguity: appended events must be numbered
+	// sequentially starting at expectedVersion+1, matching the in-memory
+	// reference store (infrastructure/inmemory/event_store.go). A gap or
+	// out-of-order Version means the events were built against a stale
+	// aggregate version and would corrupt the append-only log (breaking
+	// optimistic locking and temporal replay), so reject the batch rather
+	// than silently renumber and persist a different version than the
+	// caller stamped.
+	for i := range events {
+		wantVersion := expectedVersion + i + 1
+		if events[i].Version != wantVersion {
+			return shared.NewDomainError(shared.ErrCodeValidation,
+				fmt.Sprintf("event %d for stream %q has version %d but expected contiguous version %d",
+					i, streamID, events[i].Version, wantVersion))
+		}
 	}
 
 	for i, evt := range events {
