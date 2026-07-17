@@ -341,6 +341,15 @@ func (s *EventStore) LoadSnapshot(ctx context.Context, streamID string) (*events
 // LoadSnapshotBefore loads the latest snapshot created before the given time,
 // or (nil, nil) if none. version DESC breaks ties between snapshots created
 // at the same instant deterministically (highest wins).
+//
+// Because the cutoff is CreatedAt (wall-clock) while callers bound events by
+// OccurredAt, a snapshot returned here is not automatically safe to use for an
+// as-of reconstruction: with a skewed/injected clock a snapshot can be
+// CreatedAt before asOf yet cover an event that OCCURRED after asOf. The
+// caller must apply the core review W7 consistency guard (reject the snapshot
+// if its Version exceeds the highest event version within the asOf horizon) —
+// see MySQLContractRepository.FindByIDAsOf in contract_repo.go, which mirrors
+// core's application/query/temporal_query_service.go GetContractAsOf.
 func (s *EventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	row := s.q(ctx).QueryRowContext(ctx,
 		"SELECT stream_id, version, state, as_of, created_at FROM snapshots WHERE stream_id = ? AND created_at < ? ORDER BY created_at DESC, version DESC LIMIT 1",

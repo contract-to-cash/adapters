@@ -436,6 +436,15 @@ func (s *PostgresEventStore) LoadSnapshot(ctx context.Context, streamID string) 
 // creation time (created_at), not the as_of time, matching the core reference
 // implementation in infrastructure/inmemory. version DESC breaks ties between
 // snapshots created at the same instant deterministically (highest wins).
+//
+// Because the cutoff is CreatedAt (wall-clock) while callers bound events by
+// OccurredAt, a snapshot returned here is not automatically safe to use for an
+// as-of reconstruction: with a skewed/injected clock a snapshot can be
+// CreatedAt before asOf yet cover an event that OCCURRED after asOf. The
+// caller must apply the core review W7 consistency guard (reject the snapshot
+// if its Version exceeds the highest event version within the asOf horizon) —
+// see PostgresContractRepository.FindByIDAsOf in contract_repo.go, which
+// mirrors core's application/query/temporal_query_service.go GetContractAsOf.
 func (s *PostgresEventStore) LoadSnapshotBefore(ctx context.Context, streamID string, before time.Time) (*eventstore.Snapshot, error) {
 	return s.loadSnapshotRow(ctx,
 		`SELECT stream_id, version, state, as_of, created_at
