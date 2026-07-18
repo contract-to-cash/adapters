@@ -749,6 +749,9 @@ and returned in UTC; `DATETIME` columns are scanned correctly under either
   removed (`mysql/contract_projector.go`, `postgres/contract_projector.go`).
 - No `LISTEN/NOTIFY`: `Subscribe` tails new events by polling `LoadAll`
   (replay-then-tail, honours `fromPosition`, back-pressures slow consumers).
+  Poll failures (e.g. a DB outage) are reported via
+  `mysql.WithSubscriptionErrorHandler`; the loop keeps polling and resumes
+  delivery once the database recovers.
 - Partial indexes are emulated as full indexes; `JSONB`→`JSON`,
   `BIGSERIAL`→`AUTO_INCREMENT`, `NOW()`→`NOW(6)`.
 
@@ -815,18 +818,30 @@ Consequences and guidance:
 - Aggregate rehydration (per-stream, version-ordered via `Load`) never depended
   on global-position visibility and is unaffected.
 
-`Subscribe` (postgres) additionally distinguishes a broken subscription from a
-clean shutdown. The core `eventstore.Store` interface returns only a channel
-that is closed on both, so register a callback to observe failures:
+`Subscribe` additionally distinguishes a broken subscription from a clean
+shutdown in both adapters. The core `eventstore.Store` interface returns only a
+channel, which cannot signal failure: a broken subscription either closes the
+channel (postgres with a reconnect bound via `WithSubscriptionMaxReconnects`)
+or leaves it silently open while retrying (mysql, and postgres by default) —
+so register a callback to observe failures:
+postgres reports every failed connection cycle (acquire / LISTEN / catch-up /
+notification-wait, including each reconnect attempt during an outage); mysql
+reports each failed `LoadAll` poll (at the `WithPollInterval` cadence during an
+outage, no debounce):
 
 ```go
 es := postgres.NewEventStore(pool,
     postgres.WithSubscriptionErrorHandler(func(err error) { log.Printf("subscribe: %v", err) }),
     postgres.WithCatchUpBatchSize(1000), // bound replay/tail page size
 )
+
+mes := mysql.New(db, clock,
+    mysql.WithSubscriptionErrorHandler(func(err error) { log.Printf("subscribe: %v", err) }),
+)
 ```
 
-Context cancellation is treated as a normal shutdown and is **not** reported.
+Context cancellation is treated as a normal shutdown and is **not** reported by
+either adapter.
 
 ### Read-model foreign keys and projection mode
 

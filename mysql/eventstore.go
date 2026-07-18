@@ -38,6 +38,17 @@ type EventStore struct {
 	pollInterval    time.Duration
 	pollBatchSize   int
 	subscribeBuffer int
+
+	// onSubErr, when set, is invoked whenever a Subscribe poll fails (the
+	// pollLoop's LoadAll returning an error — e.g. a DB outage). The core
+	// eventstore.Store interface cannot signal any of this (Subscribe returns
+	// a bare channel; for this adapter it is closed only on context
+	// cancellation, so a failing subscription is indistinguishable from an
+	// idle one), so this optional callback lets integrators distinguish a
+	// clean shutdown from a broken/outaged subscription. It is called from
+	// the subscription goroutine; keep it non-blocking (e.g. log, increment
+	// a metric, push to a buffered channel).
+	onSubErr func(error)
 }
 
 // Option configures an EventStore.
@@ -61,6 +72,17 @@ func WithSubscribeBuffer(n int) Option {
 			s.pollBatchSize = n
 		}
 	}
+}
+
+// WithSubscriptionErrorHandler registers a callback invoked when a Subscribe
+// poll fails. It fires once per failed poll (at the poll cadence, so an
+// ongoing DB outage is continuously observable at WithPollInterval frequency;
+// there is no debouncing, mirroring the postgres adapter's per-failed-cycle
+// reporting). Context cancellation is a normal shutdown and does not trigger
+// it. The handler is called from the subscription goroutine; keep it
+// non-blocking.
+func WithSubscriptionErrorHandler(fn func(error)) Option {
+	return func(s *EventStore) { s.onSubErr = fn }
 }
 
 // New constructs a MySQL EventStore over an existing *sql.DB.
@@ -313,6 +335,11 @@ func (s *EventStore) LoadAll(ctx context.Context, fromPosition int64, limit int)
 // order, so advancing the poll cursor past position N can never hide an
 // as-yet-uncommitted event at a lower position. The channel is closed when ctx
 // is cancelled.
+//
+// A failed poll (LoadAll error, e.g. during a DB outage) is reported through
+// the callback registered with WithSubscriptionErrorHandler; without that
+// option such failures are dropped (preserving prior behavior). The loop keeps
+// polling either way and resumes delivery once the database recovers.
 func (s *EventStore) Subscribe(ctx context.Context, fromPosition int64) (<-chan eventstore.Event, error) {
 	ch := make(chan eventstore.Event, s.subscribeBuffer)
 	go s.pollLoop(ctx, fromPosition, ch)
@@ -326,7 +353,17 @@ func (s *EventStore) pollLoop(ctx context.Context, pos int64, ch chan<- eventsto
 
 	for {
 		batch, err := s.LoadAll(ctx, pos, s.pollBatchSize)
-		if err == nil {
+		if err != nil {
+			if ctx.Err() != nil {
+				// Normal shutdown; the deferred close signals completion.
+				// This guard catches cancellation-induced driver errors that
+				// do not wrap context.Canceled (e.g. "driver: bad connection"
+				// from a torn-down conn), mirroring postgres's
+				// runSubscription ctx.Err() check before reportSubErr.
+				return
+			}
+			s.reportSubErr(fmt.Errorf("subscribe: %w", err))
+		} else {
 			for _, e := range batch {
 				select {
 				case ch <- e:
@@ -347,6 +384,21 @@ func (s *EventStore) pollLoop(ctx context.Context, pos int64, ch chan<- eventsto
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// reportSubErr forwards an abnormal subscription error (a failed poll) to the
+// registered handler. Context cancellation/deadline is a normal shutdown and is
+// dropped so integrators are not paged for a graceful close. This filter is
+// defense-in-depth: pollLoop's ctx.Err() guard is the primary suppression
+// layer (it also catches cancellation-induced driver errors that don't wrap
+// context.Canceled), mirroring the postgres adapter's two-layer structure.
+func (s *EventStore) reportSubErr(err error) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	if s.onSubErr != nil {
+		s.onSubErr(err)
 	}
 }
 
